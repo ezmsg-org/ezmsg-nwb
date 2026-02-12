@@ -6,13 +6,12 @@ from collections import deque
 from pathlib import Path
 
 import ezmsg.core as ez
-import fsspec
 import h5py
 import numpy as np
 import pynwb
+import remfile
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
-from fsspec.implementations.cached import CachingFileSystem
 
 from .util import ReferenceClockType
 
@@ -28,16 +27,7 @@ class NWBIteratorSettings(ez.Settings):
 
 
 class NWBAxisArrayIterator:
-    _fs: typing.ClassVar[typing.Optional[CachingFileSystem]] = None
-
-    @classmethod
-    def _get_fs(cls) -> CachingFileSystem:
-        if cls._fs is None:
-            cls._fs = CachingFileSystem(
-                fs=fsspec.filesystem("http"),
-                cache_storage=str(Path("~").expanduser() / ".ezmsg" / "nwb-cache"),
-            )
-        return cls._fs
+    disk_cache = remfile.DiskCache(str(Path("~").expanduser() / ".ezmsg" / "nwb-cache"))
 
     def __init__(self, settings: NWBIteratorSettings):
         self._settings = settings
@@ -54,10 +44,12 @@ class NWBAxisArrayIterator:
     def _preload(self):
         self._streams = {}
         if str(self._settings.filepath).startswith("http"):
-            # If filepath is URL then use fsspec
-            f = h5py.File(self._get_fs().open(self._settings.filepath, "rb"))
-            self._io = pynwb.NWBHDF5IO(file=f)
+            # If filepath is URL then use remfile
+            f = remfile.File(self._settings.filepath, disk_cache=self.disk_cache)
+            file = h5py.File(f)
+            self._io = pynwb.NWBHDF5IO(file=file)
         else:
+            # Provide the path, not the file. This is different to the remfile usage.
             self._io = pynwb.NWBHDF5IO(self._settings.filepath, "r")
         nwbfile = self._io.read()
 

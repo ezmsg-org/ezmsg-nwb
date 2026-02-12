@@ -17,7 +17,6 @@ dependencies = [
   "neuroconv",
   "remfile",
   "pyyaml",
-  "fsspec",
 ]
 
 [project.optional-dependencies]
