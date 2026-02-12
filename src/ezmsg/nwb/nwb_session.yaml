@@ -1,0 +1,14 @@
+Subject:
+  subject_id: P001
+  species: Homo sapiens
+  age: P0D  # in ISO 8601, such as "P1W2D"
+  # date_of_birth: as an alternative to age:
+  sex: U  # One of M, F, U, or O
+  description: Please provide a description.
+  # genotype:
+  # weight:
+  # strain:
+# NWBFile:
+#   session_description:
+#     Overwrite the session description if necessary.
+#   session_id: optional session id

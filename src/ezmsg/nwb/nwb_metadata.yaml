@@ -1,0 +1,24 @@
+NWBFile:
+  keywords:
+    - ezmsg
+    - NWB
+  experiment_description:
+    Please describe your experiment
+  related_publications:
+    - https://doi.org/####
+    # -  or link to APA or MLA citation of the publication
+  session_description:
+    This file was created using ezmsg-nwb.
+    We suggest you create your own metadata yaml file and provide its
+    path as an argument to the nwb writer.
+  institution: Institution where the lab is located
+  lab: TBD
+  experimenter:
+    - Last, First Middle
+    - Last, First Middle
+  # surgery
+  # pharmacology
+  # protocol
+  # source_script: script file used to create this NWB file
+  # source_script_file_name: script file used to create this NWB file
+  # notes:

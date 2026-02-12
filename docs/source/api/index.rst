@@ -8,4 +8,4 @@ This page contains auto-generated API reference documentation.
    :recursive:
    :template: autosummary/module.rst
 
-   ezmsg.example
+   ezmsg.nwb

@@ -1,35 +1,41 @@
-# ezmsg-example
+# ezmsg-nwb
 
-Short description of your ezmsg package.
+NWB (Neurodata Without Borders) file reading and writing for the [ezmsg](https://www.ezmsg.org) framework.
 
 ## Overview
 
-`ezmsg-example` provides ... for the `ezmsg <https://www.ezmsg.org>`_ framework.
+`ezmsg-nwb` provides streaming NWB file I/O as ezmsg Units.
 
 Key features:
 
-* **Feature 1** - Description
-* **Feature 2** - Description
-* **Feature 3** - Description
+* **NWB Reader** - Stream data from NWB files (local or remote) as AxisArray messages
+* **NWB Writer** - Write incoming AxisArray streams to NWB files with automatic container management
+* **Flexible clock handling** - Support for system, monotonic, and unknown reference clocks
 
 ## Installation
 
 Install from PyPI:
 
 ```bash
-pip install ezmsg-example
+pip install ezmsg-nwb
 ```
 
 Or install the latest development version:
 
 ```bash
-pip install git+https://github.com/ezmsg-org/ezmsg-example@main
+pip install git+https://github.com/ezmsg-org/ezmsg-nwb@main
 ```
 
 ## Dependencies
 
 - `ezmsg`
+- `ezmsg-baseproc`
 - `numpy`
+- `pynwb`
+- `h5py`
+- `neuroconv`
+- `remfile`
+- `pyyaml`
 
 ## Usage
 
@@ -37,9 +43,7 @@ See the `examples` folder for usage examples.
 
 ```python
 import ezmsg.core as ez
-from ezmsg.example import MyUnit
-
-# Your usage example here
+from ezmsg.nwb import NWBIteratorUnit, NWBSink
 ```
 
 For general ezmsg tutorials and guides, visit [ezmsg.org](https://www.ezmsg.org).
