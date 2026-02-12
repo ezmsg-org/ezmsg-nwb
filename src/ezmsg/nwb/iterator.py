@@ -131,7 +131,9 @@ class NWBAxisArrayIterator:
         for address, child in all_timeseries:
             if type(child) is pynwb.misc.Units:
                 ez.logger.warning("Units found in NWB file. Not yet supported.")
-            elif isinstance(child, pynwb.TimeSeries):
+            elif isinstance(child, pynwb.TimeSeries) and (
+                self._settings.stream_keys is None or child.name in self._settings.stream_keys
+            ):
                 if child.data.size == 0:
                     ez.logger.warning(f"Skipping empty TimeSeries: {child.name} {type(child)}")
                     continue
