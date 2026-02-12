@@ -97,28 +97,29 @@ class NWBAxisArrayIterator:
         start_time = np.inf
         stop_time = -np.inf
 
-        # First for trials and epochs tables.
-        for attr in ["trials", "epochs"]:
-            if hasattr(nwbfile, attr) and getattr(nwbfile, attr) is not None:
-                table = getattr(nwbfile, attr)
-                start_time = min(start_time, self._ts_off + table.start_time[0])
-                stop_time = max(stop_time, self._ts_off + table.start_time[-1])
-                # For tables, dset cannot be lazily loaded.
-                ch_labels = list(set(table.colnames) - {"start_time", "stop_time"})
-                dset = np.array([list(map(str, table[_].data)) for _ in ch_labels]).T
-                self._streams[attr] = {
-                    "dset": dset,
-                    "template": AxisArray(
-                        data=np.zeros((0, len(ch_labels)), dtype=dset.dtype),
-                        dims=["time", "ch"],
-                        axes={
-                            "time": AxisArray.CoordinateAxis(data=np.array([]), dims=["time"], unit="s"),
-                            "ch": AxisArray.CoordinateAxis(data=np.array(ch_labels), dims=["ch"]),
-                        },
-                        key=attr,
-                    ),
-                    "table_ref": table,
-                }
+        # First for time interval tables (trials, epochs, and any custom intervals).
+        time_intervals = getattr(nwbfile, "intervals", None)
+        if time_intervals is not None:
+            for attr, table in time_intervals.items():
+                if table is not None and (self._settings.stream_keys is None or attr in self._settings.stream_keys):
+                    start_time = min(start_time, self._ts_off + table.start_time[0])
+                    stop_time = max(stop_time, self._ts_off + table.start_time[-1])
+                    # For tables, dset cannot be lazily loaded.
+                    ch_labels = list(set(table.colnames) - {"start_time", "stop_time"})
+                    dset = np.array([list(map(str, table[_].data)) for _ in ch_labels]).T
+                    self._streams[attr] = {
+                        "dset": dset,
+                        "template": AxisArray(
+                            data=np.zeros((0, len(ch_labels)), dtype=dset.dtype),
+                            dims=["time", "ch"],
+                            axes={
+                                "time": AxisArray.CoordinateAxis(data=np.array([]), dims=["time"], unit="s"),
+                                "ch": AxisArray.CoordinateAxis(data=np.array(ch_labels), dims=["ch"]),
+                            },
+                            key=attr,
+                        ),
+                        "table_ref": table,
+                    }
 
         # Next for timeseries — recursively extract from root and processing modules.
         all_timeseries = extract_timeseries_from_container(nwbfile)
