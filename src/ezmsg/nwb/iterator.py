@@ -24,6 +24,7 @@ class NWBIteratorSettings(ez.Settings):
     reference_clock: ReferenceClockType = ReferenceClockType.SYSTEM
     reref_now: bool = False
     self_terminating: bool = True
+    stream_keys: typing.Optional[list[str]] = None
 
 
 class NWBAxisArrayIterator:
@@ -42,6 +43,21 @@ class NWBAxisArrayIterator:
         self._preload()
 
     def _preload(self):
+        def extract_timeseries_from_container(
+            container, address: str | None = None
+        ) -> list[tuple[str, pynwb.TimeSeries]]:
+            """Recursively extract all TimeSeries objects from a container."""
+            if address is None:
+                address = container.name
+            timeseries = []
+            for obj in container.children:
+                joint_address = f"{address}/{obj.name}"
+                if isinstance(obj, pynwb.TimeSeries):
+                    timeseries.append((joint_address, obj))
+                elif hasattr(obj, "children") and len(obj.children) > 0:
+                    timeseries.extend(extract_timeseries_from_container(obj, joint_address))
+            return timeseries
+
         self._streams = {}
         if str(self._settings.filepath).startswith("http"):
             # If filepath is URL then use remfile
@@ -104,8 +120,14 @@ class NWBAxisArrayIterator:
                     "table_ref": table,
                 }
 
-        # Next for all other supported datasets
-        for child in nwbfile.children:
+        # Next for timeseries — recursively extract from root and processing modules.
+        all_timeseries = extract_timeseries_from_container(nwbfile)
+        # Also explicitly scan processing modules in case the NWB structure doesn't
+        # expose them as root children.
+        for module_name, module in nwbfile.processing.items():
+            all_timeseries.extend(extract_timeseries_from_container(module, address=f"/root/{module_name}"))
+        all_timeseries = set(all_timeseries)  # Remove duplicates
+        for address, child in all_timeseries:
             if type(child) is pynwb.misc.Units:
                 ez.logger.warning("Units found in NWB file. Not yet supported.")
             elif isinstance(child, pynwb.TimeSeries):
