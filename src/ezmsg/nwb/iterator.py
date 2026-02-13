@@ -107,7 +107,7 @@ class NWBAxisArrayIterator:
             for attr, table in time_intervals.items():
                 if table is not None and (self._settings.stream_keys is None or attr in self._settings.stream_keys):
                     start_time = min(start_time, self._ts_off + table.start_time[0])
-                    stop_time = max(stop_time, self._ts_off + table.start_time[-1])
+                    stop_time = max(stop_time, self._ts_off + table.stop_time[-1])  # Was start_time. stop_time OK?
                     # For tables, dset cannot be lazily loaded.
                     ch_labels = list(set(table.colnames) - {"start_time", "stop_time"})
                     dset = np.array([list(map(str, table[_].data)) for _ in ch_labels]).T
@@ -130,7 +130,7 @@ class NWBAxisArrayIterator:
         # Also explicitly scan processing modules in case the NWB structure doesn't
         # expose them as root children.
         for module_name, module in nwbfile.processing.items():
-            all_timeseries.extend(extract_timeseries_from_container(module, address=f"/root/{module_name}"))
+            all_timeseries.extend(extract_timeseries_from_container(module, address=f"root/{module_name}"))
         all_timeseries = set(all_timeseries)  # Remove duplicates
         for address, child in all_timeseries:
             if type(child) is pynwb.misc.Units:
