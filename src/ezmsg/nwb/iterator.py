@@ -223,19 +223,18 @@ class NWBAxisArrayIterator:
         # For each stream, for each chunk, identify the first sample index for that chunk.
         for n, strm in self._streams.items():
             if hasattr(strm["template"].axes["time"], "data"):
-                # Irregular interval stream
+                # Irregular interval stream — find first sample index in each chunk.
                 timestamps = time_intervals[n].start_time[:]
-                # For each sample, find the first chunk in which it appears, index +1,
-                #  then set chunk_ix[x:] to that sample index.
-                chunk_ix_offsets = np.zeros(n_chunks, dtype=int)
-                for samp_ix, ts in enumerate(timestamps):
-                    chunk_ix = int((ts + self._ts_off - start_time) // self._settings.chunk_dur)
-                    chunk_ix_offsets[chunk_ix + 1 :] = samp_ix + 1
+                # Build the boundary times for each chunk and searchsorted to find the
+                # first sample that falls at or after each boundary.
+                chunk_boundaries = start_time + np.arange(n_chunks) * self._settings.chunk_dur - self._ts_off
+                chunk_ix_offsets = np.searchsorted(timestamps, chunk_boundaries, side="left").astype(int)
             else:
                 samps_per_chunk = self._settings.chunk_dur / strm["template"].axes["time"].gain
-                first_chunk = max(0, int(strm["t0"] // self._settings.chunk_dur))
+                t0_abs = float(strm["t0"]) + float(self._ts_off)
+                first_chunk = max(0, int((t0_abs - float(start_time)) // self._settings.chunk_dur))
                 chunk_ix_offsets = np.arange(n_chunks - first_chunk) * samps_per_chunk
-                chunk_ix_offsets = np.hstack((np.zeros(first_chunk), chunk_ix_offsets)).astype(int)
+                chunk_ix_offsets = chunk_ix_offsets.astype(int)
 
             strm["chunk_offsets"] = chunk_ix_offsets
 
