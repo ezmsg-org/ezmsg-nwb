@@ -36,6 +36,9 @@ class NWBAxisArrayIterator:
         self._chunk_ix = 0
         self._last_time = 0.0
         self._io: typing.Optional[pynwb.NWBHDF5IO] = None
+
+        # Session start time. This might be converted from the datetime in the header, or set to now,
+        #  depending on the playback settings (reref_now).
         self._ts_off = 0.0
         self._streams = {}
         self._force_single_sample = set()
@@ -138,6 +141,13 @@ class NWBAxisArrayIterator:
                     ez.logger.warning(f"Skipping empty TimeSeries: {child.name} {type(child)}")
                     continue
                 if hasattr(child, "timestamps") and child.timestamps is not None:
+                    # The timeseries has timestamps for each sample. This might be because the
+                    #  timeseries is irregularly sampled, or because we purposely stored timestamps
+                    #  for more accuracy.
+                    # Despite having all timestamps, we still want to know the nominal rate.
+                    #  The rate is usually not included when timestamps are provided, but some of our custom tools
+                    #  hide the rate when creating the NWB file -- retrieve that.
+                    #  Otherwise, calculate the rate from the timestamps.
                     if hasattr(child, "rate") and child.rate is not None:
                         rate = child.rate
                     elif "rate" in child.timestamps.attrs:
@@ -173,7 +183,7 @@ class NWBAxisArrayIterator:
                 if rate == 0.0:
                     axes["time"] = AxisArray.CoordinateAxis(data=np.array([]), dims=["time"], unit="s")
                 else:
-                    axes["time"] = AxisArray.Axis.TimeAxis(fs=rate, offset=self._ts_off)
+                    axes["time"] = AxisArray.LinearAxis.create_time_axis(fs=rate, offset=self._ts_off)
                 if hasattr(child, "electrodes"):
                     el_inds = child.electrodes.table.id[:]
                     el_df = child.electrodes.table.to_dataframe().loc[el_inds]
@@ -196,7 +206,9 @@ class NWBAxisArrayIterator:
                     "timestamps": tvec,
                     "template": AxisArray(
                         data=np.zeros((0,) + child.data.shape[1:], dtype=child.data.dtype),
-                        dims=["time", "ch"] + [f"dim_{_}" for _ in range(2, child.data.ndim)],
+                        dims=(["time", "ch"] + [f"dim_{_}" for _ in range(2, child.data.ndim)])
+                        if child.data.ndim > 1
+                        else ["time"],
                         axes=axes,
                         key=child.name,
                     ),
@@ -212,7 +224,7 @@ class NWBAxisArrayIterator:
         for n, strm in self._streams.items():
             if hasattr(strm["template"].axes["time"], "data"):
                 # Irregular interval stream
-                timestamps = getattr(nwbfile, n).start_time[:]
+                timestamps = time_intervals[n].start_time[:]
                 # For each sample, find the first chunk in which it appears, index +1,
                 #  then set chunk_ix[x:] to that sample index.
                 chunk_ix_offsets = np.zeros(n_chunks, dtype=int)
