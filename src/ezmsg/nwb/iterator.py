@@ -1,4 +1,5 @@
 import datetime
+import math
 import os
 import time
 import typing
@@ -180,7 +181,7 @@ class NWBAxisArrayIterator:
 
                 # Build up axes metadata
                 axes = {}
-                if rate == 0.0:
+                if math.isclose(rate, 0.0):
                     axes["time"] = AxisArray.CoordinateAxis(data=np.array([]), dims=["time"], unit="s")
                 else:
                     axes["time"] = AxisArray.LinearAxis.create_time_axis(fs=rate, offset=self._ts_off)
