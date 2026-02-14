@@ -23,6 +23,7 @@ def test_exports():
         "NWBAxisArrayIterator",
         "NWBIteratorSettings",
         "NWBIteratorUnit",
+        "NWBIteratorState",
         "NWBSink",
         "NWBSinkConsumer",
         "NWBSinkSettings",

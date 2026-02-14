@@ -1,6 +1,7 @@
 from .__version__ import __version__ as __version__
 from .iterator import NWBAxisArrayIterator as NWBAxisArrayIterator
 from .iterator import NWBIteratorSettings as NWBIteratorSettings
+from .iterator import NWBIteratorState as NWBIteratorState
 from .reader import NWBIteratorUnit as NWBIteratorUnit
 from .util import ReferenceClockType as ReferenceClockType
 from .util import build_nwb_fname as build_nwb_fname
