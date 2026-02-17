@@ -104,7 +104,7 @@ class NWBSinkSettings(ez.Settings):
     meta_yaml: typing.Optional[typing.Union[str, os.PathLike]] = None
     split_bytes: int = 0
     expected_series: typing.Optional[typing.Union[str, os.PathLike]] = None
-    settings: typing.Optional[typing.Union[ez.Settings, None]] = None
+    pipeline_settings: typing.Optional[typing.Union[ez.Settings, None]] = None
 
 
 class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
@@ -149,7 +149,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
 
         if self.settings is not None:
             # Add settings columns to epochs table
-            self._settings_dict = flatten_settings(self.settings.settings)
+            self._settings_dict = flatten_settings(self.settings.pipeline_settings)
             self._prep_settings()
 
     def _prep_settings(self) -> None:
@@ -163,7 +163,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
 
         # Prepare io for epochs table
         self._current_msg = AxisArray(
-            data=np.zeros((1, len(self._settings_dict)), dtype="O"),
+            data=np.zeros((0, len(self._settings_dict)), dtype="O"),
             dims=["time", "setting"],
             axes={"time": AxisArray.CoordinateAxis(np.array([]), dims=["time"], unit="s")},
             key="epochs",
