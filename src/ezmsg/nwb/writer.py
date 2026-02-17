@@ -85,7 +85,7 @@ from ezmsg.util.messages.util import replace
 from hdmf.backends.hdf5.h5_utils import H5DataIO
 from neuroconv.utils import DeepDict, dict_deep_update, load_dict_from_file
 
-from .util import ReferenceClockType, build_nwb_fname
+from .util import ReferenceClockType, build_nwb_fname, flatten_settings
 
 try:
     from ezmsg.baseproc import SampleTriggerMessage
@@ -104,6 +104,7 @@ class NWBSinkSettings(ez.Settings):
     meta_yaml: typing.Optional[typing.Union[str, os.PathLike]] = None
     split_bytes: int = 0
     expected_series: typing.Optional[typing.Union[str, os.PathLike]] = None
+    settings: typing.Optional[typing.Union[ez.Settings, None]] = None
 
 
 class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
@@ -131,6 +132,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         self._io: typing.Optional[pynwb.NWBHDF5IO] = None
         self._nwbfile: typing.Optional[pynwb.NWBFile] = None
         self._datasets: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
+        self._settings_dict: typing.Optional[typing.Dict[str, typing.Any]] = {}
 
         # Normalize filepath and delete existing file if enabled.
         self._check_filepath()
@@ -144,6 +146,29 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             _ = self.get_session_datetime(None)
             self._start_timestamp = self.get_session_timestamp(None)
             self._prep_from_meta(meta)
+
+        if self.settings is not None:
+            # Add settings columns to epochs table
+            self._settings_dict = flatten_settings(self.settings.settings)
+            self._prep_settings()
+
+    def _prep_settings(self) -> None:
+        """Prepares the epochs table for settings storage."""
+        # Add columns to epochs table
+        for name in self._settings_dict:
+            self._nwbfile.add_epoch_column(
+                name=name,
+                description="ezmsg setting",
+            )
+
+        # Prepare io for epochs table
+        self._current_msg = AxisArray(
+            data=np.zeros((1, len(self._settings_dict)), dtype="O"),
+            dims=["time", "setting"],
+            axes={"time": AxisArray.CoordinateAxis(np.array([]), dims=["time"], unit="s")},
+            key="epochs",
+        )
+        self._prep_event_io()
 
     def __del__(self):
         self.close(write=False, log=False)
@@ -603,7 +628,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
     ):
         fun = {"epochs": self._nwbfile.add_epoch, "trials": self._nwbfile.add_trial}[key]
         for ev_t, ev_str in zip(timestamps, data):
-            fun(start_time=ev_t, stop_time=ev_t + 0, **{"label": ",".join(ev_str)})
+            fun(start_time=ev_t, stop_time=ev_t + 0, **{"label": ",".join(ev_str)}, **self._settings_dict)
 
     def _prep_event_io(self):
         """
@@ -620,10 +645,8 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         self._datasets[key] = {"shape": self._current_msg.data.shape[1:]}
 
         table = {"epochs": self._nwbfile.epochs, "trials": self._nwbfile.trials}[key]
-        table.id.set_data_io(H5DataIO, {"maxshape": (None,)})
-        table.start_time.set_data_io(H5DataIO, {"maxshape": (None,)})
-        table.stop_time.set_data_io(H5DataIO, {"maxshape": (None,)})
-        getattr(table, colname).set_data_io(H5DataIO, {"maxshape": (None,)})
+        for col in table.colnames:
+            table[col].set_data_io(H5DataIO, {"maxshape": (None,)})
 
         # Note: We cannot io.write(...) yet because a bug in hdmf requires that a custom column
         #  must have data before it may be written:
