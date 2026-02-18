@@ -21,12 +21,16 @@ def test_exports():
 
     expected = [
         "NWBAxisArrayIterator",
+        "NWBClockDrivenProducer",
+        "NWBClockDrivenSettings",
+        "NWBClockDrivenUnit",
         "NWBIteratorSettings",
         "NWBIteratorUnit",
         "NWBIteratorState",
         "NWBSink",
         "NWBSinkConsumer",
         "NWBSinkSettings",
+        "NWBSlicer",
         "ReferenceClockType",
         "build_nwb_fname",
     ]
