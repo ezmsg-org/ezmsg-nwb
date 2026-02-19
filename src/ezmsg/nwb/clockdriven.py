@@ -6,7 +6,6 @@ import os
 import typing
 
 import ezmsg.core as ez
-import numpy as np
 from ezmsg.baseproc.clockdriven import BaseClockDrivenProducer, ClockDrivenSettings, ClockDrivenState
 from ezmsg.baseproc.protocols import processor_state
 from ezmsg.baseproc.units import BaseClockDrivenUnit
@@ -103,10 +102,6 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
         # Compute n_samples (same logic as base class but using detected fs)
         if self.settings.n_time is not None:
             n_samples = self.settings.n_time
-            if clock_tick.gain == 0.0:
-                offset = self._state.counter / fs
-            else:
-                offset = clock_tick.offset
         else:
             if clock_tick.gain == 0.0:
                 raise ValueError("Cannot use clock with gain=0 (AFAP) without specifying n_time")
@@ -115,7 +110,6 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
             self._state.fractional_samples = samples_float - n_samples
             if n_samples == 0:
                 return None
-            offset = clock_tick.offset
 
         # Check bounds
         start_idx = self._state.sample_idx
@@ -123,12 +117,10 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
             return None
         stop_idx = min(start_idx + n_samples, self._state.n_total_samples)
 
-        output = self._state.slicer.read_by_index(
-            self.settings.stream_key, start_idx, stop_idx
-        )
+        output = self._state.slicer.read_by_index(self.settings.stream_key, start_idx, stop_idx)
 
         self._state.sample_idx = stop_idx
-        self._state.counter += (stop_idx - start_idx)
+        self._state.counter += stop_idx - start_idx
 
         return output
 

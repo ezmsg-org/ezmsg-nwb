@@ -7,7 +7,7 @@ import math
 import os
 import time
 import typing
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import ezmsg.core as ez
@@ -53,9 +53,7 @@ class StreamInfo:
     """Reference to the interval table (events only)."""
 
 
-def _extract_timeseries_from_container(
-    container, address: str | None = None
-) -> list[tuple[str, pynwb.TimeSeries]]:
+def _extract_timeseries_from_container(container, address: str | None = None) -> list[tuple[str, pynwb.TimeSeries]]:
     """Recursively extract all TimeSeries objects from a container."""
     if address is None:
         address = container.name
@@ -169,9 +167,7 @@ class NWBSlicer:
         for address, child in all_timeseries:
             if type(child) is pynwb.misc.Units:
                 ez.logger.warning("Units found in NWB file. Not yet supported.")
-            elif isinstance(child, pynwb.TimeSeries) and (
-                self._stream_keys is None or child.name in self._stream_keys
-            ):
+            elif isinstance(child, pynwb.TimeSeries) and (self._stream_keys is None or child.name in self._stream_keys):
                 if child.data.size == 0:
                     ez.logger.warning(f"Skipping empty TimeSeries: {child.name} {type(child)}")
                     continue
@@ -346,9 +342,7 @@ class NWBSlicer:
         else:
             # Timestamped continuous stream
             if info.timestamps is None:
-                raise ValueError(
-                    f"Stream '{stream_key}' has no explicit timestamps. Use read_by_index instead."
-                )
+                raise ValueError(f"Stream '{stream_key}' has no explicit timestamps. Use read_by_index instead.")
             timestamps = info.timestamps
             # Materialize if h5py dataset for searchsorted
             if hasattr(timestamps, "shape") and not isinstance(timestamps, np.ndarray):

@@ -3,11 +3,6 @@
 import asyncio
 import importlib
 
-import ezmsg.core as ez
-
-from ezmsg.nwb import NWBIteratorUnit, NWBSink, NWBSinkSettings
-from ezmsg.nwb.iterator import NWBIteratorSettings
-
 
 async def main():
     """Run the example."""
