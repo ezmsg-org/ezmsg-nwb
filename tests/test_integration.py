@@ -22,7 +22,6 @@ from ezmsg.nwb import (
 from ezmsg.nwb.clockdriven import NWBClockDrivenSettings, NWBClockDrivenUnit
 from ezmsg.nwb.reader import NWBIteratorUnit
 
-
 # -- NWBIteratorUnit system test --
 
 

@@ -1,12 +1,9 @@
 """Tests for NWBClockDrivenProducer."""
 
-import numpy as np
-import pytest
 from ezmsg.util.messages.axisarray import AxisArray
 
 from ezmsg.nwb.clockdriven import NWBClockDrivenProducer, NWBClockDrivenSettings
 from ezmsg.nwb.util import ReferenceClockType
-
 
 # --- Rate-only continuous stream ---
 

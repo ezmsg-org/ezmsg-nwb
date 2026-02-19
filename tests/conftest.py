@@ -3,7 +3,6 @@
 from pathlib import Path
 
 import pytest
-
 from create_test_nwb import create_test_nwb
 
 

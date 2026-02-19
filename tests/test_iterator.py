@@ -8,17 +8,18 @@ import pytest
 
 from ezmsg.nwb import NWBAxisArrayIterator, NWBIteratorSettings, ReferenceClockType
 
-
 # --- Stream discovery ---
 
 
 def test_all_streams_discovered(test_nwb_path):
     """Iterator discovers all streams including /processing and custom intervals."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
 
     stream_names = set(it._state.streams.keys())
     assert stream_names == {"Broadband", "RawAnalog", "BinnedSpikes", "Force", "trials", "phonemes"}
@@ -36,12 +37,14 @@ def test_all_streams_discovered(test_nwb_path):
 
 def test_stream_keys_filter(test_nwb_path):
     """stream_keys setting filters which streams are discovered and yielded."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["Broadband", "trials"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Broadband", "trials"],
+        )
+    )
 
     assert set(it._state.streams.keys()) == {"Broadband", "trials"}
 
@@ -57,12 +60,14 @@ def test_stream_keys_filter(test_nwb_path):
 
 def test_continuous_data_shape(test_nwb_path):
     """Continuous data chunks have correct shape, dims, and LinearAxis time axis."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["Broadband"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Broadband"],
+        )
+    )
     msg = next(it)
 
     assert msg.key == "Broadband"
@@ -74,12 +79,14 @@ def test_continuous_data_shape(test_nwb_path):
 
 def test_1d_timeseries_dims(test_nwb_path):
     """1D timeseries data gets dims=['time'], not ['time', 'ch']."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["Force"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Force"],
+        )
+    )
     msg = next(it)
     assert msg.data.ndim == 1
     assert msg.dims == ["time"]
@@ -87,12 +94,14 @@ def test_1d_timeseries_dims(test_nwb_path):
 
 def test_interval_table_structure(test_nwb_path):
     """Interval tables produce correct AxisArray messages (sample-by-sample, CoordinateAxis)."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["phonemes"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["phonemes"],
+        )
+    )
     msg = next(it)
 
     assert msg.key == "phonemes"
@@ -107,35 +116,41 @@ def test_interval_table_structure(test_nwb_path):
 
 def test_exhausted_false_initially(test_nwb_path):
     """Iterator is not exhausted right after construction."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["BinnedSpikes"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["BinnedSpikes"],
+        )
+    )
     assert not it.exhausted
 
 
 def test_exhausted_after_full_consumption(test_nwb_path):
     """Iterator reports exhausted after all messages are consumed."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=10.0,  # single chunk covers all data
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["BinnedSpikes"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=10.0,  # single chunk covers all data
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["BinnedSpikes"],
+        )
+    )
     list(it)  # consume all
     assert it.exhausted
 
 
 def test_stop_iteration(test_nwb_path):
     """__next__ raises StopIteration when data is exhausted."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=10.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["BinnedSpikes"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=10.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["BinnedSpikes"],
+        )
+    )
     list(it)
     with pytest.raises(StopIteration):
         next(it)
@@ -146,48 +161,56 @@ def test_stop_iteration(test_nwb_path):
 
 def test_total_samples_rate_only(test_nwb_path):
     """All samples from a rate-only stream are emitted exactly once."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["BinnedSpikes"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["BinnedSpikes"],
+        )
+    )
     total = sum(m.data.shape[0] for m in it)
     assert total == 150
 
 
 def test_total_samples_timestamped(test_nwb_path):
     """All samples from a timestamped stream are emitted exactly once."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["Broadband"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Broadband"],
+        )
+    )
     total = sum(m.data.shape[0] for m in it)
     assert total == 3000
 
 
 def test_total_samples_1d(test_nwb_path):
     """All samples from a 1D stream are emitted exactly once."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["Force"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Force"],
+        )
+    )
     total = sum(m.data.shape[0] for m in it)
     assert total == 300
 
 
 def test_total_events(test_nwb_path):
     """All events from an interval table are emitted exactly once."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["phonemes"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["phonemes"],
+        )
+    )
     counts = Counter()
     for m in it:
         if math.prod(m.data.shape) > 0:
@@ -200,13 +223,16 @@ def test_total_events(test_nwb_path):
 
 def test_chunk_dur_determines_chunk_count(test_nwb_path):
     """Smaller chunk_dur produces more chunks (messages) for a continuous stream."""
+
     def count_messages(chunk_dur):
-        it = NWBAxisArrayIterator(NWBIteratorSettings(
-            filepath=test_nwb_path,
-            chunk_dur=chunk_dur,
-            reference_clock=ReferenceClockType.UNKNOWN,
-            stream_keys=["RawAnalog"],
-        ))
+        it = NWBAxisArrayIterator(
+            NWBIteratorSettings(
+                filepath=test_nwb_path,
+                chunk_dur=chunk_dur,
+                reference_clock=ReferenceClockType.UNKNOWN,
+                stream_keys=["RawAnalog"],
+            )
+        )
         return sum(1 for m in it if m.data.shape[0] > 0)
 
     n_big = count_messages(10.0)
@@ -216,13 +242,16 @@ def test_chunk_dur_determines_chunk_count(test_nwb_path):
 
 def test_chunk_dur_preserves_total_samples(test_nwb_path):
     """Different chunk_dur values still emit the same total sample count."""
+
     def total_samples(chunk_dur):
-        it = NWBAxisArrayIterator(NWBIteratorSettings(
-            filepath=test_nwb_path,
-            chunk_dur=chunk_dur,
-            reference_clock=ReferenceClockType.UNKNOWN,
-            stream_keys=["RawAnalog"],
-        ))
+        it = NWBAxisArrayIterator(
+            NWBIteratorSettings(
+                filepath=test_nwb_path,
+                chunk_dur=chunk_dur,
+                reference_clock=ReferenceClockType.UNKNOWN,
+                stream_keys=["RawAnalog"],
+            )
+        )
         return sum(m.data.shape[0] for m in it)
 
     assert total_samples(0.5) == total_samples(2.0) == 1500
@@ -233,12 +262,14 @@ def test_chunk_dur_preserves_total_samples(test_nwb_path):
 
 def test_time_axis_offset_advances(test_nwb_path):
     """Successive chunks have increasing time axis offsets for rate-only streams."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["BinnedSpikes"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["BinnedSpikes"],
+        )
+    )
     offsets = [m.axes["time"].offset for m in it if m.data.shape[0] > 0]
     assert len(offsets) > 1
     assert all(offsets[i] < offsets[i + 1] for i in range(len(offsets) - 1))
@@ -246,12 +277,14 @@ def test_time_axis_offset_advances(test_nwb_path):
 
 def test_timestamped_time_axis_offset_advances(test_nwb_path):
     """Successive chunks have increasing time axis offsets for timestamped streams."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["Broadband"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Broadband"],
+        )
+    )
     offsets = [m.axes["time"].offset for m in it if m.data.shape[0] > 0]
     assert len(offsets) > 1
     assert all(offsets[i] < offsets[i + 1] for i in range(len(offsets) - 1))
@@ -259,12 +292,14 @@ def test_timestamped_time_axis_offset_advances(test_nwb_path):
 
 def test_event_time_axis_has_coordinate_data(test_nwb_path):
     """Event messages have CoordinateAxis with actual timestamp data."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=10.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["trials"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=10.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["trials"],
+        )
+    )
     event_msgs = [m for m in it if m.data.shape[0] > 0]
     assert len(event_msgs) == 3  # one per event
     for m in event_msgs:
@@ -280,12 +315,14 @@ def test_data_not_corrupted(test_nwb_path):
     from ezmsg.nwb.slicer import NWBSlicer
 
     # Read all BinnedSpikes via iterator
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["BinnedSpikes"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["BinnedSpikes"],
+        )
+    )
     iter_data = np.concatenate([m.data for m in it], axis=0)
 
     # Read all BinnedSpikes via slicer
@@ -305,12 +342,14 @@ def test_data_not_corrupted(test_nwb_path):
 
 def test_multi_stream_interleaving(test_nwb_path):
     """When iterating multiple streams, messages from all streams are interleaved per chunk."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["BinnedSpikes", "RawAnalog"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["BinnedSpikes", "RawAnalog"],
+        )
+    )
     keys = [m.key for m in it]
     # Both streams should appear
     assert "BinnedSpikes" in keys
@@ -327,12 +366,14 @@ def test_multi_stream_interleaving(test_nwb_path):
 
 def test_electrode_labels_preserved(test_nwb_path):
     """Electrode labels from the file are present in the ch axis of emitted messages."""
-    it = NWBAxisArrayIterator(NWBIteratorSettings(
-        filepath=test_nwb_path,
-        chunk_dur=1.0,
-        reference_clock=ReferenceClockType.UNKNOWN,
-        stream_keys=["Broadband"],
-    ))
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Broadband"],
+        )
+    )
     msg = next(it)
     ch_labels = list(msg.axes["ch"].data)
     assert ch_labels == [f"elec{i}" for i in range(8)]

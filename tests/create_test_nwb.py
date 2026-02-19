@@ -20,7 +20,6 @@ from pynwb import NWBHDF5IO, NWBFile
 from pynwb.ecephys import ElectricalSeries
 from pynwb.file import Subject, TimeIntervals
 
-
 DURATION = 3.0  # seconds
 
 
@@ -109,14 +108,14 @@ def create_test_nwb(output_path: Path | str) -> Path:
     nwbfile.add_electrode_column(name="label", description="Electrode label")
     for i in range(8):
         nwbfile.add_electrode(
-            x=float(i), y=0.0, z=0.0,
+            x=float(i),
+            y=0.0,
+            z=0.0,
             location="cortex",
             group=group,
             label=f"elec{i}",
         )
-    electrode_region = nwbfile.create_electrode_table_region(
-        region=list(range(8)), description="all electrodes"
-    )
+    electrode_region = nwbfile.create_electrode_table_region(region=list(range(8)), description="all electrodes")
 
     # --- Broadband: ElectricalSeries, 1000 Hz, 8ch, explicit timestamps + rate attr ---
     #   Exercises: timestamped continuous + electrodes + labels + rate-from-attr
@@ -232,8 +231,8 @@ def create_test_nwb(output_path: Path | str) -> Path:
     print(f"  RawAnalog:    {ra_n} samples x 2 ch @ {ra_rate} Hz (rate-only)")
     print(f"  BinnedSpikes: {bs_n} samples x 4 ch @ {bs_rate} Hz (rate-only, processing/ecephys)")
     print(f"  Force:        {f_n} samples x 1    @ {f_rate} Hz (1D, processing/behavior)")
-    print(f"  trials:       3 events")
-    print(f"  phonemes:     10 events")
+    print("  trials:       3 events")
+    print("  phonemes:     10 events")
 
     return output_path
 
