@@ -127,3 +127,6 @@ uv.lock
 
 # Claude
 settings.local.json
+
+
+tests/data/*.nwb
