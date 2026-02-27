@@ -62,3 +62,8 @@ We use [`uv`](https://docs.astral.sh/uv/getting-started/installation/) for devel
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
+## Acknowledgements
+
+This project is supported by [the Wyss Center for Bio and Neuroengineering](https://wysscenter.ch)
+and by [Blackrock Neurotech](https://www.blackrockneurotech.com).
