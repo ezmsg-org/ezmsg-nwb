@@ -147,7 +147,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             self._start_timestamp = self.get_session_timestamp(None)
             self._prep_from_meta(meta)
 
-        if self.settings is not None:
+        if self.settings.pipeline_settings is not None:
             # Add settings columns to epochs table
             self._settings_dict = flatten_settings(self.settings.pipeline_settings)
             self._prep_settings()
