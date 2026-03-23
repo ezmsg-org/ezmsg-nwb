@@ -69,6 +69,7 @@ import asyncio
 import datetime
 import os
 import re
+import threading
 import time
 import typing
 from collections import defaultdict
@@ -85,7 +86,11 @@ from ezmsg.util.messages.util import replace
 from hdmf.backends.hdf5.h5_utils import H5DataIO
 from neuroconv.utils import DeepDict, dict_deep_update, load_dict_from_file
 
-from .util import ReferenceClockType, build_nwb_fname, flatten_settings
+from .util import (
+    ReferenceClockType,
+    build_nwb_fname,
+    flatten_component_settings,
+)
 
 try:
     from ezmsg.baseproc import SampleTriggerMessage
@@ -104,7 +109,6 @@ class NWBSinkSettings(ez.Settings):
     meta_yaml: typing.Optional[typing.Union[str, os.PathLike]] = None
     split_bytes: int = 0
     expected_series: typing.Optional[typing.Union[str, os.PathLike]] = None
-    pipeline_settings: typing.Optional[typing.Union[ez.Settings, None]] = None
 
 
 class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
@@ -117,6 +121,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
     def __init__(self, *args, settings: typing.Optional[NWBSinkSettings] = None, **kwargs):
         super().__init__(*args, settings=settings, **kwargs)
 
+        self._lock = threading.RLock()
         self._filepath = Path(self.settings.filepath)
         self._overwrite_old = self.settings.overwrite_old
         self._axis = self.settings.axis
@@ -132,7 +137,10 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         self._io: typing.Optional[pynwb.NWBHDF5IO] = None
         self._nwbfile: typing.Optional[pynwb.NWBFile] = None
         self._datasets: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
-        self._settings_dict: typing.Optional[typing.Dict[str, typing.Any]] = {}
+        self._settings_intervals_name = "settings_intervals"
+        self._settings_columns: list[str] = []
+        self._settings_state: dict[str, typing.Any] = {}
+        self._settings_active_since: typing.Optional[float] = None
 
         # Normalize filepath and delete existing file if enabled.
         self._check_filepath()
@@ -147,29 +155,6 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             self._start_timestamp = self.get_session_timestamp(None)
             self._prep_from_meta(meta)
 
-        if self.settings.pipeline_settings is not None:
-            # Add settings columns to epochs table
-            self._settings_dict = flatten_settings(self.settings.pipeline_settings)
-            self._prep_settings()
-
-    def _prep_settings(self) -> None:
-        """Prepares the epochs table for settings storage."""
-        # Add columns to epochs table
-        for name in self._settings_dict:
-            self._nwbfile.add_epoch_column(
-                name=name,
-                description="ezmsg setting",
-            )
-
-        # Prepare io for epochs table
-        self._current_msg = AxisArray(
-            data=np.zeros((0, len(self._settings_dict)), dtype="O"),
-            dims=["time", "setting"],
-            axes={"time": AxisArray.CoordinateAxis(np.array([]), dims=["time"], unit="s")},
-            key="epochs",
-        )
-        self._prep_event_io()
-
     def __del__(self):
         self.close(write=False, log=False)
 
@@ -178,104 +163,114 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         await asyncio.to_thread(self._process, message)
 
     def _process(self, message: AxisArray) -> None:
-        self._current_msg = message
+        with self._lock:
+            self._current_msg = message
 
-        # Adjust incoming data
-        if _HAS_SAMPLE_TRIGGER and isinstance(self._current_msg, SampleTriggerMessage):
-            # SampleTriggerMessage. Rewrite as AxisArray.
-            timestamp = self._current_msg.timestamp
-            if hasattr(self._current_msg, "period") and len(self._current_msg.period) > 0:
-                timestamp = timestamp + self._current_msg.period[0]
-            self._current_msg = AxisArray(
-                data=np.array([self._current_msg.value]),
-                dims=["time"],
-                axes={"time": AxisArray.Axis(gain=1.0, offset=timestamp)},
-                key="epochs",
-            )
-        elif not hasattr(self._current_msg, "data"):
-            return
-        else:
-            targ_ax_ix = self._current_msg.get_axis_idx(self._axis)
-            if targ_ax_ix != 0:
-                self._current_msg = replace(
-                    self._current_msg,
-                    data=np.moveaxis(self._current_msg.data, targ_ax_ix, 0),
-                    dims=[self._axis] + self._current_msg.dims[:targ_ax_ix] + self._current_msg.dims[targ_ax_ix + 1 :],
+            # Adjust incoming data
+            if _HAS_SAMPLE_TRIGGER and isinstance(self._current_msg, SampleTriggerMessage):
+                # SampleTriggerMessage. Rewrite as AxisArray.
+                timestamp = self._current_msg.timestamp
+                if hasattr(self._current_msg, "period") and len(self._current_msg.period) > 0:
+                    timestamp = timestamp + self._current_msg.period[0]
+                self._current_msg = AxisArray(
+                    data=np.array([self._current_msg.value]),
+                    dims=["time"],
+                    axes={"time": AxisArray.Axis(gain=1.0, offset=timestamp)},
+                    key="epochs",
                 )
-
-        # Is this a new series?
-        b_new = self._io is None
-        b_new = b_new or self._current_msg.key not in self._datasets
-
-        # If inc message key is in datasets but properties do not match previous dataset properties
-        #  then close io and raise error
-        if not b_new and not self._check_msg_consistency():
-            b_final_write = hasattr(self._nwbfile, "epochs") and self._nwbfile.epochs is not None
-            b_final_write = b_final_write or (hasattr(self._nwbfile, "trials") and self._nwbfile.trials is not None)
-            self.close(write=b_final_write)
-            raise ValueError("Data provided to NWBSink has changed shape. Closing NWB file.")
-
-        if b_new:
-            # Use first incoming timestamp to set the session start time.
-            key = self._current_msg.key
-            t0 = None
-            if self._axis in ["time", "win"] or "time" in self._current_msg.axes:
-                targ_dim = self._axis if self._axis in ["time", "win"] else "time"
-                if hasattr(self._current_msg.axes[targ_dim], "data"):
-                    t0 = self._current_msg.axes[targ_dim].data[0]
-                else:
-                    t0 = self._current_msg.axes[targ_dim].offset
-            _ = self.get_session_datetime(t0)
-            self._start_timestamp = self.get_session_timestamp(t0)
-            if self._inc_clock == ReferenceClockType.MONOTONIC:
-                self._start_timestamp += time.monotonic() - time.time()
-
-            # Create the container(s) for the new stream.
-            if key in ["epochs", "trials"]:
-                self._prep_event_io()
-                self._flush_io(reopen=True)
-            elif self._current_msg.data.dtype.type is np.str_:
-                raise ValueError(f"Cannot stream varlen str data to series {key}. Use 'epochs' or 'trials' instead.")
+            elif not hasattr(self._current_msg, "data"):
+                return
             else:
-                self._prep_continuous_io()
-                self._flush_io(reopen=True)
-                self._update_rate_for_current()
-
-        if self._recording and self._current_msg.data.size:
-            timestamps = None
-            if self._axis in ["time", "win"] or "time" in self._current_msg.axes:
-                targ_dim = self._axis if self._axis in ["time", "win"] else "time"
-                time_ax = self._current_msg.axes[targ_dim]
-                if hasattr(time_ax, "data"):
-                    timestamps = time_ax.data - self._start_timestamp
-                else:
-                    timestamps = (np.arange(len(self._current_msg.data)) * time_ax.gain) + (
-                        time_ax.offset - self._start_timestamp
+                targ_ax_ix = self._current_msg.get_axis_idx(self._axis)
+                if targ_ax_ix != 0:
+                    self._current_msg = replace(
+                        self._current_msg,
+                        data=np.moveaxis(self._current_msg.data, targ_ax_ix, 0),
+                        dims=[self._axis]
+                        + self._current_msg.dims[:targ_ax_ix]
+                        + self._current_msg.dims[targ_ax_ix + 1 :],
                     )
 
-            if self._current_msg.key in ["epochs", "trials"]:
-                self._append_events(self._current_msg.key, timestamps, self._current_msg.data)
-            else:
-                # Write data
-                dataset = self._datasets[self._current_msg.key]["data"]
-                dataset.resize(len(dataset) + len(self._current_msg.data), axis=0)
-                dataset[-len(self._current_msg.data) :] = self._current_msg.data
-                self._stream_bytes[self._current_msg.key] += self._current_msg.data.nbytes
+            # Is this a new series?
+            b_new = self._io is None
+            b_new = b_new or self._current_msg.key not in self._datasets
 
-                # Write timestamps
-                if timestamps is not None:
-                    ts = self._datasets[self._current_msg.key]["ts"]
-                    ts.resize(len(ts) + len(timestamps), axis=0)
-                    ts[-len(timestamps) :] = timestamps
-                    self._stream_bytes[self._current_msg.key] += timestamps.nbytes
+            # If inc message key is in datasets but properties do not match previous dataset properties
+            #  then close io and raise error
+            if not b_new and not self._check_msg_consistency():
+                b_final_write = hasattr(self._nwbfile, "epochs") and self._nwbfile.epochs is not None
+                b_final_write = b_final_write or (hasattr(self._nwbfile, "trials") and self._nwbfile.trials is not None)
+                self.close(write=b_final_write)
+                raise ValueError("Data provided to NWBSink has changed shape. Closing NWB file.")
 
-            if 0 < self._split_bytes <= sum(self._stream_bytes.values()) and "%d" not in str(self._filepath):
-                self._split_count += 1
-                self.path_on_disk.unlink(missing_ok=True)
-                new_nwbfile, new_meta = self._copy_nwb()
-                self.close()
-                self._nwb_create_or_fail(nwbfile=new_nwbfile)
-                self._prep_from_meta(new_meta)
+            if b_new:
+                # Use first incoming timestamp to set the session start time.
+                key = self._current_msg.key
+                t0 = None
+                if self._axis in ["time", "win"] or "time" in self._current_msg.axes:
+                    targ_dim = self._axis if self._axis in ["time", "win"] else "time"
+                    if hasattr(self._current_msg.axes[targ_dim], "data"):
+                        t0 = self._current_msg.axes[targ_dim].data[0]
+                    else:
+                        t0 = self._current_msg.axes[targ_dim].offset
+                _ = self.get_session_datetime(t0)
+                self._start_timestamp = self.get_session_timestamp(t0)
+                if self._inc_clock == ReferenceClockType.MONOTONIC:
+                    self._start_timestamp += time.monotonic() - time.time()
+
+                # Create the container(s) for the new stream.
+                if key in ["epochs", "trials"]:
+                    self._prep_event_io()
+                    self._flush_io(reopen=True)
+                elif self._current_msg.data.dtype.type is np.str_:
+                    raise ValueError(
+                        f"Cannot stream varlen str data to series {key}. Use 'epochs' or 'trials' instead."
+                    )
+                else:
+                    self._prep_continuous_io()
+                    self._flush_io(reopen=True)
+                    self._update_rate_for_current()
+
+            if self._recording and self._current_msg.data.size:
+                timestamps = None
+                if self._axis in ["time", "win"] or "time" in self._current_msg.axes:
+                    targ_dim = self._axis if self._axis in ["time", "win"] else "time"
+                    time_ax = self._current_msg.axes[targ_dim]
+                    if hasattr(time_ax, "data"):
+                        timestamps = time_ax.data - self._start_timestamp
+                    else:
+                        timestamps = (np.arange(len(self._current_msg.data)) * time_ax.gain) + (
+                            time_ax.offset - self._start_timestamp
+                        )
+
+                if self._current_msg.key in ["epochs", "trials"]:
+                    self._append_events(self._current_msg.key, timestamps, self._current_msg.data)
+                else:
+                    # Write data
+                    dataset = self._datasets[self._current_msg.key]["data"]
+                    dataset.resize(len(dataset) + len(self._current_msg.data), axis=0)
+                    dataset[-len(self._current_msg.data) :] = self._current_msg.data
+                    self._stream_bytes[self._current_msg.key] += self._current_msg.data.nbytes
+
+                    # Write timestamps
+                    if timestamps is not None:
+                        ts = self._datasets[self._current_msg.key]["ts"]
+                        ts.resize(len(ts) + len(timestamps), axis=0)
+                        ts[-len(timestamps) :] = timestamps
+                        self._stream_bytes[self._current_msg.key] += timestamps.nbytes
+
+                if 0 < self._split_bytes <= sum(self._stream_bytes.values()) and "%d" not in str(self._filepath):
+                    split_timestamp = time.time()
+                    self._flush_settings_interval(split_timestamp, "EZMSG-SETTINGS", "__split__")
+                    reopen_settings_since = split_timestamp if self._settings_state else None
+                    self._settings_active_since = None
+                    self._split_count += 1
+                    self.path_on_disk.unlink(missing_ok=True)
+                    new_nwbfile, new_meta = self._copy_nwb()
+                    self.close()
+                    self._nwb_create_or_fail(nwbfile=new_nwbfile)
+                    self._prep_from_meta(new_meta)
+                    self._settings_active_since = reopen_settings_since
 
     @property
     def path_on_disk(self) -> Path:
@@ -439,8 +434,12 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 )
                 self._prep_event_io()
 
+        if self._settings_intervals_name in meta:
+            settings_meta = meta[self._settings_intervals_name]
+            self._prep_settings_intervals(settings_meta.get("columns", []))
+
         for key, ss in meta.items():
-            if key not in ["epochs", "trials"]:
+            if key not in ["epochs", "trials", self._settings_intervals_name]:
                 shape = _sanitize_shape(ss["shape"])
                 self._current_msg = AxisArray(
                     data=np.zeros(shape, dtype=self._current_msg.data.dtype),
@@ -470,28 +469,34 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             log: Set True to log the closing and deletion of the file.
               This must be kept False when calling from __del__.
         """
-        if self._io is not None:
-            if write:
-                self._io.write(self._nwbfile)
-            src_str = f"{self._io.source}"
-            b_delete = sum(self._stream_bytes.values()) == 0
-            for key in ["epochs", "trials"]:
-                if hasattr(self._nwbfile, key) and getattr(self._nwbfile, key) is not None:
-                    b_delete = b_delete and len(getattr(self._nwbfile, key)) == 1  # EZNWB-START
-            self._io.close()
-            del self._nwbfile
-            del self._io
-            self._nwbfile = None
-            self._io = None
-            if log:
-                ez.logger.info(f"Closed file at {src_str}")
-            if b_delete:
-                self.path_on_disk.unlink(missing_ok=True)
+        with self._lock:
+            if self._io is not None:
+                self._flush_settings_interval(time.time(), "EZMSG-SETTINGS", "__shutdown__")
+                if write:
+                    self._io.write(self._nwbfile)
+                src_str = f"{self._io.source}"
+                b_delete = sum(self._stream_bytes.values()) == 0
+                for key in ["epochs", "trials"]:
+                    if hasattr(self._nwbfile, key) and getattr(self._nwbfile, key) is not None:
+                        b_delete = b_delete and len(getattr(self._nwbfile, key)) == 1  # EZNWB-START
+                settings_intervals = self._get_settings_intervals()
+                if settings_intervals is not None:
+                    b_delete = b_delete and len(settings_intervals) == 1  # EZNWB-SETTINGS-START
+                self._io.close()
+                del self._nwbfile
+                del self._io
+                self._nwbfile = None
+                self._io = None
                 if log:
-                    ez.logger.info(f"Deleted empty file at {src_str}.")
+                    ez.logger.info(f"Closed file at {src_str}")
+                if b_delete:
+                    self.path_on_disk.unlink(missing_ok=True)
+                    if log:
+                        ez.logger.info(f"Deleted empty file at {src_str}.")
 
     def toggle_recording(self, recording: typing.Optional[bool] = None):
-        self._recording = recording if recording is not None else not self._recording
+        with self._lock:
+            self._recording = recording if recording is not None else not self._recording
 
     def _check_msg_consistency(self) -> bool:
         key = self._current_msg.key
@@ -545,6 +550,8 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         for key in ["epochs", "trials"]:
             if hasattr(self._nwbfile, key) and getattr(self._nwbfile, key) is not None:
                 meta[key] = {"fs": 0.0, "shape": (0, 1)}
+        if self._settings_columns:
+            meta[self._settings_intervals_name] = {"columns": list(self._settings_columns)}
         for key, ds in self._datasets.items():
             if key not in ["epochs", "trials"]:
                 meta[key] = {"fs": ds["ts"].attrs["rate"], "shape": (0,) + ds["shape"]}
@@ -628,7 +635,108 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
     ):
         fun = {"epochs": self._nwbfile.add_epoch, "trials": self._nwbfile.add_trial}[key]
         for ev_t, ev_str in zip(timestamps, data):
-            fun(start_time=ev_t, stop_time=ev_t + 0, **{"label": ",".join(ev_str)}, **self._settings_dict)
+            fun(start_time=ev_t, stop_time=ev_t + 0, **{"label": ",".join(ev_str)})
+
+    def _get_settings_intervals(self) -> typing.Any:
+        if self._nwbfile is None or self._nwbfile.intervals is None:
+            return None
+        try:
+            return self._nwbfile.intervals[self._settings_intervals_name]
+        except Exception:
+            return None
+
+    def _prep_settings_intervals(self, settings_columns: typing.Iterable[str]) -> None:
+        existing = self._get_settings_intervals()
+        if existing is not None:
+            return
+
+        intervals = pynwb.epoch.TimeIntervals(
+            name=self._settings_intervals_name,
+            description="Flattened ezmsg settings snapshots active over each logged interval",
+        )
+        intervals.add_column(name="label", description="settings interval label")
+        intervals.add_column(name="updated_component", description="component that triggered the snapshot transition")
+        for column_name in settings_columns:
+            intervals.add_column(name=column_name, description="flattened ezmsg setting")
+        self._nwbfile.add_time_intervals(intervals)
+
+        table = self._get_settings_intervals()
+        if table is None:
+            raise RuntimeError("Failed to create settings_intervals table")
+
+        self._settings_columns = list(settings_columns)
+        for col in table.colnames:
+            table[col].set_data_io(H5DataIO, {"maxshape": (None,)})
+
+    def _settings_relative_time(self, timestamp: float) -> float:
+        return timestamp - self.get_session_timestamp(None)
+
+    def initialize_settings_state(self, flat_settings: dict[str, typing.Any], timestamp: float) -> None:
+        with self._lock:
+            if not flat_settings:
+                return
+            if not self._settings_columns:
+                self._prep_settings_intervals(flat_settings.keys())
+            missing_columns = [name for name in flat_settings if name not in self._settings_columns]
+            if missing_columns:
+                raise ValueError(
+                    "Received settings fields not present in settings_intervals schema: "
+                    f"{', '.join(sorted(missing_columns))}"
+                )
+            self._settings_state = {
+                column_name: flat_settings.get(column_name, "") for column_name in self._settings_columns
+            }
+            self._settings_active_since = timestamp
+
+            self.update_settings_state("__init__", flat_settings, self.get_session_timestamp())
+
+    def update_settings_state(
+        self,
+        component_address: str,
+        flat_settings: dict[str, typing.Any],
+        timestamp: float,
+    ) -> None:
+        with self._lock:
+            if not flat_settings:
+                return
+            if not self._settings_columns:
+                self._prep_settings_intervals(flat_settings.keys())
+                self._settings_state = {column_name: "" for column_name in self._settings_columns}
+                self._settings_active_since = timestamp
+
+            missing_columns = [name for name in flat_settings if name not in self._settings_columns]
+            if missing_columns:
+                raise ValueError(
+                    "Received settings fields not present in settings_intervals schema: "
+                    f"{', '.join(sorted(missing_columns))}"
+                )
+
+            self._flush_settings_interval(timestamp, "EZMSG-SETTINGS", component_address)
+            if not self._settings_state:
+                self._settings_state = {column_name: "" for column_name in self._settings_columns}
+            self._settings_state.update(flat_settings)
+            self._settings_active_since = timestamp
+
+    def _flush_settings_interval(self, end_timestamp: float, label: str, updated_component: str) -> None:
+        if not self._settings_state or self._settings_active_since is None:
+            return
+
+        table = self._get_settings_intervals()
+        if table is None:
+            return
+
+        start_time = self._settings_relative_time(self._settings_active_since)
+        stop_time = self._settings_relative_time(end_timestamp)
+        if stop_time < start_time:
+            stop_time = start_time
+
+        table.add_interval(
+            start_time=start_time,
+            stop_time=stop_time,
+            label=label,
+            updated_component=updated_component,
+            **self._settings_state,
+        )
 
     def _prep_event_io(self):
         """
@@ -750,6 +858,102 @@ class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
 
     INPUT_SETTINGS = ez.InputStream(NWBSinkSettings)
 
+    async def initialize(self) -> None:
+        await super().initialize()
+        self._settings_ctx: typing.Optional[ez.GraphContext] = None
+        self._settings_watch_task: typing.Optional[asyncio.Task[None]] = None
+        self._settings_component_addresses: set[str] = set()
+        self._settings_last_timestamp: float = time.time()
+
+        try:
+            ctx = ez.GraphContext(auto_start=False)
+            await ctx.__aenter__()
+            self._settings_ctx = ctx
+
+            snapshot = await ctx.snapshot()
+            session_components = self._session_component_addresses(snapshot)
+            if not session_components:
+                return
+
+            self._settings_component_addresses = session_components
+            settings_snapshot = await ctx.settings_snapshot()
+            settings_events = await ctx.settings_events(after_seq=0)
+
+            flat_snapshot: dict[str, typing.Any] = {}
+            for component_address in sorted(session_components):
+                if component_address in settings_snapshot:
+                    flat_snapshot.update(
+                        flatten_component_settings(component_address, settings_snapshot[component_address])
+                    )
+
+            latest_timestamp = max(
+                (event.timestamp for event in settings_events if event.component_address in session_components),
+                default=time.time(),
+            )
+            last_seq = max((event.seq for event in settings_events), default=0)
+            self._settings_last_timestamp = latest_timestamp
+
+            if flat_snapshot:
+                await asyncio.to_thread(self.processor.initialize_settings_state, flat_snapshot, latest_timestamp)
+
+            self._settings_watch_task = asyncio.create_task(
+                self._watch_graph_settings(after_seq=last_seq),
+                name=f"{self.address}-settings-watch",
+            )
+
+        except Exception as exc:
+            ez.logger.warning(f"{self.address} could not initialize GraphServer-backed settings logging: {exc}")
+            if self._settings_ctx is not None:
+                await self._settings_ctx.__aexit__(None, None, None)
+                self._settings_ctx = None
+
+    def _session_component_addresses(self, graph_snapshot: typing.Any) -> set[str]:
+        for session in graph_snapshot.sessions.values():
+            metadata = session.metadata
+            if metadata is None:
+                continue
+            if self.address in metadata.components:
+                return set(metadata.components.keys())
+        return set()
+
+    async def _watch_graph_settings(self, after_seq: int) -> None:
+        if self._settings_ctx is None:
+            return
+        async for event in self._settings_ctx.subscribe_settings_events(after_seq=after_seq):
+            if event.component_address not in self._settings_component_addresses:
+                continue
+            flat_settings = flatten_component_settings(event.component_address, event.value)
+            try:
+                await asyncio.to_thread(
+                    self.processor.update_settings_state,
+                    event.component_address,
+                    flat_settings,
+                    event.timestamp,
+                )
+                self._settings_last_timestamp = event.timestamp
+            except Exception as exc:
+                ez.logger.warning(
+                    f"{self.address} failed to record settings update for {event.component_address}: {exc}"
+                )
+
+    async def _bootstrap_processor_settings(self) -> None:
+        if self._settings_ctx is None or not self._settings_component_addresses:
+            return
+
+        settings_snapshot = await self._settings_ctx.settings_snapshot()
+        flat_snapshot: dict[str, typing.Any] = {}
+        for component_address in sorted(self._settings_component_addresses):
+            if component_address in settings_snapshot:
+                flat_snapshot.update(
+                    flatten_component_settings(component_address, settings_snapshot[component_address])
+                )
+        if flat_snapshot:
+            await asyncio.to_thread(
+                self.processor.initialize_settings_state,
+                flat_snapshot,
+                self._settings_last_timestamp,
+            )
+
     @ez.subscriber(INPUT_SETTINGS)
     async def on_settings(self, msg: NWBSinkSettings) -> None:
         # Reset if settings _other than `recording`_ have changed.
@@ -761,9 +965,18 @@ class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
         if b_reset:
             self.apply_settings(msg)
             self.create_processor()
+            await self._bootstrap_processor_settings()
         elif msg.recording != self.SETTINGS.recording:
             self.processor.toggle_recording(msg.recording)
 
     async def shutdown(self) -> None:
+        if getattr(self, "_settings_watch_task", None) is not None:
+            self._settings_watch_task.cancel()
+            try:
+                await self._settings_watch_task
+            except asyncio.CancelledError:
+                pass
+        if getattr(self, "_settings_ctx", None) is not None:
+            await self._settings_ctx.__aexit__(None, None, None)
         await super().shutdown()
         self.processor.close()
