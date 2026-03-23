@@ -137,10 +137,11 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         self._io: typing.Optional[pynwb.NWBHDF5IO] = None
         self._nwbfile: typing.Optional[pynwb.NWBFile] = None
         self._datasets: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
-        self._settings_intervals_name = "settings_intervals"
+        self._settings_intervals_name = "pipeline_settings"
         self._settings_columns: list[str] = []
         self._settings_state: dict[str, typing.Any] = {}
         self._settings_active_since: typing.Optional[float] = None
+        self._settings_prev_component: str = "__init__"
 
         # Normalize filepath and delete existing file if enabled.
         self._check_filepath()
@@ -261,7 +262,8 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
 
                 if 0 < self._split_bytes <= sum(self._stream_bytes.values()) and "%d" not in str(self._filepath):
                     split_timestamp = time.time()
-                    self._flush_settings_interval(split_timestamp, "EZMSG-SETTINGS", "__split__")
+                    self._flush_settings_interval(split_timestamp, self._settings_prev_component)
+                    self._settings_prev_component = "__split__"
                     reopen_settings_since = split_timestamp if self._settings_state else None
                     self._settings_active_since = None
                     self._split_count += 1
@@ -471,7 +473,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         """
         with self._lock:
             if self._io is not None:
-                self._flush_settings_interval(time.time(), "EZMSG-SETTINGS", "__shutdown__")
+                self._flush_settings_interval(time.time(), self._settings_prev_component)
                 if write:
                     self._io.write(self._nwbfile)
                 src_str = f"{self._io.source}"
@@ -627,6 +629,11 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                     v["data"] = series.data
                     v["ts"] = series.timestamps
 
+    def _configure_appendable_table(self, table: typing.Any) -> None:
+        table.id.set_data_io(H5DataIO, {"maxshape": (None,), "chunks": True})
+        for col in table.colnames:
+            table[col].set_data_io(H5DataIO, {"maxshape": (None,), "chunks": True})
+
     def _append_events(
         self,
         key: str,
@@ -654,7 +661,6 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             name=self._settings_intervals_name,
             description="Flattened ezmsg settings snapshots active over each logged interval",
         )
-        intervals.add_column(name="label", description="settings interval label")
         intervals.add_column(name="updated_component", description="component that triggered the snapshot transition")
         for column_name in settings_columns:
             intervals.add_column(name=column_name, description="flattened ezmsg setting")
@@ -665,8 +671,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             raise RuntimeError("Failed to create settings_intervals table")
 
         self._settings_columns = list(settings_columns)
-        for col in table.colnames:
-            table[col].set_data_io(H5DataIO, {"maxshape": (None,)})
+        self._configure_appendable_table(table)
 
     def _settings_relative_time(self, timestamp: float) -> float:
         return timestamp - self.get_session_timestamp(None)
@@ -690,6 +695,8 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
 
             self.update_settings_state("__init__", flat_settings, self.get_session_timestamp())
 
+            self._flush_io(reopen=True)
+
     def update_settings_state(
         self,
         component_address: str,
@@ -711,13 +718,14 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                     f"{', '.join(sorted(missing_columns))}"
                 )
 
-            self._flush_settings_interval(timestamp, "EZMSG-SETTINGS", component_address)
+            self._flush_settings_interval(timestamp, self._settings_prev_component)
             if not self._settings_state:
                 self._settings_state = {column_name: "" for column_name in self._settings_columns}
             self._settings_state.update(flat_settings)
             self._settings_active_since = timestamp
+            self._settings_prev_component = component_address
 
-    def _flush_settings_interval(self, end_timestamp: float, label: str, updated_component: str) -> None:
+    def _flush_settings_interval(self, end_timestamp: float, updated_component: str) -> None:
         if not self._settings_state or self._settings_active_since is None:
             return
 
@@ -733,7 +741,6 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         table.add_interval(
             start_time=start_time,
             stop_time=stop_time,
-            label=label,
             updated_component=updated_component,
             **self._settings_state,
         )
@@ -753,8 +760,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         self._datasets[key] = {"shape": self._current_msg.data.shape[1:]}
 
         table = {"epochs": self._nwbfile.epochs, "trials": self._nwbfile.trials}[key]
-        for col in table.colnames:
-            table[col].set_data_io(H5DataIO, {"maxshape": (None,)})
+        self._configure_appendable_table(table)
 
         # Note: We cannot io.write(...) yet because a bug in hdmf requires that a custom column
         #  must have data before it may be written:

@@ -11,6 +11,7 @@ from ezmsg.util.messagecodec import message_log
 from ezmsg.util.messagelogger import MessageLogger, MessageLoggerSettings
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.terminate import TerminateOnTotal, TerminateOnTotalSettings
+from pynwb import NWBHDF5IO
 
 from ezmsg.nwb import (
     NWBAxisArrayIterator,
@@ -148,6 +149,24 @@ def test_nwb_clockdriven_unit_system(test_nwb_path):
 # -- Writer round-trip tests --
 
 
+def _make_writer_continuous_msg() -> AxisArray:
+    return AxisArray(
+        data=np.arange(6, dtype=float).reshape(3, 2),
+        dims=["time", "ch"],
+        axes={"time": AxisArray.Axis.TimeAxis(fs=100.0)},
+        key="sig",
+    )
+
+
+def _make_writer_epochs_msg() -> AxisArray:
+    return AxisArray(
+        data=np.array([["a"], ["b"]], dtype="U"),
+        dims=["time", "ch"],
+        axes={"time": AxisArray.CoordinateAxis(np.array([0.0, 1.0]), dims=["time"], unit="s")},
+        key="epochs",
+    )
+
+
 def test_writer_roundtrip_continuous(test_nwb_path):
     """Test writing continuous data and reading it back."""
     settings = NWBIteratorSettings(
@@ -233,3 +252,79 @@ def test_writer_recording_toggle():
     assert sink._recording is False
     sink.close(write=False)
     outpath.unlink(missing_ok=True)
+
+
+def test_writer_pipeline_settings_shutdown_persist(tmp_path):
+    """Pipeline settings created before first data should persist and append on close."""
+    outpath = tmp_path / "ezmsg_nwb_settings_shutdown_test.nwb"
+
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+    sink.initialize_settings_state({"component_foo": "bar"}, timestamp=1.0)
+    sink._process(_make_writer_continuous_msg())
+    sink.close(write=False)
+
+    assert outpath.exists()
+
+    with NWBHDF5IO(outpath, "r") as io:
+        nwbfile = io.read()
+        table = nwbfile.intervals["pipeline_settings"]
+        df = table.to_dataframe()
+
+    assert df["updated_component"].tolist() == ["__init__", "__init__"]
+    assert df["component_foo"].tolist() == ["bar", "bar"]
+
+
+def test_writer_pipeline_settings_created_after_first_flush(tmp_path):
+    """Pipeline settings created after the first stream flush should still be materialized."""
+    outpath = tmp_path / "ezmsg_nwb_settings_late_create_test.nwb"
+
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+    sink._process(_make_writer_continuous_msg())
+    sink.initialize_settings_state({"component_foo": "bar"}, timestamp=1.0)
+    sink.close(write=False)
+
+    assert outpath.exists()
+
+    with NWBHDF5IO(outpath, "r") as io:
+        nwbfile = io.read()
+        assert nwbfile.intervals is not None
+        table = nwbfile.intervals["pipeline_settings"]
+        df = table.to_dataframe()
+
+    assert df["updated_component"].tolist() == ["__init__", "__init__"]
+    assert df["component_foo"].tolist() == ["bar", "bar"]
+
+
+def test_writer_event_append_after_reopen(tmp_path):
+    """Epoch rows should remain appendable after the initial write/reopen cycle."""
+    outpath = tmp_path / "ezmsg_nwb_event_append_test.nwb"
+
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+    sink._process(_make_writer_epochs_msg())
+    sink.close(write=False)
+
+    assert outpath.exists()
+
+    with NWBHDF5IO(outpath, "r") as io:
+        nwbfile = io.read()
+        df = nwbfile.epochs.to_dataframe()
+
+    assert df["label"].tolist() == ["EZNWB-START", "a", "b"]
