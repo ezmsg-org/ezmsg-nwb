@@ -307,6 +307,33 @@ def test_writer_pipeline_settings_created_after_first_flush(tmp_path):
     assert df["component_foo"].tolist() == ["bar", "bar"]
 
 
+def test_writer_pipeline_settings_shape_change_rotates_file(tmp_path):
+    """An incompatible settings update should rotate to a new file instead of erroring on close."""
+    outpath = tmp_path / "ezmsg_nwb_settings_rotate_integration_test.nwb"
+    rotated_path = tmp_path / "ezmsg_nwb_settings_rotate_integration_test_01.nwb"
+
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+    sink.initialize_settings({"component_list": [[1, 2], [3, 4]]}, timestamp=1.0)
+    sink._process(_make_writer_continuous_msg())
+    sink.update_settings("component", {"component_list": [[1, 2], [3, 4], [5, 6]]}, timestamp=2.0)
+    sink.close(write=False)
+
+    assert outpath.exists()
+    assert rotated_path.exists()
+
+    with NWBHDF5IO(rotated_path, "r") as io:
+        nwbfile = io.read()
+        df = nwbfile.intervals["pipeline_settings"].to_dataframe()
+
+    np.testing.assert_array_equal(df["component_list"].iloc[-1], np.array([[1, 2], [3, 4], [5, 6]]))
+
+
 def test_writer_event_append_after_reopen(tmp_path):
     """Epoch rows should remain appendable after the initial write/reopen cycle."""
     outpath = tmp_path / "ezmsg_nwb_event_append_test.nwb"

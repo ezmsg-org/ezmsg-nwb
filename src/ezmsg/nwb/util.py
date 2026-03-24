@@ -126,9 +126,9 @@ def flatten_component_settings(component_address: str, value: Any) -> dict[str, 
     if isinstance(value, ez.Settings):
         flat = flatten_ez_settings(value)
     elif hasattr(value, "structured_value") and getattr(value, "structured_value") is not None:
-        flat = _flatten_value(getattr(value, "structured_value"))
+        flat = _flatten_value(getattr(value, "structured_value"), "")
     elif hasattr(value, "repr_value") and isinstance(getattr(value, "repr_value"), dict):
-        flat = _flatten_value(getattr(value, "repr_value"))
+        flat = _flatten_value(getattr(value, "repr_value"), "")
     else:
         flat = _flatten_value(value, "")
 

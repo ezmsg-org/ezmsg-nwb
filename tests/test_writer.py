@@ -201,3 +201,137 @@ def test_sink_updates_list_settings_with_same_shape(tmp_path):
 
     np.testing.assert_array_equal(df["component_list"].iloc[0], np.array([[1, 2], [3, 4]]))
     np.testing.assert_array_equal(df["component_list"].iloc[-1], np.array([[5, 6], [7, 8]]))
+
+
+def test_sink_rotates_file_on_incompatible_list_shape_update(tmp_path):
+    """A settings shape change should close the current file and continue in a new segment."""
+    outpath = tmp_path / "ezmsg_nwb_settings_rotate_test.nwb"
+    rotated_path = tmp_path / "ezmsg_nwb_settings_rotate_test_01.nwb"
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+
+    sink.initialize_settings({"component_list": [[1, 2], [3, 4]]}, timestamp=1.0)
+    sink._process(
+        AxisArray(
+            data=np.arange(4, dtype=float).reshape(2, 2),
+            dims=["time", "ch"],
+            axes={"time": AxisArray.Axis.TimeAxis(fs=100.0)},
+            key="sig",
+        )
+    )
+
+    sink.update_settings("component", {"component_list": [[1, 2], [3, 4], [5, 6]]}, timestamp=2.0)
+    sink._process(
+        AxisArray(
+            data=np.arange(4, 8, dtype=float).reshape(2, 2),
+            dims=["time", "ch"],
+            axes={"time": AxisArray.Axis.TimeAxis(fs=100.0, offset=2.0)},
+            key="sig",
+        )
+    )
+    sink.close(write=False)
+
+    assert outpath.exists()
+    assert rotated_path.exists()
+
+    with NWBHDF5IO(outpath, "r") as io:
+        nwbfile = io.read()
+        df = nwbfile.intervals["pipeline_settings"].to_dataframe()
+        np.testing.assert_array_equal(df["component_list"].iloc[-1], np.array([[1, 2], [3, 4]]))
+        np.testing.assert_array_equal(
+            np.asarray(nwbfile.acquisition["sig"].data[:]), np.arange(4, dtype=float).reshape(2, 2)
+        )
+
+    with NWBHDF5IO(rotated_path, "r") as io:
+        nwbfile = io.read()
+        df = nwbfile.intervals["pipeline_settings"].to_dataframe()
+        np.testing.assert_array_equal(df["component_list"].iloc[-1], np.array([[1, 2], [3, 4], [5, 6]]))
+        np.testing.assert_array_equal(
+            np.asarray(nwbfile.acquisition["sig"].data[:]),
+            np.arange(4, 8, dtype=float).reshape(2, 2),
+        )
+
+
+def test_sink_rotates_file_on_scalar_to_array_update(tmp_path):
+    """A scalar-to-array settings transition should rotate to a new file segment."""
+    outpath = tmp_path / "ezmsg_nwb_settings_scalar_rotate_test.nwb"
+    rotated_path = tmp_path / "ezmsg_nwb_settings_scalar_rotate_test_01.nwb"
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+
+    sink.initialize_settings({"component_value": "foo"}, timestamp=1.0)
+    sink.update_settings("component", {"component_value": [1, 2, 3]}, timestamp=2.0)
+    sink.close(write=False)
+
+    assert outpath.exists()
+    assert rotated_path.exists()
+
+    with NWBHDF5IO(outpath, "r") as io:
+        nwbfile = io.read()
+        df = nwbfile.intervals["pipeline_settings"].to_dataframe()
+        assert df["component_value"].iloc[-1] == "foo"
+
+    with NWBHDF5IO(rotated_path, "r") as io:
+        nwbfile = io.read()
+        df = nwbfile.intervals["pipeline_settings"].to_dataframe()
+        np.testing.assert_array_equal(df["component_value"].iloc[-1], np.array([1, 2, 3]))
+
+
+def test_sink_rotates_file_on_rank_change_update(tmp_path):
+    """A settings rank change should rotate to a new file segment."""
+    outpath = tmp_path / "ezmsg_nwb_settings_rank_rotate_test.nwb"
+    rotated_path = tmp_path / "ezmsg_nwb_settings_rank_rotate_test_01.nwb"
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+
+    sink.initialize_settings({"component_value": [1, 2, 3]}, timestamp=1.0)
+    sink.update_settings("component", {"component_value": [[1, 2, 3]]}, timestamp=2.0)
+    sink.close(write=False)
+
+    assert outpath.exists()
+    assert rotated_path.exists()
+
+    with NWBHDF5IO(rotated_path, "r") as io:
+        nwbfile = io.read()
+        df = nwbfile.intervals["pipeline_settings"].to_dataframe()
+        np.testing.assert_array_equal(df["component_value"].iloc[-1], np.array([[1, 2, 3]]))
+
+
+def test_sink_rotation_before_new_data_preserves_new_settings_file(tmp_path):
+    """A settings-triggered rotation should keep the new file even before more samples arrive."""
+    outpath = tmp_path / "ezmsg_nwb_settings_no_data_rotate_test.nwb"
+    rotated_path = tmp_path / "ezmsg_nwb_settings_no_data_rotate_test_01.nwb"
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+
+    sink.initialize_settings({"component_list": [1, 2]}, timestamp=1.0)
+    sink.update_settings("component", {"component_list": [[1, 2], [3, 4]]}, timestamp=2.0)
+    sink.close(write=False)
+
+    assert outpath.exists()
+    assert rotated_path.exists()
+
+    with NWBHDF5IO(rotated_path, "r") as io:
+        nwbfile = io.read()
+        df = nwbfile.intervals["pipeline_settings"].to_dataframe()
+        np.testing.assert_array_equal(df["component_list"].iloc[-1], np.array([[1, 2], [3, 4]]))

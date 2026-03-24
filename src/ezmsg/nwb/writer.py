@@ -73,7 +73,6 @@ import threading
 import time
 import typing
 from collections import defaultdict
-from dataclasses import field
 from pathlib import Path
 from uuid import uuid4
 
@@ -110,7 +109,6 @@ class NWBSinkSettings(ez.Settings):
     meta_yaml: typing.Optional[typing.Union[str, os.PathLike]] = None
     split_bytes: int = 0
     expected_series: typing.Optional[typing.Union[str, os.PathLike]] = None
-    test_setting: list = field(default_factory=lambda: [[1, 2], [3, 4]])
 
 
 class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
@@ -282,32 +280,23 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                         self._stream_bytes[self._current_msg.key] += timestamps.nbytes
 
                 if 0 < self._split_bytes <= sum(self._stream_bytes.values()) and "%d" not in str(self._filepath):
-                    # When the file hits the split threshold, flush the active settings
-                    # interval, clone the NWB structure, and continue in a fresh file.
-                    split_timestamp = time.time()
-                    self._flush_settings_interval(split_timestamp, self._settings_prev_component)
-                    self._settings_prev_component = "__split__"
-                    reopen_settings_since = split_timestamp if self._settings_state else None
-                    self._settings_active_since = None
-                    self._split_count += 1
-                    self.path_on_disk.unlink(missing_ok=True)
-                    new_nwbfile, new_meta = self._copy_nwb()
-                    self.close()
-                    self._nwb_create_or_fail(nwbfile=new_nwbfile)
-                    self._prep_from_meta(new_meta)
-                    self._settings_active_since = reopen_settings_since
+                    # When the file hits the split threshold, rotate into a fresh
+                    # file and continue with the current settings snapshot.
+                    self._rotate_file(
+                        timestamp=time.time(),
+                        next_settings_state=self._settings_state.copy(),
+                        next_settings_prev_component="__split__",
+                    )
 
     @property
     def path_on_disk(self) -> Path:
         """Return the concrete on-disk filepath for the current output segment."""
         fp = Path(self._filepath)
-        if self._split_bytes > 0:
-            if "%d" in str(fp):
-                return Path(re.sub("%d", "0", str(fp)))
-            else:
-                return fp.parent / (fp.stem + f"_{self._split_count:02}" + fp.suffix)
-        else:
-            return fp
+        if "%d" in str(fp):
+            return Path(re.sub("%d", "0", str(fp)))
+        if self._split_count > 0:
+            return fp.parent / (fp.stem + f"_{self._split_count:02}" + fp.suffix)
+        return fp
 
     def get_session_datetime(self, try_t0: typing.Optional[float] = None) -> datetime.datetime:
         """
@@ -450,7 +439,10 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
 
         if self._settings_table_name in meta:
             settings_meta = meta[self._settings_table_name]
-            self._prep_settings_table(settings_meta.get("columns", []))
+            sample_values = settings_meta.get("sample_values") or {
+                column_name: "" for column_name in settings_meta.get("columns", [])
+            }
+            self._prep_settings_table(sample_values)
 
         # Recreate the continuous-series schema from the metadata payload.
         for key, ss in meta.items():
@@ -496,7 +488,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                         b_delete = b_delete and len(getattr(self._nwbfile, key)) == 1  # EZNWB-START
                 settings_table = self._get_settings_table()
                 if settings_table is not None:
-                    b_delete = b_delete and len(settings_table) == 1  # EZNWB-SETTINGS-START
+                    b_delete = b_delete and len(settings_table) == 0
                 self._io.close()
                 del self._nwbfile
                 del self._io
@@ -543,7 +535,11 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 rate = 1 / time_ax.gain if time_ax.gain != 0 else 0
             self._datasets[self._current_msg.key]["ts"].attrs["rate"] = rate
 
-    def _copy_nwb(self) -> typing.Tuple[pynwb.NWBFile, dict]:
+    def _copy_nwb(
+        self,
+        settings_columns: typing.Optional[typing.Iterable[str]] = None,
+        settings_state: typing.Optional[dict[str, typing.Any]] = None,
+    ) -> typing.Tuple[pynwb.NWBFile, dict]:
         """Clone the current NWB structure into a fresh file and metadata description."""
         copy_keys = [
             "session_description",
@@ -575,8 +571,13 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         for key in ["epochs", "trials"]:
             if hasattr(self._nwbfile, key) and getattr(self._nwbfile, key) is not None:
                 meta[key] = {"fs": 0.0, "shape": (0, 1)}
-        if self._settings_columns:
-            meta[self._settings_table_name] = {"columns": list(self._settings_columns)}
+        settings_columns = list(self._settings_columns if settings_columns is None else settings_columns)
+        settings_state = self._settings_state if settings_state is None else settings_state
+        if settings_columns:
+            meta[self._settings_table_name] = {
+                "columns": settings_columns,
+                "sample_values": {column_name: settings_state.get(column_name, "") for column_name in settings_columns},
+            }
         for key, ds in self._datasets.items():
             if key not in ["epochs", "trials"]:
                 meta[key] = {"fs": ds["ts"].attrs["rate"], "shape": (0,) + ds["shape"]}
@@ -710,6 +711,30 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         """Convert an absolute timestamp into file-relative session time."""
         return timestamp - self.get_session_timestamp(None)
 
+    def _settings_value_shape(self, value: typing.Any) -> tuple[int, ...]:
+        """Return the per-cell shape occupied by a settings value."""
+        if value is None or np.isscalar(value) or isinstance(value, (str, bytes)):
+            return ()
+
+        try:
+            return tuple(np.asarray(value).shape)
+        except Exception:
+            return ()
+
+    def _column_value_shape(self, column_name: str) -> tuple[int, ...]:
+        """Return the current per-cell shape stored for a settings column."""
+        table = self._get_settings_table()
+        if table is not None and column_name in table.colnames:
+            data = table[column_name].data
+            if hasattr(data, "shape"):
+                shape = tuple(data.shape)
+                return shape[1:] if len(shape) > 1 else ()
+
+        if column_name in self._settings_state:
+            return self._settings_value_shape(self._settings_state[column_name])
+
+        return ()
+
     def _validate_settings_columns(self, flat_settings: dict[str, typing.Any]) -> None:
         """Ensure incoming settings keys match the established settings-table schema."""
         missing_columns = [name for name in flat_settings if name not in self._settings_columns]
@@ -717,6 +742,73 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             raise ValueError(
                 f"Received settings fields not present in settings table schema: {', '.join(sorted(missing_columns))}"
             )
+
+    def _settings_update_requires_rotation(self, flat_settings: dict[str, typing.Any]) -> bool:
+        """Return whether an incoming settings update is incompatible with the current table schema."""
+        for column_name, value in flat_settings.items():
+            if column_name not in self._settings_columns:
+                return True
+
+            current_shape = self._column_value_shape(column_name)
+            new_shape = self._settings_value_shape(value)
+            current_is_scalar = current_shape == ()
+            new_is_scalar = new_shape == ()
+
+            if current_is_scalar != new_is_scalar:
+                return True
+            if not current_is_scalar and current_shape != new_shape:
+                return True
+
+        return False
+
+    def _merged_settings_state(self, flat_settings: dict[str, typing.Any]) -> dict[str, typing.Any]:
+        """Return the full settings snapshot after applying a partial settings update."""
+        merged = {column_name: self._settings_state.get(column_name, "") for column_name in self._settings_columns}
+        merged.update(flat_settings)
+        return merged
+
+    def _rotate_file(
+        self,
+        timestamp: float,
+        next_settings_state: typing.Optional[dict[str, typing.Any]],
+        next_settings_prev_component: str,
+    ) -> None:
+        """Close the current NWB file and open a new segment seeded with the given settings state."""
+        if self._settings_state and self._settings_active_since is not None:
+            self._flush_settings_interval(timestamp, self._settings_prev_component)
+
+        next_settings_state = dict(next_settings_state or {})
+        next_settings_columns = list(next_settings_state.keys())
+
+        # Prevent close() from re-appending the interval we just flushed.
+        self._settings_active_since = None
+
+        # Advance to the next file segment before creating the replacement file.
+        self._split_count += 1
+        self.path_on_disk.unlink(missing_ok=True)
+
+        new_nwbfile, new_meta = self._copy_nwb(
+            settings_columns=[],
+            settings_state={},
+        )
+        self.close()
+        self._nwb_create_or_fail(nwbfile=new_nwbfile)
+        self._prep_from_meta(new_meta)
+
+        if next_settings_state:
+            self._prep_settings_table(next_settings_state)
+            self._settings_state = {
+                column_name: next_settings_state.get(column_name, "") for column_name in self._settings_columns
+            }
+            self._settings_active_since = timestamp
+            self._settings_prev_component = next_settings_prev_component
+            self._apply_settings_update(next_settings_prev_component, next_settings_state, timestamp)
+            self._flush_io(reopen=True)
+        else:
+            self._settings_columns = next_settings_columns
+            self._settings_state = next_settings_state
+            self._settings_active_since = None
+            self._settings_prev_component = next_settings_prev_component
 
     def _apply_settings_update(
         self,
@@ -794,6 +886,14 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 self._prep_settings_table(flat_settings)
                 self._settings_state = {column_name: "" for column_name in self._settings_columns}
                 self._settings_active_since = timestamp
+
+            if self._settings_update_requires_rotation(flat_settings):
+                self._rotate_file(
+                    timestamp=timestamp,
+                    next_settings_state=self._merged_settings_state(flat_settings),
+                    next_settings_prev_component=component_address,
+                )
+                return
 
             self._validate_settings_columns(flat_settings)
             self._apply_settings_update(component_address, flat_settings, timestamp)
