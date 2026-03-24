@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from enum import Enum
@@ -51,7 +52,14 @@ def sanitize_settings_value(value: Any) -> str:
         value = value.value
     if isinstance(value, os.PathLike):
         return os.fspath(value)
-    return str(value)
+    if isinstance(value, (bool, int, float, str)):
+        # Keep primitive types
+        return value
+    try:
+        return json.dumps(value)
+    except TypeError:
+        # Force everything else to str
+        return str(value)
 
 
 def flatten_mapping(value: Any, prefix: str = "") -> dict[str, Any]:

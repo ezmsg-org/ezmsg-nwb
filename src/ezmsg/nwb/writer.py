@@ -73,6 +73,7 @@ import threading
 import time
 import typing
 from collections import defaultdict
+from dataclasses import field
 from pathlib import Path
 from uuid import uuid4
 
@@ -109,6 +110,7 @@ class NWBSinkSettings(ez.Settings):
     meta_yaml: typing.Optional[typing.Union[str, os.PathLike]] = None
     split_bytes: int = 0
     expected_series: typing.Optional[typing.Union[str, os.PathLike]] = None
+    test_setting: list = field(default_factory=lambda: [1, 2])
 
 
 class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
@@ -137,7 +139,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         self._io: typing.Optional[pynwb.NWBHDF5IO] = None
         self._nwbfile: typing.Optional[pynwb.NWBFile] = None
         self._datasets: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
-        self._settings_intervals_name = "pipeline_settings"
+        self._settings_table_name = "pipeline_settings"
         self._settings_columns: list[str] = []
         self._settings_state: dict[str, typing.Any] = {}
         self._settings_active_since: typing.Optional[float] = None
@@ -436,12 +438,12 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 )
                 self._prep_event_io()
 
-        if self._settings_intervals_name in meta:
-            settings_meta = meta[self._settings_intervals_name]
-            self._prep_settings_intervals(settings_meta.get("columns", []))
+        if self._settings_table_name in meta:
+            settings_meta = meta[self._settings_table_name]
+            self._prep_settings_table(settings_meta.get("columns", []))
 
         for key, ss in meta.items():
-            if key not in ["epochs", "trials", self._settings_intervals_name]:
+            if key not in ["epochs", "trials", self._settings_table_name]:
                 shape = _sanitize_shape(ss["shape"])
                 self._current_msg = AxisArray(
                     data=np.zeros(shape, dtype=self._current_msg.data.dtype),
@@ -481,9 +483,9 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 for key in ["epochs", "trials"]:
                     if hasattr(self._nwbfile, key) and getattr(self._nwbfile, key) is not None:
                         b_delete = b_delete and len(getattr(self._nwbfile, key)) == 1  # EZNWB-START
-                settings_intervals = self._get_settings_intervals()
-                if settings_intervals is not None:
-                    b_delete = b_delete and len(settings_intervals) == 1  # EZNWB-SETTINGS-START
+                settings_table = self._get_settings_table()
+                if settings_table is not None:
+                    b_delete = b_delete and len(settings_table) == 1  # EZNWB-SETTINGS-START
                 self._io.close()
                 del self._nwbfile
                 del self._io
@@ -553,7 +555,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             if hasattr(self._nwbfile, key) and getattr(self._nwbfile, key) is not None:
                 meta[key] = {"fs": 0.0, "shape": (0, 1)}
         if self._settings_columns:
-            meta[self._settings_intervals_name] = {"columns": list(self._settings_columns)}
+            meta[self._settings_table_name] = {"columns": list(self._settings_columns)}
         for key, ds in self._datasets.items():
             if key not in ["epochs", "trials"]:
                 meta[key] = {"fs": ds["ts"].attrs["rate"], "shape": (0,) + ds["shape"]}
@@ -644,21 +646,21 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         for ev_t, ev_str in zip(timestamps, data):
             fun(start_time=ev_t, stop_time=ev_t + 0, **{"label": ",".join(ev_str)})
 
-    def _get_settings_intervals(self) -> typing.Any:
+    def _get_settings_table(self) -> typing.Any:
         if self._nwbfile is None or self._nwbfile.intervals is None:
             return None
         try:
-            return self._nwbfile.intervals[self._settings_intervals_name]
+            return self._nwbfile.intervals[self._settings_table_name]
         except Exception:
             return None
 
-    def _prep_settings_intervals(self, settings_columns: typing.Iterable[str]) -> None:
-        existing = self._get_settings_intervals()
+    def _prep_settings_table(self, settings_columns: typing.Iterable[str]) -> None:
+        existing = self._get_settings_table()
         if existing is not None:
             return
 
         intervals = pynwb.epoch.TimeIntervals(
-            name=self._settings_intervals_name,
+            name=self._settings_table_name,
             description="Flattened ezmsg settings snapshots active over each logged interval",
         )
         intervals.add_column(name="updated_component", description="component that triggered the snapshot transition")
@@ -666,9 +668,9 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             intervals.add_column(name=column_name, description="flattened ezmsg setting")
         self._nwbfile.add_time_intervals(intervals)
 
-        table = self._get_settings_intervals()
+        table = self._get_settings_table()
         if table is None:
-            raise RuntimeError("Failed to create settings_intervals table")
+            raise RuntimeError("Failed to create settings table")
 
         self._settings_columns = list(settings_columns)
         self._configure_appendable_table(table)
@@ -681,11 +683,11 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             if not flat_settings:
                 return
             if not self._settings_columns:
-                self._prep_settings_intervals(flat_settings.keys())
+                self._prep_settings_table(flat_settings.keys())
             missing_columns = [name for name in flat_settings if name not in self._settings_columns]
             if missing_columns:
                 raise ValueError(
-                    "Received settings fields not present in settings_intervals schema: "
+                    "Received settings fields not present in settings table schema: "
                     f"{', '.join(sorted(missing_columns))}"
                 )
             self._settings_state = {
@@ -707,14 +709,14 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             if not flat_settings:
                 return
             if not self._settings_columns:
-                self._prep_settings_intervals(flat_settings.keys())
+                self._prep_settings_table(flat_settings.keys())
                 self._settings_state = {column_name: "" for column_name in self._settings_columns}
                 self._settings_active_since = timestamp
 
             missing_columns = [name for name in flat_settings if name not in self._settings_columns]
             if missing_columns:
                 raise ValueError(
-                    "Received settings fields not present in settings_intervals schema: "
+                    "Received settings fields not present in settings table schema: "
                     f"{', '.join(sorted(missing_columns))}"
                 )
 
@@ -729,7 +731,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         if not self._settings_state or self._settings_active_since is None:
             return
 
-        table = self._get_settings_intervals()
+        table = self._get_settings_table()
         if table is None:
             return
 
