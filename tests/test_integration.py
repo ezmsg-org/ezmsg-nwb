@@ -265,7 +265,7 @@ def test_writer_pipeline_settings_shutdown_persist(tmp_path):
             inc_clock=ReferenceClockType.UNKNOWN,
         )
     )
-    sink.initialize_settings_state({"component_foo": "bar"}, timestamp=1.0)
+    sink.initialize_settings({"component_foo": "bar"}, timestamp=1.0)
     sink._process(_make_writer_continuous_msg())
     sink.close(write=False)
 
@@ -292,7 +292,7 @@ def test_writer_pipeline_settings_created_after_first_flush(tmp_path):
         )
     )
     sink._process(_make_writer_continuous_msg())
-    sink.initialize_settings_state({"component_foo": "bar"}, timestamp=1.0)
+    sink.initialize_settings({"component_foo": "bar"}, timestamp=1.0)
     sink.close(write=False)
 
     assert outpath.exists()

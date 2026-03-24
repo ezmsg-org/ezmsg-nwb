@@ -1,5 +1,10 @@
 """Tests for NWB writer module."""
 
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+
+import ezmsg.core as ez
 import numpy as np
 from ezmsg.util.messages.axisarray import AxisArray
 from pynwb import NWBHDF5IO
@@ -48,7 +53,7 @@ def test_sink_close_is_idempotent_after_settings_activation(tmp_path):
         )
     )
 
-    sink.initialize_settings_state({"component_foo": "bar"}, timestamp=1.0)
+    sink.initialize_settings({"component_foo": "bar"}, timestamp=1.0)
     sink._process(
         AxisArray(
             data=np.arange(6, dtype=float).reshape(3, 2),
@@ -75,7 +80,7 @@ def test_sink_serializes_none_settings_values(tmp_path):
         )
     )
 
-    sink.initialize_settings_state(flatten_component_settings({"component_optional": None}), timestamp=1.0)
+    sink.initialize_settings(flatten_component_settings("component", {"component_optional": None}), timestamp=1.0)
     sink._process(
         AxisArray(
             data=np.arange(6, dtype=float).reshape(3, 2),
@@ -90,11 +95,11 @@ def test_sink_serializes_none_settings_values(tmp_path):
         nwbfile = io.read()
         df = nwbfile.intervals["pipeline_settings"].to_dataframe()
 
-    assert df["component_optional"].tolist() == ["None", "None"]
+    assert df["component.component_optional"].tolist() == ["None", "None"]
 
 
 def test_sink_serializes_list_settings_values(tmp_path):
-    """List-valued settings should be serialized into scalar table cells."""
+    """List-valued settings should be preserved as arrays in table cells."""
     outpath = tmp_path / "ezmsg_nwb_list_settings_test.nwb"
     sink = NWBSinkConsumer(
         settings=NWBSinkSettings(
@@ -104,7 +109,7 @@ def test_sink_serializes_list_settings_values(tmp_path):
         )
     )
 
-    sink.initialize_settings_state(flatten_component_settings({"component_list": [1, 2]}), timestamp=1.0)
+    sink.initialize_settings({"component_list": [1, 2]}, timestamp=1.0)
     sink._process(
         AxisArray(
             data=np.arange(6, dtype=float).reshape(3, 2),
@@ -119,4 +124,80 @@ def test_sink_serializes_list_settings_values(tmp_path):
         nwbfile = io.read()
         df = nwbfile.intervals["pipeline_settings"].to_dataframe()
 
-    assert df["component_list"].tolist() == ["[1, 2]", "[1, 2]"]
+    np.testing.assert_array_equal(df["component_list"].iloc[0], np.array([1, 2]))
+    np.testing.assert_array_equal(df["component_list"].iloc[1], np.array([1, 2]))
+
+
+@dataclass
+class _Endpoint:
+    host: str = "127.0.0.1"
+    port: int = 5000
+
+
+class _NestedSettings(ez.Settings):
+    endpoint: _Endpoint = field(default_factory=_Endpoint)
+    route_map: dict[str, str] = field(default_factory=lambda: {"open": "A", "closed": "B"})
+    bands: list[tuple[float, float]] = field(default_factory=lambda: [(70.0, 200.0)])
+
+
+def test_flatten_component_settings_flattens_dataclasses_and_mappings():
+    """Structured setting values should become native NWB-compatible columns where possible."""
+    flat = flatten_component_settings("PIPELINE.UNIT", _NestedSettings())
+
+    assert flat["PIPELINE.UNIT._NestedSettings.endpoint.host"] == "127.0.0.1"
+    assert flat["PIPELINE.UNIT._NestedSettings.endpoint.port"] == 5000
+    assert flat["PIPELINE.UNIT._NestedSettings.route_map.open"] == "A"
+    assert flat["PIPELINE.UNIT._NestedSettings.route_map.closed"] == "B"
+    np.testing.assert_array_equal(flat["PIPELINE.UNIT._NestedSettings.bands"], np.array([[70.0, 200.0]]))
+
+
+class _Mode(Enum):
+    TRAIN = "train"
+
+
+class _EdgeCaseSettings(ez.Settings):
+    mode: _Mode = _Mode.TRAIN
+    config_path: Path = Path("/tmp/model.pt")
+    sample_count: np.int64 = np.int64(7)
+    labels: set[str] = field(default_factory=lambda: {"b", "a"})
+
+
+def test_flatten_component_settings_sanitizes_common_edge_types():
+    """Enums, paths, NumPy scalars, and sets should normalize predictably."""
+    flat = flatten_component_settings("PIPELINE.EDGE", _EdgeCaseSettings())
+
+    assert flat["PIPELINE.EDGE._EdgeCaseSettings.mode"] == "train"
+    assert flat["PIPELINE.EDGE._EdgeCaseSettings.config_path"] == "/tmp/model.pt"
+    assert flat["PIPELINE.EDGE._EdgeCaseSettings.sample_count"] == 7
+    np.testing.assert_array_equal(flat["PIPELINE.EDGE._EdgeCaseSettings.labels"], np.array(["a", "b"]))
+
+
+def test_sink_updates_list_settings_with_same_shape(tmp_path):
+    """Fixed-shape list settings should remain appendable across updates."""
+    outpath = tmp_path / "ezmsg_nwb_list_settings_update_test.nwb"
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+
+    sink.initialize_settings({"component_list": [[1, 2], [3, 4]]}, timestamp=1.0)
+    sink.update_settings("component", {"component_list": [[5, 6], [7, 8]]}, timestamp=2.0)
+    sink._process(
+        AxisArray(
+            data=np.arange(6, dtype=float).reshape(3, 2),
+            dims=["time", "ch"],
+            axes={"time": AxisArray.Axis.TimeAxis(fs=100.0)},
+            key="sig",
+        )
+    )
+    sink.close(write=False)
+
+    with NWBHDF5IO(outpath, "r") as io:
+        nwbfile = io.read()
+        df = nwbfile.intervals["pipeline_settings"].to_dataframe()
+
+    np.testing.assert_array_equal(df["component_list"].iloc[0], np.array([[1, 2], [3, 4]]))
+    np.testing.assert_array_equal(df["component_list"].iloc[-1], np.array([[5, 6], [7, 8]]))

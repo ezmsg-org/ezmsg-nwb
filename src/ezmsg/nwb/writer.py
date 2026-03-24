@@ -110,7 +110,7 @@ class NWBSinkSettings(ez.Settings):
     meta_yaml: typing.Optional[typing.Union[str, os.PathLike]] = None
     split_bytes: int = 0
     expected_series: typing.Optional[typing.Union[str, os.PathLike]] = None
-    test_setting: list = field(default_factory=lambda: [1, 2])
+    test_setting: list = field(default_factory=lambda: [[1, 2], [3, 4]])
 
 
 class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
@@ -121,6 +121,20 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
     shared_clock_type: typing.Optional[ReferenceClockType] = None
 
     def __init__(self, *args, settings: typing.Optional[NWBSinkSettings] = None, **kwargs):
+        """
+        Initialize an NWB sink consumer and prepare its output file state.
+
+        Args:
+            settings: Optional sink settings to apply when constructing the consumer.
+            *args: Forwarded to :class:`BaseConsumer`.
+            **kwargs: Forwarded to :class:`BaseConsumer`.
+
+        Notes:
+            This constructor validates the target filepath, creates an in-memory
+            :class:`~pynwb.NWBFile`, and optionally pre-populates the file schema
+            from an ``expected_series`` metadata file. No NWB content is written
+            to disk until a later flush.
+        """
         super().__init__(*args, settings=settings, **kwargs)
 
         self._lock = threading.RLock()
@@ -159,6 +173,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             self._prep_from_meta(meta)
 
     def __del__(self):
+        """Best-effort cleanup for partially initialized consumers."""
         self.close(write=False, log=False)
 
     async def _aprocess(self, message: AxisArray) -> None:
@@ -166,12 +181,14 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         await asyncio.to_thread(self._process, message)
 
     def _process(self, message: AxisArray) -> None:
+        """Normalize one incoming message and append its contents into the NWB file."""
         with self._lock:
             self._current_msg = message
 
-            # Adjust incoming data
+            # Normalize the incoming payload into an AxisArray with the target
+            # sample axis in position 0 so downstream write logic can stay simple.
             if _HAS_SAMPLE_TRIGGER and isinstance(self._current_msg, SampleTriggerMessage):
-                # SampleTriggerMessage. Rewrite as AxisArray.
+                # Re-express trigger messages as event-like AxisArray messages.
                 timestamp = self._current_msg.timestamp
                 if hasattr(self._current_msg, "period") and len(self._current_msg.period) > 0:
                     timestamp = timestamp + self._current_msg.period[0]
@@ -194,7 +211,8 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                         + self._current_msg.dims[targ_ax_ix + 1 :],
                     )
 
-            # Is this a new series?
+            # Determine whether this message belongs to a new NWB series and, if
+            # not, verify that its schema still matches the existing dataset.
             b_new = self._io is None
             b_new = b_new or self._current_msg.key not in self._datasets
 
@@ -207,7 +225,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 raise ValueError("Data provided to NWBSink has changed shape. Closing NWB file.")
 
             if b_new:
-                # Use first incoming timestamp to set the session start time.
+                # Use the first timestamp we see to anchor the session clock.
                 key = self._current_msg.key
                 t0 = None
                 if self._axis in ["time", "win"] or "time" in self._current_msg.axes:
@@ -221,7 +239,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 if self._inc_clock == ReferenceClockType.MONOTONIC:
                     self._start_timestamp += time.monotonic() - time.time()
 
-                # Create the container(s) for the new stream.
+                # Materialize the NWB schema for this stream before appending samples.
                 if key in ["epochs", "trials"]:
                     self._prep_event_io()
                     self._flush_io(reopen=True)
@@ -235,6 +253,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                     self._update_rate_for_current()
 
             if self._recording and self._current_msg.data.size:
+                # Convert message-relative time information into file-relative timestamps.
                 timestamps = None
                 if self._axis in ["time", "win"] or "time" in self._current_msg.axes:
                     targ_dim = self._axis if self._axis in ["time", "win"] else "time"
@@ -249,13 +268,13 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 if self._current_msg.key in ["epochs", "trials"]:
                     self._append_events(self._current_msg.key, timestamps, self._current_msg.data)
                 else:
-                    # Write data
+                    # Append sample data to the resizable HDF5 dataset.
                     dataset = self._datasets[self._current_msg.key]["data"]
                     dataset.resize(len(dataset) + len(self._current_msg.data), axis=0)
                     dataset[-len(self._current_msg.data) :] = self._current_msg.data
                     self._stream_bytes[self._current_msg.key] += self._current_msg.data.nbytes
 
-                    # Write timestamps
+                    # Append matching timestamps when the message carries explicit timing.
                     if timestamps is not None:
                         ts = self._datasets[self._current_msg.key]["ts"]
                         ts.resize(len(ts) + len(timestamps), axis=0)
@@ -263,6 +282,8 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                         self._stream_bytes[self._current_msg.key] += timestamps.nbytes
 
                 if 0 < self._split_bytes <= sum(self._stream_bytes.values()) and "%d" not in str(self._filepath):
+                    # When the file hits the split threshold, flush the active settings
+                    # interval, clone the NWB structure, and continue in a fresh file.
                     split_timestamp = time.time()
                     self._flush_settings_interval(split_timestamp, self._settings_prev_component)
                     self._settings_prev_component = "__split__"
@@ -278,6 +299,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
 
     @property
     def path_on_disk(self) -> Path:
+        """Return the concrete on-disk filepath for the current output segment."""
         fp = Path(self._filepath)
         if self._split_bytes > 0:
             if "%d" in str(fp):
@@ -344,10 +366,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         return self.__class__.shared_t0
 
     def _check_filepath(self) -> None:
-        """
-        Check self._filepath. Update path if necessary. Check if the path already exists and potentially raise
-        an error if overwriting is disabled.
-        """
+        """Normalize the configured output path and enforce overwrite policy."""
         _suffix = ".nwb"
 
         if self._filepath.name.startswith("."):
@@ -389,12 +408,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         self._filepath = filepath
 
     def _read_meta_dict(self) -> typing.Union[typing.Mapping, dict]:
-        """
-        Load the metadata from self._meta_yaml if that path exists, else load it from the default location.
-
-        Returns:
-            A dict containing the metadata for this NWB file.
-        """
+        """Load NWB metadata from the configured file or bundled defaults."""
         if self._meta_yaml is None or not Path(self._meta_yaml).expanduser().exists():
             default_path = Path(__file__).parent
             meta_dict = DeepDict()
@@ -407,12 +421,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         return meta_dict
 
     def _prep_from_meta(self, meta: dict):
-        """
-        Prepare the NWBFile and NWBHDF5IO objects from metadata.
-
-        Args:
-            meta: The metadata dict to use to create the NWBFile and NWBHDF5IO objects.
-        """
+        """Pre-create NWB tables and series from a metadata description."""
 
         def _sanitize_shape(
             shape: typing.Union[typing.List[int], typing.Tuple[int, ...]],
@@ -425,7 +434,8 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 shape = [0] + [_ for _ in shape if _ != 0]
             return shape
 
-        # Create the trials and epochs tables
+        # Recreate any event tables described in the metadata so they are ready
+        # before the first message arrives.
         for key in ["epochs", "trials"]:
             if key in meta:
                 ss = meta[key]
@@ -442,6 +452,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             settings_meta = meta[self._settings_table_name]
             self._prep_settings_table(settings_meta.get("columns", []))
 
+        # Recreate the continuous-series schema from the metadata payload.
         for key, ss in meta.items():
             if key not in ["epochs", "trials", self._settings_table_name]:
                 shape = _sanitize_shape(ss["shape"])
@@ -455,10 +466,10 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 )
                 self._prep_continuous_io()
 
-        # Flush and reopen to make h5py datasets
+        # Flush once so the H5DataIO placeholders become concrete HDF5 datasets.
         self._flush_io(reopen=True)
 
-        # Add the rate attribute to the timestamps series. Can only do this after flushing.
+        # Restore stored sample rates on the timestamp datasets after reopening.
         for key, ss in meta.items():
             if key not in ["epochs", "trials"]:
                 series = self._nwbfile.acquisition[key]
@@ -499,10 +510,18 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                         ez.logger.info(f"Deleted empty file at {src_str}.")
 
     def toggle_recording(self, recording: typing.Optional[bool] = None):
+        """
+        Enable, disable, or toggle recording of incoming stream samples.
+
+        Args:
+            recording: Explicit recording state to apply. If omitted, the
+                current recording state is inverted.
+        """
         with self._lock:
             self._recording = recording if recording is not None else not self._recording
 
     def _check_msg_consistency(self) -> bool:
+        """Return whether the current message matches the previously created dataset schema."""
         key = self._current_msg.key
         in_ax = self._current_msg.axes[self._axis]
         b_rate_change = (
@@ -515,6 +534,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         return not (b_rate_change or b_shape_change)
 
     def _update_rate_for_current(self):
+        """Update the stored sample-rate attribute for the current stream timestamps."""
         if self._axis in ["time", "win"]:
             time_ax = self._current_msg.axes[self._axis]
             if hasattr(time_ax, "data"):
@@ -524,6 +544,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             self._datasets[self._current_msg.key]["ts"].attrs["rate"] = rate
 
     def _copy_nwb(self) -> typing.Tuple[pynwb.NWBFile, dict]:
+        """Clone the current NWB structure into a fresh file and metadata description."""
         copy_keys = [
             "session_description",
             "session_start_time",
@@ -563,10 +584,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         return nwbfile, meta
 
     def _nwb_create_or_fail(self, nwbfile: typing.Optional[pynwb.NWBFile] = None) -> None:
-        """
-        Create the NWBFile and NWBHDF5IO for writing.
-        Note: This does not yet write the NWBFile object to disk.
-        """
+        """Create the writable NWBFile/IO pair without flushing any content to disk."""
         if self.path_on_disk.exists():
             raise ValueError(f"File {self.path_on_disk} already exists. Set overwrite_old=True to overwrite.")
 
@@ -596,15 +614,10 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         self._stream_bytes = defaultdict(lambda: 0)
 
     def _flush_io(self, reopen: bool = True):
-        """
-        Write the header to the NWBFile.
-
-        This step is also necessary to:
-        * enable appending to our epochs/trials table (but only after it has an entry).
-        * create the appendable datasets for our continuous data.
-        """
+        """Flush the NWB schema to disk and optionally reopen for append access."""
         self._io.write(self._nwbfile)
         if reopen:
+            # Reopen the file in append mode so event tables and datasets can be extended.
             if self._io:
                 self._io.close()
             if "%d" in str(self._filepath):
@@ -620,7 +633,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             self._io = io
             self._nwbfile = self._io.read()
 
-        # Get references to our continuous datasets
+        # Refresh dataset handles so future appends target the reopened HDF5 objects.
         for k, v in self._datasets.items():
             if k in self._nwbfile.acquisition:
                 series = self._nwbfile.acquisition[k]
@@ -631,10 +644,25 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                     v["data"] = series.data
                     v["ts"] = series.timestamps
 
-    def _configure_appendable_table(self, table: typing.Any) -> None:
+    def _configure_appendable_table(
+        self,
+        table: typing.Any,
+        sample_values: typing.Optional[dict[str, typing.Any]] = None,
+    ) -> None:
+        """Configure a dynamic table so its columns remain appendable after flush/reopen."""
         table.id.set_data_io(H5DataIO, {"maxshape": (None,), "chunks": True})
         for col in table.colnames:
-            table[col].set_data_io(H5DataIO, {"maxshape": (None,), "chunks": True})
+            sample_value = None if sample_values is None else sample_values.get(col)
+            if sample_value is None:
+                col_shape = getattr(table[col].data, "shape", ())
+                maxshape = (None,) + tuple(col_shape[1:]) if len(col_shape) > 1 else (None,)
+            elif np.isscalar(sample_value) or isinstance(sample_value, (str, bytes)):
+                col_shape = ()
+                maxshape = (None,)
+            else:
+                col_shape = np.asarray(sample_value).shape
+                maxshape = (None,) + tuple(col_shape)
+            table[col].set_data_io(H5DataIO, {"maxshape": maxshape, "chunks": True})
 
     def _append_events(
         self,
@@ -642,11 +670,13 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         timestamps: typing.Iterable[float],
         data: typing.Iterable[typing.Iterable[str]],
     ):
+        """Append event rows into the NWB epochs or trials table."""
         fun = {"epochs": self._nwbfile.add_epoch, "trials": self._nwbfile.add_trial}[key]
         for ev_t, ev_str in zip(timestamps, data):
             fun(start_time=ev_t, stop_time=ev_t + 0, **{"label": ",".join(ev_str)})
 
     def _get_settings_table(self) -> typing.Any:
+        """Return the pipeline-settings intervals table if it exists."""
         if self._nwbfile is None or self._nwbfile.intervals is None:
             return None
         try:
@@ -654,7 +684,8 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         except Exception:
             return None
 
-    def _prep_settings_table(self, settings_columns: typing.Iterable[str]) -> None:
+    def _prep_settings_table(self, flat_settings: dict[str, typing.Any]) -> None:
+        """Create the pipeline-settings intervals table and its columns."""
         existing = self._get_settings_table()
         if existing is not None:
             return
@@ -664,7 +695,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             description="Flattened ezmsg settings snapshots active over each logged interval",
         )
         intervals.add_column(name="updated_component", description="component that triggered the snapshot transition")
-        for column_name in settings_columns:
+        for column_name in flat_settings:
             intervals.add_column(name=column_name, description="flattened ezmsg setting")
         self._nwbfile.add_time_intervals(intervals)
 
@@ -672,62 +703,103 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         if table is None:
             raise RuntimeError("Failed to create settings table")
 
-        self._settings_columns = list(settings_columns)
-        self._configure_appendable_table(table)
+        self._settings_columns = list(flat_settings.keys())
+        self._configure_appendable_table(table, flat_settings)
 
     def _settings_relative_time(self, timestamp: float) -> float:
+        """Convert an absolute timestamp into file-relative session time."""
         return timestamp - self.get_session_timestamp(None)
 
-    def initialize_settings_state(self, flat_settings: dict[str, typing.Any], timestamp: float) -> None:
-        with self._lock:
-            if not flat_settings:
-                return
-            if not self._settings_columns:
-                self._prep_settings_table(flat_settings.keys())
-            missing_columns = [name for name in flat_settings if name not in self._settings_columns]
-            if missing_columns:
-                raise ValueError(
-                    "Received settings fields not present in settings table schema: "
-                    f"{', '.join(sorted(missing_columns))}"
-                )
-            self._settings_state = {
-                column_name: flat_settings.get(column_name, "") for column_name in self._settings_columns
-            }
-            self._settings_active_since = timestamp
+    def _validate_settings_columns(self, flat_settings: dict[str, typing.Any]) -> None:
+        """Ensure incoming settings keys match the established settings-table schema."""
+        missing_columns = [name for name in flat_settings if name not in self._settings_columns]
+        if missing_columns:
+            raise ValueError(
+                f"Received settings fields not present in settings table schema: {', '.join(sorted(missing_columns))}"
+            )
 
-            self.update_settings_state("__init__", flat_settings, self.get_session_timestamp())
-
-            self._flush_io(reopen=True)
-
-    def update_settings_state(
+    def _apply_settings_update(
         self,
         component_address: str,
         flat_settings: dict[str, typing.Any],
         timestamp: float,
     ) -> None:
+        """Commit a prepared settings snapshot into the in-memory active state."""
+        self._flush_settings_interval(timestamp, self._settings_prev_component)
+        if not self._settings_state:
+            self._settings_state = {column_name: "" for column_name in self._settings_columns}
+        self._settings_state.update(flat_settings)
+        self._settings_active_since = timestamp
+        self._settings_prev_component = component_address
+
+    def initialize_settings(self, flat_settings: dict[str, typing.Any], timestamp: float) -> None:
+        """
+        Initialize the settings table from an already prepared flat settings snapshot.
+
+        Args:
+            flat_settings: Flattened, column-name-safe settings values ready to be
+                written into the settings intervals table.
+            timestamp: Absolute wall-clock time at which this snapshot became active.
+
+        Notes:
+            This is the prepared-data entrypoint used by :class:`NWBSink`. It
+            creates the settings table schema on first use, records the initial
+            active snapshot, and flushes the file so the settings table exists on
+            disk before later updates arrive.
+        """
         with self._lock:
             if not flat_settings:
                 return
+            # Create the table schema from the first snapshot and seed the
+            # in-memory state that future interval flushes will reuse.
             if not self._settings_columns:
-                self._prep_settings_table(flat_settings.keys())
+                self._prep_settings_table(flat_settings)
+            self._validate_settings_columns(flat_settings)
+            self._settings_state = {
+                column_name: flat_settings.get(column_name, "") for column_name in self._settings_columns
+            }
+            self._settings_active_since = timestamp
+            self._settings_prev_component = "__init__"
+            self._apply_settings_update("__init__", flat_settings, self.get_session_timestamp())
+
+            # Materialize the settings table before any later append operations.
+            self._flush_io(reopen=True)
+
+    def update_settings(
+        self,
+        component_address: str,
+        flat_settings: dict[str, typing.Any],
+        timestamp: float,
+    ) -> None:
+        """
+        Record a prepared settings update for the current NWB recording session.
+
+        Args:
+            component_address: Address of the component whose settings changed.
+            flat_settings: Flattened, column-name-safe settings values ready to be
+                written into the settings intervals table.
+            timestamp: Absolute wall-clock time at which the new snapshot became active.
+
+        Notes:
+            This method closes the previous active settings interval, updates the
+            in-memory snapshot, and leaves the new interval open until a later
+            settings change, file split, or shutdown flushes it.
+        """
+        with self._lock:
+            if not flat_settings:
+                return
+            # Lazily create the settings table if an update arrives before an
+            # explicit initialization snapshot has been logged.
+            if not self._settings_columns:
+                self._prep_settings_table(flat_settings)
                 self._settings_state = {column_name: "" for column_name in self._settings_columns}
                 self._settings_active_since = timestamp
 
-            missing_columns = [name for name in flat_settings if name not in self._settings_columns]
-            if missing_columns:
-                raise ValueError(
-                    "Received settings fields not present in settings table schema: "
-                    f"{', '.join(sorted(missing_columns))}"
-                )
-
-            self._flush_settings_interval(timestamp, self._settings_prev_component)
-            if not self._settings_state:
-                self._settings_state = {column_name: "" for column_name in self._settings_columns}
-            self._settings_state.update(flat_settings)
-            self._settings_active_since = timestamp
-            self._settings_prev_component = component_address
+            self._validate_settings_columns(flat_settings)
+            self._apply_settings_update(component_address, flat_settings, timestamp)
 
     def _flush_settings_interval(self, end_timestamp: float, updated_component: str) -> None:
+        """Append the currently active settings snapshot as a closed NWB interval."""
         if not self._settings_state or self._settings_active_since is None:
             return
 
@@ -748,9 +820,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         )
 
     def _prep_event_io(self):
-        """
-        Prepare the NWB file to receive event data, either "epochs" or "trials".
-        """
+        """Prepare the NWB event table state for the current epochs or trials stream."""
         colname = "label"
         key = self._current_msg.key
         fun = {
@@ -764,17 +834,12 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         table = {"epochs": self._nwbfile.epochs, "trials": self._nwbfile.trials}[key]
         self._configure_appendable_table(table)
 
-        # Note: We cannot io.write(...) yet because a bug in hdmf requires that a custom column
-        #  must have data before it may be written:
-        #  https://github.com/hdmf-dev/hdmf/issues/1000
-        # So we append a dummy event
+        # Seed the custom label column because HDMF requires at least one row
+        # before a table with custom columns can be flushed.
         self._append_events(key, [0.0], [["EZNWB-START"]])
 
     def _prep_continuous_io(self):
-        """
-        Prepare NWB file to receive continuous data into a pynwb.TimeSeries (or pynwb.ecephys.ElectricalSeries if
-        channel info is provided).
-        """
+        """Prepare a resizable NWB series for the current continuous stream."""
         key = self._current_msg.key
         targ_ax_ix = self._current_msg.get_axis_idx(self._axis)
         shape = self._current_msg.data.shape[:targ_ax_ix] + self._current_msg.data.shape[targ_ax_ix + 1 :]
@@ -793,8 +858,8 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         )
         series_description = "created by ezmsg nwbsink"
 
-        # If channel label info is provided then we create an electrode table and our timeseries is
-        #  a pynwb.ecephys.ElectricalSeries.
+        # Upgrade to an ElectricalSeries when channel labels are available so the
+        # recorded data can reference a proper electrode table region.
         if (
             "ch" in self._current_msg.axes
             and hasattr(self._current_msg.axes["ch"], "data")
@@ -804,6 +869,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             if b_first:
                 self._nwbfile.add_electrode_column(name="label", description="electrode label")
 
+            # Reuse a single device/electrode-group namespace across streams.
             dev_name = "unified device"
             if dev_name in self._nwbfile.devices:
                 device = self._nwbfile.devices[dev_name]
@@ -823,6 +889,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 if not b_first:
                     self._flush_io(reopen=True)
 
+            # Ensure all observed channel labels exist in the shared electrodes table.
             el_df = self._nwbfile.electrodes.to_dataframe()
             el_df = el_df[el_df["group"] == el_grp]
             for ll in self._current_msg.axes["ch"].data:
@@ -833,6 +900,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 for fn in ["id", "location", "group_name", "group", "label"]:
                     getattr(self._nwbfile.electrodes, fn).set_data_io(H5DataIO, {"maxshape": (None,), "chunks": True})
 
+            # Build the electrode-region reference for this specific stream.
             el_df = self._nwbfile.electrodes.to_dataframe()
             el_df = el_df[el_df["group"] == el_grp]
             b_in = el_df["label"].isin(self._current_msg.axes["ch"].data)
@@ -867,6 +935,15 @@ class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
     INPUT_SETTINGS = ez.InputStream(NWBSinkSettings)
 
     async def initialize(self) -> None:
+        """
+        Initialize the sink unit and start GraphServer-backed settings tracking.
+
+        Notes:
+            This method discovers the components participating in the current
+            session, captures an initial settings snapshot for those components,
+            forwards that snapshot to the processor, and starts a background task
+            that records subsequent settings-change events.
+        """
         await super().initialize()
         self._settings_ctx: typing.Optional[ez.GraphContext] = None
         self._settings_watch_task: typing.Optional[asyncio.Task[None]] = None
@@ -887,6 +964,7 @@ class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
             settings_snapshot = await ctx.settings_snapshot()
             settings_events = await ctx.settings_events(after_seq=0)
 
+            # Build the initial flattened settings snapshot for all session components.
             flat_snapshot: dict[str, typing.Any] = {}
             for component_address in sorted(session_components):
                 if component_address in settings_snapshot:
@@ -901,9 +979,11 @@ class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
             last_seq = max((event.seq for event in settings_events), default=0)
             self._settings_last_timestamp = latest_timestamp
 
+            # Seed the processor before subscribing so no initial settings state is lost.
             if flat_snapshot:
-                await asyncio.to_thread(self.processor.initialize_settings_state, flat_snapshot, latest_timestamp)
+                await asyncio.to_thread(self.processor.initialize_settings, flat_snapshot, latest_timestamp)
 
+            # Continue tracking future settings changes in the background.
             self._settings_watch_task = asyncio.create_task(
                 self._watch_graph_settings(after_seq=last_seq),
                 name=f"{self.address}-settings-watch",
@@ -916,6 +996,7 @@ class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
                 self._settings_ctx = None
 
     def _session_component_addresses(self, graph_snapshot: typing.Any) -> set[str]:
+        """Return the component addresses that belong to this unit's active session."""
         for session in graph_snapshot.sessions.values():
             metadata = session.metadata
             if metadata is None:
@@ -925,15 +1006,17 @@ class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
         return set()
 
     async def _watch_graph_settings(self, after_seq: int) -> None:
+        """Subscribe to GraphServer settings events and forward relevant updates to the processor."""
         if self._settings_ctx is None:
             return
         async for event in self._settings_ctx.subscribe_settings_events(after_seq=after_seq):
             if event.component_address not in self._settings_component_addresses:
                 continue
+            # Flatten and forward each relevant settings event as a prepared snapshot.
             flat_settings = flatten_component_settings(event.component_address, event.value)
             try:
                 await asyncio.to_thread(
-                    self.processor.update_settings_state,
+                    self.processor.update_settings,
                     event.component_address,
                     flat_settings,
                     event.timestamp,
@@ -945,9 +1028,12 @@ class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
                 )
 
     async def _bootstrap_processor_settings(self) -> None:
+        """Rebuild the processor settings snapshot after the processor is recreated."""
         if self._settings_ctx is None or not self._settings_component_addresses:
             return
 
+        # Recompute the latest full snapshot so a fresh processor starts with
+        # the same settings view the GraphServer currently exposes.
         settings_snapshot = await self._settings_ctx.settings_snapshot()
         flat_snapshot: dict[str, typing.Any] = {}
         for component_address in sorted(self._settings_component_addresses):
@@ -957,13 +1043,24 @@ class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
                 )
         if flat_snapshot:
             await asyncio.to_thread(
-                self.processor.initialize_settings_state,
+                self.processor.initialize_settings,
                 flat_snapshot,
                 self._settings_last_timestamp,
             )
 
     @ez.subscriber(INPUT_SETTINGS)
     async def on_settings(self, msg: NWBSinkSettings) -> None:
+        """
+        Apply runtime sink settings updates to the unit and its processor.
+
+        Args:
+            msg: New sink settings received on the settings input stream.
+
+        Notes:
+            Changes that alter file layout or timing semantics require a full
+            processor recreation. Pure recording toggles are applied in place so
+            the current file stays open.
+        """
         # Reset if settings _other than `recording`_ have changed.
         b_reset = msg.filepath != self.SETTINGS.filepath
         b_reset = b_reset or msg.overwrite_old != self.SETTINGS.overwrite_old
@@ -978,6 +1075,15 @@ class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
             self.processor.toggle_recording(msg.recording)
 
     async def shutdown(self) -> None:
+        """
+        Stop background settings tracking and close the underlying NWB writer.
+
+        Notes:
+            Shutdown first cancels the GraphServer settings watcher, then tears
+            down the GraphContext, then lets the base unit shutdown complete
+            before closing the processor so any pending settings interval can be
+            flushed cleanly.
+        """
         if getattr(self, "_settings_watch_task", None) is not None:
             self._settings_watch_task.cancel()
             try:
