@@ -167,7 +167,7 @@ def test_flatten_component_settings_sanitizes_common_edge_types():
     flat = flatten_component_settings("PIPELINE.EDGE", _EdgeCaseSettings())
 
     assert flat["PIPELINE.EDGE._EdgeCaseSettings.mode"] == "train"
-    assert flat["PIPELINE.EDGE._EdgeCaseSettings.config_path"] == "/tmp/model.pt"
+    assert flat["PIPELINE.EDGE._EdgeCaseSettings.config_path"] == str(Path("/tmp/model.pt"))
     assert flat["PIPELINE.EDGE._EdgeCaseSettings.sample_count"] == 7
     np.testing.assert_array_equal(flat["PIPELINE.EDGE._EdgeCaseSettings.labels"], np.array(["a", "b"]))
 
