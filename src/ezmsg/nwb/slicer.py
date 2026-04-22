@@ -214,12 +214,20 @@ class NWBSlicer:
                 else:
                     axes["time"] = AxisArray.LinearAxis.create_time_axis(fs=rate, offset=self._ts_off)
                 if hasattr(child, "electrodes") and child.electrodes is not None:
-                    el_inds = child.electrodes.table.id[:]
-                    el_df = child.electrodes.table.to_dataframe().loc[el_inds]
+                    # ``child.electrodes`` is a DynamicTableRegion whose
+                    # ``.data`` holds the positional indices into the full
+                    # electrodes table. Subset with iloc so the returned
+                    # channel labels line up 1:1 with the data columns —
+                    # otherwise an ElectricalSeries that references a
+                    # strict subset of the electrodes table produces a
+                    # ch-axis whose length does not match data.shape[1].
+                    region_idx = np.asarray(child.electrodes.data)
+                    full_df = child.electrodes.table.to_dataframe()
+                    el_df = full_df.iloc[region_idx]
                     if "label" in el_df.columns:
                         ch_labels = el_df["label"].values.tolist()
                     else:
-                        ch_labels = [f"ch_{_}" for _ in el_inds]
+                        ch_labels = [f"ch_{idx}" for idx in el_df.index.tolist()]
                     axes["ch"] = AxisArray.CoordinateAxis(data=np.array(ch_labels), dims=["ch"])
 
                 self._streams[child.name] = StreamInfo(
