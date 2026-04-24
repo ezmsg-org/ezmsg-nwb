@@ -66,6 +66,7 @@ D - When opening the *next* file when splitting
 """
 
 import asyncio
+import dataclasses
 import datetime
 import os
 import re
@@ -112,6 +113,14 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
     # Session start time.time. It does not have a timezone but unqualified conversions assume local time.
     shared_t0: typing.Optional[float] = None
     shared_clock_type: typing.Optional[ReferenceClockType] = None
+
+    # Fields that can change without reconstructing the NWB file. ``recording``
+    # is handled via :meth:`toggle_recording`; ``split_bytes`` is re-read on
+    # every write so the next split respects the new threshold. Everything
+    # else (filepath, axis, inc_clock, meta_yaml, expected_series,
+    # overwrite_old) is consumed during ``__init__`` side effects and
+    # requires a full processor rebuild to take effect.
+    NONRESET_SETTINGS_FIELDS = frozenset({"recording", "split_bytes"})
 
     def __init__(self, *args, settings: typing.Optional[NWBSinkSettings] = None, **kwargs):
         super().__init__(*args, settings=settings, **kwargs)
@@ -729,16 +738,22 @@ class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
 
     @ez.subscriber(INPUT_SETTINGS)
     async def on_settings(self, msg: NWBSinkSettings) -> None:
-        # Reset if settings _other than `recording`_ have changed.
-        b_reset = msg.filepath != self.SETTINGS.filepath
-        b_reset = b_reset or msg.overwrite_old != self.SETTINGS.overwrite_old
-        b_reset = b_reset or msg.axis != self.SETTINGS.axis
-        b_reset = b_reset or msg.inc_clock != self.SETTINGS.inc_clock
-        b_reset = b_reset or msg.meta_yaml != self.SETTINGS.meta_yaml
-        if b_reset:
-            self.apply_settings(msg)
+        """Apply new settings, rebuilding the consumer only when a non-safe
+        field changed.
+
+        ``NWBSinkConsumer`` does its heavy lifting (open file, write header)
+        in ``__init__``, so a "reset" here really means recreating the
+        processor — ``BaseConsumer._request_reset`` is a no-op and can't
+        reopen files. We consult the consumer's ``NONRESET_SETTINGS_FIELDS``
+        to decide between rebuild and live update.
+        """
+        changed = {f.name for f in dataclasses.fields(msg) if getattr(self.SETTINGS, f.name) != getattr(msg, f.name)}
+        self.apply_settings(msg)
+        if changed - NWBSinkConsumer.NONRESET_SETTINGS_FIELDS:
             self.create_processor()
-        elif msg.recording != self.SETTINGS.recording:
+            return
+        self.processor.settings = msg
+        if "recording" in changed:
             self.processor.toggle_recording(msg.recording)
 
     async def shutdown(self) -> None:
