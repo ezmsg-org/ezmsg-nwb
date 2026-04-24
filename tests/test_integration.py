@@ -6,6 +6,7 @@ from pathlib import Path
 
 import ezmsg.core as ez
 import numpy as np
+import pytest
 from ezmsg.baseproc.clock import Clock, ClockSettings
 from ezmsg.util.messagecodec import message_log
 from ezmsg.util.messagelogger import MessageLogger, MessageLoggerSettings
@@ -226,10 +227,12 @@ def test_writer_recording_toggle():
             inc_clock=ReferenceClockType.UNKNOWN,
         )
     )
-    assert sink._recording is False
-    sink.toggle_recording(True)
-    assert sink._recording is True
-    sink.toggle_recording()
-    assert sink._recording is False
+    assert sink.settings.recording is False
+    with pytest.warns(DeprecationWarning):
+        sink.toggle_recording(True)
+    assert sink.settings.recording is True
+    with pytest.warns(DeprecationWarning):
+        sink.toggle_recording()
+    assert sink.settings.recording is False
     sink.close(write=False)
     outpath.unlink(missing_ok=True)
