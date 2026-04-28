@@ -213,12 +213,17 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         if _HAS_SAMPLE_TRIGGER and isinstance(self._current_msg, SampleTriggerMessage):
             # SampleTriggerMessage. Rewrite as AxisArray.
             timestamp = self._current_msg.timestamp
-            if hasattr(self._current_msg, "period") and len(self._current_msg.period) > 0:
-                timestamp = timestamp + self._current_msg.period[0]
+            period = self._current_msg.period
+            if period is not None and len(period) > 0:
+                timestamp = timestamp + period[0]
+            # Wrap value in a 2D shape (1, 1) so ``_append_events`` iterates
+            # rows of label-iterables (matching the convention used by the
+            # plain ``key="epochs"`` AxisArray path). A 1D shape would make
+            # ``",".join(ev_str)`` join the characters of a single string.
             self._current_msg = AxisArray(
-                data=np.array([self._current_msg.value]),
-                dims=["time"],
-                axes={"time": AxisArray.Axis(gain=1.0, offset=timestamp)},
+                data=np.array([[self._current_msg.value]]),
+                dims=["time", "ch"],
+                axes={"time": AxisArray.LinearAxis(gain=1.0, offset=timestamp)},
                 key="epochs",
             )
         elif not hasattr(self._current_msg, "data"):
@@ -351,6 +356,9 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                 self.__class__.shared_start_datetime = datetime.datetime.fromtimestamp(try_t0, datetime.timezone.utc)
             else:
                 self.__class__.shared_start_datetime = datetime.datetime.now(datetime.timezone.utc)
+            # Latch the clock type so subsequent instances are forced to
+            # match — otherwise the mismatch check above never fires.
+            self.__class__.shared_clock_type = inc_clock
         return self.__class__.shared_start_datetime
 
     def get_session_timestamp(self, try_t0: typing.Optional[float] = None) -> float:
@@ -380,6 +388,10 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                     "Clock type is UNKNOWN. Timestamps are relative to the first incoming timestamp "
                     "but this value is NOT recoverable as it is not stored in the NWB file."
                 )
+            # Latch the clock type if get_session_datetime didn't already
+            # (the UNKNOWN branch above bypasses it).
+            if self.__class__.shared_clock_type is None:
+                self.__class__.shared_clock_type = inc_clock
         return self.__class__.shared_t0
 
     def _check_filepath(self) -> None:
