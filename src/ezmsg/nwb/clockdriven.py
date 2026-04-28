@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import typing
 
@@ -81,6 +82,15 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
         if self._state.is_event or self._state.has_timestamps:
             return False  # Time-window streams don't track exhaustion via index
         return self._state.sample_idx >= self._state.n_total_samples
+
+    async def _areset_state(self, time_axis: LinearAxis) -> None:
+        """Offload the slow ``NWBSlicer`` open onto a worker thread so that
+        sibling subscribers (notably ``INPUT_SETTINGS`` for live scrubbing)
+        can keep running while the file is opened. First-message NWB I/O
+        can take 1.5–4 seconds per the writer-module docstring; without
+        this, the unit's event loop is held for the whole duration.
+        """
+        await asyncio.to_thread(self._reset_state, time_axis)
 
     def _reset_state(self, time_axis: LinearAxis) -> None:
         if self._state.slicer is not None:

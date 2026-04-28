@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import typing
 from collections import deque
@@ -36,7 +37,6 @@ class NWBIteratorState:
 
 
 class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, NWBIteratorState]):
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Eagerly initialize state (load NWB file metadata) so that
@@ -47,6 +47,14 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
     @property
     def exhausted(self) -> bool:
         return self._state.chunk_ix >= self._state.n_chunks and not self._state.deque
+
+    async def _areset_state(self) -> None:
+        """Offload the slow ``NWBSlicer`` open and chunk-table build onto
+        a worker thread so the unit's event loop can keep servicing other
+        async tasks during the multi-second first-open. See the matching
+        override on ``NWBClockDrivenProducer`` for context.
+        """
+        await asyncio.to_thread(self._reset_state)
 
     def _reset_state(self) -> None:
         self._state.n_chunks = 0

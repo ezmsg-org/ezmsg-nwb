@@ -1,9 +1,42 @@
 """Tests for NWBClockDrivenProducer."""
 
-from ezmsg.util.messages.axisarray import AxisArray
+import threading
+
+from ezmsg.util.messages.axisarray import AxisArray, LinearAxis
 
 from ezmsg.nwb.clockdriven import NWBClockDrivenProducer, NWBClockDrivenSettings
 from ezmsg.nwb.util import ReferenceClockType
+
+
+async def test_areset_state_runs_reset_in_worker_thread():
+    """``_areset_state`` must offload sync ``_reset_state`` to a worker thread
+    so the unit's event loop isn't blocked by the multi-second NWB open."""
+    main_tid = threading.get_ident()
+    seen_tids: list[int] = []
+
+    class Spy(NWBClockDrivenProducer):
+        def _reset_state(self, time_axis):
+            seen_tids.append(threading.get_ident())
+            super()._reset_state(time_axis)
+
+    # Idle-mode (empty filepath/stream_key) short-circuits the slow NWB
+    # I/O — we only want to assert the offload mechanism, not exercise
+    # pynwb here.
+    producer = Spy(
+        settings=NWBClockDrivenSettings(
+            fs=50.0,
+            filepath="",
+            stream_key="",
+            reference_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+    seen_tids.clear()  # discard any eager-init invocation
+
+    await producer._areset_state(LinearAxis(gain=0.05, offset=0.0))
+
+    assert seen_tids == [t for t in seen_tids if t != main_tid], "_reset_state ran on the main event-loop thread"
+    assert len(seen_tids) == 1, "_reset_state should run exactly once per _areset_state"
+
 
 # --- Rate-only continuous stream ---
 
