@@ -1,11 +1,14 @@
 """Integration tests for ezmsg-nwb: ezmsg system tests and writer round-trip."""
 
+import asyncio
 import tempfile
+import typing
 from dataclasses import field
 from pathlib import Path
 
 import ezmsg.core as ez
 import numpy as np
+import pynwb
 import pytest
 from ezmsg.baseproc.clock import Clock, ClockSettings
 from ezmsg.util.messagecodec import message_log
@@ -16,6 +19,7 @@ from ezmsg.util.terminate import TerminateOnTotal, TerminateOnTotalSettings
 from ezmsg.nwb import (
     NWBAxisArrayIterator,
     NWBIteratorSettings,
+    NWBSink,
     NWBSinkConsumer,
     NWBSinkSettings,
     ReferenceClockType,
@@ -235,4 +239,131 @@ def test_writer_recording_toggle():
         sink.toggle_recording()
     assert sink.settings.recording is False
     sink.close(write=False)
+    outpath.unlink(missing_ok=True)
+
+
+# -- Settings-push through running graph --
+
+
+class EnableRecordingPubSettings(ez.Settings):
+    sink_filepath: Path
+    n_messages: int
+    chunk_samples: int
+    chunk_channels: int
+
+
+class EnableRecordingPub(ez.Unit):
+    """Pushes a settings update that flips ``recording`` from ``False`` to
+    ``True``, waits for it to land at the sink, then publishes data. The
+    inverse direction (``True → False``) races: NWB's first-message I/O
+    takes seconds, so a fast settings flip beats every queued data message
+    to the consumer and we observe nothing on disk. Going ``False → True``
+    pushes the slow side ahead of the fast side, so a settled sleep is
+    enough to guarantee ordering."""
+
+    SETTINGS = EnableRecordingPubSettings
+
+    OUTPUT_SETTINGS = ez.OutputStream(NWBSinkSettings)
+    OUTPUT_SIGNAL = ez.OutputStream(AxisArray)
+
+    @ez.publisher(OUTPUT_SIGNAL)
+    @ez.publisher(OUTPUT_SETTINGS)
+    async def go(self) -> typing.AsyncGenerator:
+        s = self.SETTINGS
+
+        # Flip recording on. Same filepath → only ``recording`` differs →
+        # NONRESET path (no file rebuild), settings just rebinds.
+        yield (
+            self.OUTPUT_SETTINGS,
+            NWBSinkSettings(
+                filepath=s.sink_filepath,
+                overwrite_old=True,
+                recording=True,
+                inc_clock=ReferenceClockType.UNKNOWN,
+            ),
+        )
+        # Give the settings subscriber time to process before any data hits
+        # the data subscriber. Settings handling is fast (no I/O) so 1s is
+        # plenty.
+        await asyncio.sleep(1.0)
+
+        for i in range(s.n_messages):
+            yield (
+                self.OUTPUT_SIGNAL,
+                AxisArray(
+                    data=np.ones((s.chunk_samples, s.chunk_channels), dtype=np.float32) * float(i),
+                    dims=["time", "ch"],
+                    axes={"time": AxisArray.TimeAxis(fs=1000.0, offset=i * 0.05)},
+                    key="K",
+                ),
+            )
+            await asyncio.sleep(0.05)
+
+        # Wait long enough for the slow first-message NWB write to finish
+        # before the runtime tears the graph down.
+        await asyncio.sleep(3.0)
+        raise ez.NormalTermination
+
+
+class SettingsPushTestSettings(ez.Settings):
+    pub: EnableRecordingPubSettings
+    sink: NWBSinkSettings
+
+
+class SettingsPushCollection(ez.Collection):
+    SETTINGS = SettingsPushTestSettings
+
+    PUB = EnableRecordingPub()
+    SINK = NWBSink()
+
+    def configure(self) -> None:
+        self.PUB.apply_settings(self.SETTINGS.pub)
+        self.SINK.apply_settings(self.SETTINGS.sink)
+
+    def network(self) -> ez.NetworkDefinition:
+        return (
+            (self.PUB.OUTPUT_SIGNAL, self.SINK.INPUT_SIGNAL),
+            (self.PUB.OUTPUT_SETTINGS, self.SINK.INPUT_SETTINGS),
+        )
+
+
+def test_settings_push_through_graph_enables_recording():
+    """A NWBSinkSettings message published into ``NWBSink.INPUT_SETTINGS``
+    while the graph is running should reach the consumer's
+    ``update_settings`` and propagate to subsequent writes."""
+    outpath = Path(tempfile.gettempdir()) / "ezmsg_nwb_settings_push.nwb"
+    outpath.unlink(missing_ok=True)
+
+    n_messages, chunk = 3, 10
+
+    system = SettingsPushCollection(
+        SettingsPushTestSettings(
+            pub=EnableRecordingPubSettings(
+                sink_filepath=outpath,
+                n_messages=n_messages,
+                chunk_samples=chunk,
+                chunk_channels=2,
+            ),
+            # Sink starts with recording=False — without the in-graph
+            # settings push, no data would land on disk.
+            sink=NWBSinkSettings(
+                filepath=outpath,
+                overwrite_old=True,
+                recording=False,
+                inc_clock=ReferenceClockType.UNKNOWN,
+            ),
+        )
+    )
+    ez.run(SYSTEM=system)
+
+    assert outpath.exists(), (
+        "If the in-graph settings update never reached the consumer, "
+        "recording stays False and the empty-file cleanup would have "
+        "deleted this path on shutdown."
+    )
+    with pynwb.NWBHDF5IO(str(outpath), "r") as io:
+        nwbfile = io.read()
+        assert "K" in nwbfile.acquisition
+        assert len(nwbfile.acquisition["K"].data) == n_messages * chunk
+
     outpath.unlink(missing_ok=True)
