@@ -66,12 +66,13 @@ D - When opening the *next* file when splitting
 """
 
 import asyncio
+import dataclasses
 import datetime
 import os
 import re
 import time
 import typing
-from collections import defaultdict
+import warnings
 from pathlib import Path
 from uuid import uuid4
 
@@ -79,7 +80,7 @@ import ezmsg.core as ez
 import h5py
 import numpy as np
 import pynwb
-from ezmsg.baseproc import BaseConsumer, BaseConsumerUnit
+from ezmsg.baseproc import BaseConsumerUnit, BaseStatefulConsumer, processor_state
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
 from hdmf.backends.hdf5.h5_utils import H5DataIO
@@ -106,46 +107,99 @@ class NWBSinkSettings(ez.Settings):
     expected_series: typing.Optional[typing.Union[str, os.PathLike]] = None
 
 
-class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
+@dataclasses.dataclass
+class SeriesState:
+    """Per-stream bookkeeping for one NWB series.
+
+    ``shape`` is the trailing (non-time) shape used by
+    :meth:`NWBSinkConsumer._check_msg_consistency`. ``data`` and ``ts`` hold
+    the live ``h5py.Dataset`` (or pynwb container) references used by
+    :meth:`NWBSinkConsumer._process` to append rows. ``bytes_written``
+    tracks cumulative append size for the file-split threshold.
+    """
+
+    shape: typing.Tuple[int, ...]
+    data: typing.Any = None
+    ts: typing.Any = None
+    bytes_written: int = 0
+
+
+@processor_state
+class NWBSinkState:
+    # hash is required by the stateful machinery we'll migrate onto in
+    # step 3; carrying it now keeps the state class identical across the
+    # base-class switch.
+    hash: int = -1
+    filepath: typing.Optional[Path] = None
+    io: typing.Optional[pynwb.NWBHDF5IO] = None
+    nwbfile: typing.Optional[pynwb.NWBFile] = None
+    series: typing.Optional[typing.Dict[str, SeriesState]] = None
+    start_timestamp: float = 0.0
+    split_count: int = 0
+
+
+class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkState]):
     # Session start datetime. It should have a valid timezone and that should be UTC.
     shared_start_datetime: typing.Optional[datetime.datetime] = None
     # Session start time.time. It does not have a timezone but unqualified conversions assume local time.
     shared_t0: typing.Optional[float] = None
     shared_clock_type: typing.Optional[ReferenceClockType] = None
 
+    # Fields that can change without reconstructing the NWB file. Both are
+    # read live from ``self.settings`` inside ``_process``. Everything else
+    # (filepath, axis, inc_clock, meta_yaml, expected_series, overwrite_old)
+    # is consumed in ``_reset_state`` side effects; ``update_settings``
+    # requests a reset so the next message closes the old file and reopens.
+    NONRESET_SETTINGS_FIELDS = frozenset({"recording", "split_bytes"})
+
     def __init__(self, *args, settings: typing.Optional[NWBSinkSettings] = None, **kwargs):
         super().__init__(*args, settings=settings, **kwargs)
-
-        self._filepath = Path(self.settings.filepath)
-        self._overwrite_old = self.settings.overwrite_old
-        self._axis = self.settings.axis
-        self._recording = self.settings.recording
-        self._inc_clock = self.settings.inc_clock
-        self._meta_yaml = self.settings.meta_yaml
-        self._split_bytes = self.settings.split_bytes
-
-        self._start_timestamp: float = 0.0
-        self._split_count: int = 0
-        self._stream_bytes = defaultdict(lambda: 0)
+        # ``_current_msg`` is scratch space shared between ``_process`` and
+        # helpers like ``_prep_continuous_io`` / ``_prep_from_meta``. Deferred
+        # migration into state — see _prep_from_meta cleanup follow-up.
         self._current_msg: typing.Optional[AxisArray] = None
-        self._io: typing.Optional[pynwb.NWBHDF5IO] = None
-        self._nwbfile: typing.Optional[pynwb.NWBFile] = None
-        self._datasets: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
+        # Eagerly open the file so construction-time errors (file exists,
+        # permission denied, bad metadata yaml) surface immediately rather
+        # than on the first message. Match _hash_message() so the first
+        # inbound message does not re-trigger reset.
+        self._reset_state(None)
+        self._hash = 0
 
-        # Normalize filepath and delete existing file if enabled.
+    def _hash_message(self, message: typing.Optional[AxisArray]) -> int:
+        # Reset is driven exclusively by settings changes via
+        # ``_request_reset``; message identity does not force a rebuild.
+        return 0
+
+    def _reset_state(self, message: typing.Optional[AxisArray]) -> None:
+        """(Re)open the NWB file using the current settings.
+
+        Called at construction (with ``None``) and again after
+        ``update_settings`` flags a reset, which happens whenever any non-
+        ``NONRESET_SETTINGS_FIELDS`` field changes. In the reset case the
+        prior file is flushed and closed before the new one opens.
+        """
+        # Settings-triggered reset: flush the prior file before rebuilding.
+        if self._state.io is not None:
+            self.close(write=True)
+
+        self._state.filepath = Path(self.settings.filepath)
+        self._state.series = {}
+        self._state.start_timestamp = 0.0
+        self._state.split_count = 0
+
         self._check_filepath()
-
-        # Create the self._nwbfile and self._io objects. Note: Nothing written to disk yet!
         self._nwb_create_or_fail()
 
         if self.settings.expected_series is not None and Path(self.settings.expected_series).expanduser().exists():
             expected_series = Path(self.settings.expected_series).expanduser()
             meta = load_dict_from_file(expected_series)
             _ = self.get_session_datetime(None)
-            self._start_timestamp = self.get_session_timestamp(None)
+            self._state.start_timestamp = self.get_session_timestamp(None)
             self._prep_from_meta(meta)
 
     def __del__(self):
+        if not hasattr(self, "_state"):
+            return
         self.close(write=False, log=False)
 
     async def _aprocess(self, message: AxisArray) -> None:
@@ -159,51 +213,59 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         if _HAS_SAMPLE_TRIGGER and isinstance(self._current_msg, SampleTriggerMessage):
             # SampleTriggerMessage. Rewrite as AxisArray.
             timestamp = self._current_msg.timestamp
-            if hasattr(self._current_msg, "period") and len(self._current_msg.period) > 0:
-                timestamp = timestamp + self._current_msg.period[0]
+            period = self._current_msg.period
+            if period is not None and len(period) > 0:
+                timestamp = timestamp + period[0]
+            # Wrap value in a 2D shape (1, 1) so ``_append_events`` iterates
+            # rows of label-iterables (matching the convention used by the
+            # plain ``key="epochs"`` AxisArray path). A 1D shape would make
+            # ``",".join(ev_str)`` join the characters of a single string.
             self._current_msg = AxisArray(
-                data=np.array([self._current_msg.value]),
-                dims=["time"],
-                axes={"time": AxisArray.Axis(gain=1.0, offset=timestamp)},
+                data=np.array([[self._current_msg.value]]),
+                dims=["time", "ch"],
+                axes={"time": AxisArray.LinearAxis(gain=1.0, offset=timestamp)},
                 key="epochs",
             )
         elif not hasattr(self._current_msg, "data"):
             return
         else:
-            targ_ax_ix = self._current_msg.get_axis_idx(self._axis)
+            axis = self.settings.axis
+            targ_ax_ix = self._current_msg.get_axis_idx(axis)
             if targ_ax_ix != 0:
                 self._current_msg = replace(
                     self._current_msg,
                     data=np.moveaxis(self._current_msg.data, targ_ax_ix, 0),
-                    dims=[self._axis] + self._current_msg.dims[:targ_ax_ix] + self._current_msg.dims[targ_ax_ix + 1 :],
+                    dims=[axis] + self._current_msg.dims[:targ_ax_ix] + self._current_msg.dims[targ_ax_ix + 1 :],
                 )
 
         # Is this a new series?
-        b_new = self._io is None
-        b_new = b_new or self._current_msg.key not in self._datasets
+        b_new = self._state.io is None
+        b_new = b_new or self._current_msg.key not in self._state.series
 
-        # If inc message key is in datasets but properties do not match previous dataset properties
+        # If inc message key is in state.series but properties do not match previous dataset properties
         #  then close io and raise error
         if not b_new and not self._check_msg_consistency():
-            b_final_write = hasattr(self._nwbfile, "epochs") and self._nwbfile.epochs is not None
-            b_final_write = b_final_write or (hasattr(self._nwbfile, "trials") and self._nwbfile.trials is not None)
+            nwbfile = self._state.nwbfile
+            b_final_write = hasattr(nwbfile, "epochs") and nwbfile.epochs is not None
+            b_final_write = b_final_write or (hasattr(nwbfile, "trials") and nwbfile.trials is not None)
             self.close(write=b_final_write)
             raise ValueError("Data provided to NWBSink has changed shape. Closing NWB file.")
 
         if b_new:
             # Use first incoming timestamp to set the session start time.
             key = self._current_msg.key
+            axis = self.settings.axis
             t0 = None
-            if self._axis in ["time", "win"] or "time" in self._current_msg.axes:
-                targ_dim = self._axis if self._axis in ["time", "win"] else "time"
+            if axis in ["time", "win"] or "time" in self._current_msg.axes:
+                targ_dim = axis if axis in ["time", "win"] else "time"
                 if hasattr(self._current_msg.axes[targ_dim], "data"):
                     t0 = self._current_msg.axes[targ_dim].data[0]
                 else:
                     t0 = self._current_msg.axes[targ_dim].offset
             _ = self.get_session_datetime(t0)
-            self._start_timestamp = self.get_session_timestamp(t0)
-            if self._inc_clock == ReferenceClockType.MONOTONIC:
-                self._start_timestamp += time.monotonic() - time.time()
+            self._state.start_timestamp = self.get_session_timestamp(t0)
+            if self.settings.inc_clock == ReferenceClockType.MONOTONIC:
+                self._state.start_timestamp += time.monotonic() - time.time()
 
             # Create the container(s) for the new stream.
             if key in ["epochs", "trials"]:
@@ -216,36 +278,40 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 self._flush_io(reopen=True)
                 self._update_rate_for_current()
 
-        if self._recording and self._current_msg.data.size:
+        if self.settings.recording and self._current_msg.data.size:
+            axis = self.settings.axis
             timestamps = None
-            if self._axis in ["time", "win"] or "time" in self._current_msg.axes:
-                targ_dim = self._axis if self._axis in ["time", "win"] else "time"
+            if axis in ["time", "win"] or "time" in self._current_msg.axes:
+                targ_dim = axis if axis in ["time", "win"] else "time"
                 time_ax = self._current_msg.axes[targ_dim]
                 if hasattr(time_ax, "data"):
-                    timestamps = time_ax.data - self._start_timestamp
+                    timestamps = time_ax.data - self._state.start_timestamp
                 else:
                     timestamps = (np.arange(len(self._current_msg.data)) * time_ax.gain) + (
-                        time_ax.offset - self._start_timestamp
+                        time_ax.offset - self._state.start_timestamp
                     )
 
-            if self._current_msg.key in ["epochs", "trials"]:
-                self._append_events(self._current_msg.key, timestamps, self._current_msg.data)
+            key = self._current_msg.key
+            if key in ["epochs", "trials"]:
+                self._append_events(key, timestamps, self._current_msg.data)
             else:
+                series_state = self._state.series[key]
                 # Write data
-                dataset = self._datasets[self._current_msg.key]["data"]
+                dataset = series_state.data
                 dataset.resize(len(dataset) + len(self._current_msg.data), axis=0)
                 dataset[-len(self._current_msg.data) :] = self._current_msg.data
-                self._stream_bytes[self._current_msg.key] += self._current_msg.data.nbytes
+                series_state.bytes_written += self._current_msg.data.nbytes
 
                 # Write timestamps
                 if timestamps is not None:
-                    ts = self._datasets[self._current_msg.key]["ts"]
+                    ts = series_state.ts
                     ts.resize(len(ts) + len(timestamps), axis=0)
                     ts[-len(timestamps) :] = timestamps
-                    self._stream_bytes[self._current_msg.key] += timestamps.nbytes
+                    series_state.bytes_written += timestamps.nbytes
 
-            if 0 < self._split_bytes <= sum(self._stream_bytes.values()) and "%d" not in str(self._filepath):
-                self._split_count += 1
+            total_bytes = sum(s.bytes_written for s in self._state.series.values())
+            if 0 < self.settings.split_bytes <= total_bytes and "%d" not in str(self._state.filepath):
+                self._state.split_count += 1
                 self.path_on_disk.unlink(missing_ok=True)
                 new_nwbfile, new_meta = self._copy_nwb()
                 self.close()
@@ -254,12 +320,12 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
 
     @property
     def path_on_disk(self) -> Path:
-        fp = Path(self._filepath)
-        if self._split_bytes > 0:
+        fp = Path(self._state.filepath)
+        if self.settings.split_bytes > 0:
             if "%d" in str(fp):
                 return Path(re.sub("%d", "0", str(fp)))
             else:
-                return fp.parent / (fp.stem + f"_{self._split_count:02}" + fp.suffix)
+                return fp.parent / (fp.stem + f"_{self._state.split_count:02}" + fp.suffix)
         else:
             return fp
 
@@ -275,20 +341,24 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         Returns:
             Common session starttime among all instances of this class
         """
-        if self.__class__.shared_clock_type is not None and self.__class__.shared_clock_type != self._inc_clock:
+        inc_clock = self.settings.inc_clock
+        if self.__class__.shared_clock_type is not None and self.__class__.shared_clock_type != inc_clock:
             raise ValueError(
-                f"All instances must share the same clock type. {self._inc_clock} != {self.__class__.shared_clock_type}"
+                f"All instances must share the same clock type. {inc_clock} != {self.__class__.shared_clock_type}"
             )
         if self.__class__.shared_start_datetime is None:
-            if try_t0 is not None and self._inc_clock in [
+            if try_t0 is not None and inc_clock in [
                 ReferenceClockType.SYSTEM,
                 ReferenceClockType.MONOTONIC,
             ]:
-                if self._inc_clock == ReferenceClockType.MONOTONIC:
+                if inc_clock == ReferenceClockType.MONOTONIC:
                     try_t0 = try_t0 - time.monotonic() + time.time()
                 self.__class__.shared_start_datetime = datetime.datetime.fromtimestamp(try_t0, datetime.timezone.utc)
             else:
                 self.__class__.shared_start_datetime = datetime.datetime.now(datetime.timezone.utc)
+            # Latch the clock type so subsequent instances are forced to
+            # match — otherwise the mismatch check above never fires.
+            self.__class__.shared_clock_type = inc_clock
         return self.__class__.shared_start_datetime
 
     def get_session_timestamp(self, try_t0: typing.Optional[float] = None) -> float:
@@ -301,12 +371,13 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         Returns:
             Common session timestamp among all instances of this class.
         """
-        if self.__class__.shared_clock_type is not None and self.__class__.shared_clock_type != self._inc_clock:
+        inc_clock = self.settings.inc_clock
+        if self.__class__.shared_clock_type is not None and self.__class__.shared_clock_type != inc_clock:
             raise ValueError(
-                f"All instances must share the same clock type. {self._inc_clock} != {self.__class__.shared_clock_type}"
+                f"All instances must share the same clock type. {inc_clock} != {self.__class__.shared_clock_type}"
             )
         if self.__class__.shared_t0 is None:
-            if try_t0 is None or self._inc_clock in [
+            if try_t0 is None or inc_clock in [
                 ReferenceClockType.SYSTEM,
                 ReferenceClockType.MONOTONIC,
             ]:
@@ -317,21 +388,27 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                     "Clock type is UNKNOWN. Timestamps are relative to the first incoming timestamp "
                     "but this value is NOT recoverable as it is not stored in the NWB file."
                 )
+            # Latch the clock type if get_session_datetime didn't already
+            # (the UNKNOWN branch above bypasses it).
+            if self.__class__.shared_clock_type is None:
+                self.__class__.shared_clock_type = inc_clock
         return self.__class__.shared_t0
 
     def _check_filepath(self) -> None:
         """
-        Check self._filepath. Update path if necessary. Check if the path already exists and potentially raise
-        an error if overwriting is disabled.
+        Normalize ``self._state.filepath`` (reading the raw path from
+        ``self.settings.filepath``). If the resolved path already exists,
+        delete it when ``overwrite_old`` is enabled or raise otherwise.
         """
         _suffix = ".nwb"
 
-        if self._filepath.name.startswith("."):
+        filepath = Path(self._state.filepath)
+        if filepath.name.startswith("."):
             raise FileNotFoundError(
-                f"filepath {self._filepath} name begins with `.` -- cannot discriminate name from extension."
+                f"filepath {filepath} name begins with `.` -- cannot discriminate name from extension."
             )
 
-        filepath = Path(self._filepath).expanduser()
+        filepath = filepath.expanduser()
 
         # If provided path is merely a directory then create a new filename.
         is_dir = (isinstance(filepath, Path) and filepath.is_dir()) or (
@@ -350,35 +427,36 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         if not filepath.suffix:
             filepath = filepath.parent / (filepath.name + _suffix)
 
-        self._filepath = filepath
+        self._state.filepath = filepath
 
         if self.path_on_disk.exists():
             age = (time.time() - os.path.getctime(self.path_on_disk)) / 60
             ez.logger.info(f"File at {self.path_on_disk} is {age:.2f} minutes old.")
-            if self._overwrite_old:
+            if self.settings.overwrite_old:
                 ez.logger.info("File will be overwritten.")
                 self.path_on_disk.unlink(missing_ok=False)
             else:
                 msg = "File exists but overwriting is disabled. Set overwrite_old=True to overwrite."
                 ez.logger.error(msg)
                 raise ValueError(msg)
-        self._filepath = filepath
 
     def _read_meta_dict(self) -> typing.Union[typing.Mapping, dict]:
         """
-        Load the metadata from self._meta_yaml if that path exists, else load it from the default location.
+        Load the metadata from ``self.settings.meta_yaml`` if that path
+        exists, else load it from the default location.
 
         Returns:
             A dict containing the metadata for this NWB file.
         """
-        if self._meta_yaml is None or not Path(self._meta_yaml).expanduser().exists():
+        meta_yaml = self.settings.meta_yaml
+        if meta_yaml is None or not Path(meta_yaml).expanduser().exists():
             default_path = Path(__file__).parent
             meta_dict = DeepDict()
             for yaml_name in ["nwb_metadata", "nwb_session"]:
                 yaml_path = default_path / f"{yaml_name}.yaml"
                 meta_dict = dict_deep_update(meta_dict, load_dict_from_file(yaml_path))
         else:
-            yaml_path = Path(self._meta_yaml).expanduser()
+            yaml_path = Path(meta_yaml).expanduser()
             meta_dict = load_dict_from_file(yaml_path)
         return meta_dict
 
@@ -433,7 +511,7 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         # Add the rate attribute to the timestamps series. Can only do this after flushing.
         for key, ss in meta.items():
             if key not in ["epochs", "trials"]:
-                series = self._nwbfile.acquisition[key]
+                series = self._state.nwbfile.acquisition[key]
                 series.timestamps.attrs["rate"] = ss["fs"]
 
     def close(self, write=False, log=True) -> None:
@@ -445,49 +523,67 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             log: Set True to log the closing and deletion of the file.
               This must be kept False when calling from __del__.
         """
-        if self._io is not None:
-            if write:
-                self._io.write(self._nwbfile)
-            src_str = f"{self._io.source}"
-            b_delete = sum(self._stream_bytes.values()) == 0
-            for key in ["epochs", "trials"]:
-                if hasattr(self._nwbfile, key) and getattr(self._nwbfile, key) is not None:
-                    b_delete = b_delete and len(getattr(self._nwbfile, key)) == 1  # EZNWB-START
-            self._io.close()
-            del self._nwbfile
-            del self._io
-            self._nwbfile = None
-            self._io = None
+        state = getattr(self, "_state", None)
+        if state is None or state.io is None:
+            return
+        nwbfile = state.nwbfile
+        io = state.io
+        if write:
+            io.write(nwbfile)
+        src_str = f"{io.source}"
+        b_delete = sum(s.bytes_written for s in state.series.values()) == 0
+        for key in ["epochs", "trials"]:
+            if hasattr(nwbfile, key) and getattr(nwbfile, key) is not None:
+                b_delete = b_delete and len(getattr(nwbfile, key)) == 1  # EZNWB-START
+        io.close()
+        state.nwbfile = None
+        state.io = None
+        state.series = {}
+        if log:
+            ez.logger.info(f"Closed file at {src_str}")
+        if b_delete:
+            self.path_on_disk.unlink(missing_ok=True)
             if log:
-                ez.logger.info(f"Closed file at {src_str}")
-            if b_delete:
-                self.path_on_disk.unlink(missing_ok=True)
-                if log:
-                    ez.logger.info(f"Deleted empty file at {src_str}.")
+                ez.logger.info(f"Deleted empty file at {src_str}.")
 
     def toggle_recording(self, recording: typing.Optional[bool] = None):
-        self._recording = recording if recording is not None else not self._recording
+        """Deprecated. Send a ``NWBSinkSettings`` update with the desired
+        ``recording`` value instead — the update is routed through
+        :meth:`update_settings` and takes effect on the next message.
+        """
+        warnings.warn(
+            "NWBSinkConsumer.toggle_recording is deprecated; publish a "
+            "NWBSinkSettings update with the desired `recording` value "
+            "instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        new_value = recording if recording is not None else not self.settings.recording
+        self.update_settings(dataclasses.replace(self.settings, recording=new_value))
 
     def _check_msg_consistency(self) -> bool:
+        axis = self.settings.axis
         key = self._current_msg.key
-        in_ax = self._current_msg.axes[self._axis]
+        series_state = self._state.series[key]
+        in_ax = self._current_msg.axes[axis]
         b_rate_change = (
-            self._axis in self._current_msg.axes
-            and "ts" in self._datasets[key]
+            axis in self._current_msg.axes
+            and series_state.ts is not None
             and not hasattr(in_ax, "data")
-            and self._datasets[key]["ts"].attrs["rate"] != 1 / in_ax.gain
+            and series_state.ts.attrs["rate"] != 1 / in_ax.gain
         )
-        b_shape_change = self._datasets[key]["shape"] != self._current_msg.data.shape[1:]
+        b_shape_change = series_state.shape != self._current_msg.data.shape[1:]
         return not (b_rate_change or b_shape_change)
 
     def _update_rate_for_current(self):
-        if self._axis in ["time", "win"]:
-            time_ax = self._current_msg.axes[self._axis]
+        axis = self.settings.axis
+        if axis in ["time", "win"]:
+            time_ax = self._current_msg.axes[axis]
             if hasattr(time_ax, "data"):
                 rate = 0.0
             else:
                 rate = 1 / time_ax.gain if time_ax.gain != 0 else 0
-            self._datasets[self._current_msg.key]["ts"].attrs["rate"] = rate
+            self._state.series[self._current_msg.key].ts.attrs["rate"] = rate
 
     def _copy_nwb(self) -> typing.Tuple[pynwb.NWBFile, dict]:
         copy_keys = [
@@ -510,19 +606,20 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             "stimulus_notes",
             "lab",
         ]
-        new_nwb_kwargs = {k: getattr(self._nwbfile, k) for k in copy_keys if hasattr(self._nwbfile, k)}
+        old_nwbfile = self._state.nwbfile
+        new_nwb_kwargs = {k: getattr(old_nwbfile, k) for k in copy_keys if hasattr(old_nwbfile, k)}
         new_nwb_kwargs["keywords"] = (
-            self._nwbfile.keywords if isinstance(self._nwbfile.keywords, list) else self._nwbfile.keywords[:].tolist()
+            old_nwbfile.keywords if isinstance(old_nwbfile.keywords, list) else old_nwbfile.keywords[:].tolist()
         )
         nwbfile = pynwb.NWBFile(identifier=str(uuid4()), **new_nwb_kwargs)
-        nwbfile.subject = pynwb.file.Subject(**self._nwbfile.subject.fields)
+        nwbfile.subject = pynwb.file.Subject(**old_nwbfile.subject.fields)
         meta = {}
         for key in ["epochs", "trials"]:
-            if hasattr(self._nwbfile, key) and getattr(self._nwbfile, key) is not None:
+            if hasattr(old_nwbfile, key) and getattr(old_nwbfile, key) is not None:
                 meta[key] = {"fs": 0.0, "shape": (0, 1)}
-        for key, ds in self._datasets.items():
+        for key, ss in self._state.series.items():
             if key not in ["epochs", "trials"]:
-                meta[key] = {"fs": ds["ts"].attrs["rate"], "shape": (0,) + ds["shape"]}
+                meta[key] = {"fs": ss.ts.attrs["rate"], "shape": (0,) + ss.shape}
 
         return nwbfile, meta
 
@@ -544,20 +641,21 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             if "Subject" in meta_dict:
                 nwbfile.subject = pynwb.file.Subject(**meta_dict["Subject"])
 
-        if "%d" in str(self._filepath):
+        if "%d" in str(self._state.filepath):
             io_file = h5py.File(
-                name=self._filepath,
+                name=self._state.filepath,
                 mode="w",
                 driver="family",
-                memb_size=self._split_bytes,
+                memb_size=self.settings.split_bytes,
             )
             io = pynwb.NWBHDF5IO(file=io_file, mode="w")
         else:
             io = pynwb.NWBHDF5IO(self.path_on_disk, "w")
 
-        self._io = io
-        self._nwbfile = nwbfile
-        self._stream_bytes = defaultdict(lambda: 0)
+        self._state.io = io
+        self._state.nwbfile = nwbfile
+        # Fresh series map; prior entries (if any) belong to the closed file.
+        self._state.series = {}
 
     def _flush_io(self, reopen: bool = True):
         """
@@ -567,33 +665,33 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         * enable appending to our epochs/trials table (but only after it has an entry).
         * create the appendable datasets for our continuous data.
         """
-        self._io.write(self._nwbfile)
+        self._state.io.write(self._state.nwbfile)
         if reopen:
-            if self._io:
-                self._io.close()
-            if "%d" in str(self._filepath):
+            if self._state.io:
+                self._state.io.close()
+            if "%d" in str(self._state.filepath):
                 io_file = h5py.File(
-                    name=self._filepath,
+                    name=self._state.filepath,
                     mode="a",
                     driver="family",
-                    memb_size=self._split_bytes,
+                    memb_size=self.settings.split_bytes,
                 )
                 io = pynwb.NWBHDF5IO(file=io_file, mode="a")
             else:
                 io = pynwb.NWBHDF5IO(self.path_on_disk, "a")
-            self._io = io
-            self._nwbfile = self._io.read()
+            self._state.io = io
+            self._state.nwbfile = self._state.io.read()
 
         # Get references to our continuous datasets
-        for k, v in self._datasets.items():
-            if k in self._nwbfile.acquisition:
-                series = self._nwbfile.acquisition[k]
+        for k, ss in self._state.series.items():
+            if k in self._state.nwbfile.acquisition:
+                series = self._state.nwbfile.acquisition[k]
                 if isinstance(series.data, H5DataIO):
-                    v["data"] = series.data.dataset
-                    v["ts"] = series.timestamps.dataset
+                    ss.data = series.data.dataset
+                    ss.ts = series.timestamps.dataset
                 else:
-                    v["data"] = series.data
-                    v["ts"] = series.timestamps
+                    ss.data = series.data
+                    ss.ts = series.timestamps
 
     def _append_events(
         self,
@@ -601,7 +699,8 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         timestamps: typing.Iterable[float],
         data: typing.Iterable[typing.Iterable[str]],
     ):
-        fun = {"epochs": self._nwbfile.add_epoch, "trials": self._nwbfile.add_trial}[key]
+        nwbfile = self._state.nwbfile
+        fun = {"epochs": nwbfile.add_epoch, "trials": nwbfile.add_trial}[key]
         for ev_t, ev_str in zip(timestamps, data):
             fun(start_time=ev_t, stop_time=ev_t + 0, **{"label": ",".join(ev_str)})
 
@@ -611,15 +710,16 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         """
         colname = "label"
         key = self._current_msg.key
+        nwbfile = self._state.nwbfile
         fun = {
-            "epochs": self._nwbfile.add_epoch_column,
-            "trials": self._nwbfile.add_trial_column,
+            "epochs": nwbfile.add_epoch_column,
+            "trials": nwbfile.add_trial_column,
         }[key]
         fun(name=colname, description=f"{colname} {key}")
 
-        self._datasets[key] = {"shape": self._current_msg.data.shape[1:]}
+        self._state.series[key] = SeriesState(shape=self._current_msg.data.shape[1:])
 
-        table = {"epochs": self._nwbfile.epochs, "trials": self._nwbfile.trials}[key]
+        table = {"epochs": nwbfile.epochs, "trials": nwbfile.trials}[key]
         table.id.set_data_io(H5DataIO, {"maxshape": (None,)})
         table.start_time.set_data_io(H5DataIO, {"maxshape": (None,)})
         table.stop_time.set_data_io(H5DataIO, {"maxshape": (None,)})
@@ -637,9 +737,10 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
         channel info is provided).
         """
         key = self._current_msg.key
-        targ_ax_ix = self._current_msg.get_axis_idx(self._axis)
+        nwbfile = self._state.nwbfile
+        targ_ax_ix = self._current_msg.get_axis_idx(self.settings.axis)
         shape = self._current_msg.data.shape[:targ_ax_ix] + self._current_msg.data.shape[targ_ax_ix + 1 :]
-        self._datasets[key] = {"shape": shape}
+        self._state.series[key] = SeriesState(shape=shape)
         dataio = H5DataIO(
             shape=(0,) + shape,
             dtype=self._current_msg.data.dtype,
@@ -661,21 +762,21 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
             and hasattr(self._current_msg.axes["ch"], "data")
             and len(self._current_msg.axes["ch"].data)
         ):
-            b_first = self._nwbfile.electrodes is None or "label" not in self._nwbfile.electrodes.colnames
+            b_first = nwbfile.electrodes is None or "label" not in nwbfile.electrodes.colnames
             if b_first:
-                self._nwbfile.add_electrode_column(name="label", description="electrode label")
+                nwbfile.add_electrode_column(name="label", description="electrode label")
 
             dev_name = "unified device"
-            if dev_name in self._nwbfile.devices:
-                device = self._nwbfile.devices[dev_name]
+            if dev_name in nwbfile.devices:
+                device = nwbfile.devices[dev_name]
             else:
-                device = self._nwbfile.create_device(name=dev_name, description="created by ezmsg nwbsink")
+                device = nwbfile.create_device(name=dev_name, description="created by ezmsg nwbsink")
 
             el_grp_name = "unified electrode group"
-            if el_grp_name in self._nwbfile.electrode_groups:
-                el_grp = self._nwbfile.electrode_groups[el_grp_name]
+            if el_grp_name in nwbfile.electrode_groups:
+                el_grp = nwbfile.electrode_groups[el_grp_name]
             else:
-                el_grp = self._nwbfile.create_electrode_group(
+                el_grp = nwbfile.create_electrode_group(
                     name=el_grp_name,
                     description="electrode group created by ezmsg nwbsink",
                     device=device,
@@ -683,21 +784,23 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 )
                 if not b_first:
                     self._flush_io(reopen=True)
+                    # _flush_io swaps nwbfile out from under us; refresh.
+                    nwbfile = self._state.nwbfile
 
-            el_df = self._nwbfile.electrodes.to_dataframe()
+            el_df = nwbfile.electrodes.to_dataframe()
             el_df = el_df[el_df["group"] == el_grp]
             for ll in self._current_msg.axes["ch"].data:
                 if ll not in el_df["label"].values:
-                    self._nwbfile.add_electrode(label=ll, location="unknown", group=el_grp)
+                    nwbfile.add_electrode(label=ll, location="unknown", group=el_grp)
 
-            if type(self._nwbfile.electrodes.id.data) is list:
+            if type(nwbfile.electrodes.id.data) is list:
                 for fn in ["id", "location", "group_name", "group", "label"]:
-                    getattr(self._nwbfile.electrodes, fn).set_data_io(H5DataIO, {"maxshape": (None,), "chunks": True})
+                    getattr(nwbfile.electrodes, fn).set_data_io(H5DataIO, {"maxshape": (None,), "chunks": True})
 
-            el_df = self._nwbfile.electrodes.to_dataframe()
+            el_df = nwbfile.electrodes.to_dataframe()
             el_df = el_df[el_df["group"] == el_grp]
             b_in = el_df["label"].isin(self._current_msg.axes["ch"].data)
-            el_tbl_region = self._nwbfile.create_electrode_table_region(
+            el_tbl_region = nwbfile.create_electrode_table_region(
                 region=el_df[b_in].index.tolist(),
                 description=f"electrodes for {key}",
             )
@@ -719,27 +822,11 @@ class NWBSinkConsumer(BaseConsumer[NWBSinkSettings, AxisArray]):
                 conversion=1e-6,
                 description=series_description,
             )
-        self._nwbfile.add_acquisition(series)
+        nwbfile.add_acquisition(series)
 
 
 class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
     SETTINGS = NWBSinkSettings
-
-    INPUT_SETTINGS = ez.InputStream(NWBSinkSettings)
-
-    @ez.subscriber(INPUT_SETTINGS)
-    async def on_settings(self, msg: NWBSinkSettings) -> None:
-        # Reset if settings _other than `recording`_ have changed.
-        b_reset = msg.filepath != self.SETTINGS.filepath
-        b_reset = b_reset or msg.overwrite_old != self.SETTINGS.overwrite_old
-        b_reset = b_reset or msg.axis != self.SETTINGS.axis
-        b_reset = b_reset or msg.inc_clock != self.SETTINGS.inc_clock
-        b_reset = b_reset or msg.meta_yaml != self.SETTINGS.meta_yaml
-        if b_reset:
-            self.apply_settings(msg)
-            self.create_processor()
-        elif msg.recording != self.SETTINGS.recording:
-            self.processor.toggle_recording(msg.recording)
 
     async def shutdown(self) -> None:
         await super().shutdown()

@@ -1,12 +1,41 @@
 """Tests for NWBAxisArrayIterator."""
 
 import math
+import threading
 from collections import Counter
 
 import numpy as np
 import pytest
 
 from ezmsg.nwb import NWBAxisArrayIterator, NWBIteratorSettings, ReferenceClockType
+
+
+async def test_areset_state_runs_reset_in_worker_thread(test_nwb_path):
+    """``_areset_state`` must offload sync ``_reset_state`` to a worker
+    thread so the unit's event loop stays responsive during the NWB open."""
+    main_tid = threading.get_ident()
+    seen_tids: list[int] = []
+
+    class Spy(NWBAxisArrayIterator):
+        def _reset_state(self):
+            seen_tids.append(threading.get_ident())
+            super()._reset_state()
+
+    producer = Spy(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+    # Discard the eager sync invocation from __init__.
+    seen_tids.clear()
+
+    await producer._areset_state()
+
+    assert len(seen_tids) == 1
+    assert seen_tids[0] != main_tid, "_reset_state ran on the main event-loop thread"
+
 
 # --- Stream discovery ---
 
