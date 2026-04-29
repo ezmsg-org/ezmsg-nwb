@@ -59,6 +59,115 @@ class NWBIteratorState:
     prefetch_stop: typing.Any = None
 
 
+def _build_chunk_messages_static(
+    slicer: NWBSlicer,
+    streams: dict,
+    chunk_ix: int,
+) -> list[AxisArray]:
+    """Build the messages for ``chunk_ix`` from explicit slicer/streams refs.
+
+    Module-level (not a method) on purpose: the prefetch worker captures only
+    the values it needs, never ``self``. If it captured ``self``, the
+    iterator's refcount would never drop to 0 while the worker is alive, so
+    ``del it`` would not trigger ``__del__`` / ``_stop_prefetch`` — the worker
+    would then outlive its intended scope and can deadlock at process exit
+    against h5py's atexit close path (both contend for the file's phil lock).
+    """
+    ts_off = slicer.ts_off
+    out: list[AxisArray] = []
+    for strm_name, strm_dict in streams.items():
+        info = strm_dict["info"]
+        start_idx = strm_dict["chunk_offsets"][chunk_ix]
+        if chunk_ix + 1 < len(strm_dict["chunk_offsets"]):
+            stop_idx = strm_dict["chunk_offsets"][chunk_ix + 1]
+        else:
+            stop_idx = info.dset.shape[0]
+        template = info.template
+
+        if info.is_event:
+            if start_idx < stop_idx:
+                table = info.table_ref
+                for idx in range(start_idx, stop_idx):
+                    out.append(
+                        replace(
+                            template,
+                            data=info.dset[idx : idx + 1],
+                            axes={
+                                **template.axes,
+                                "time": replace(
+                                    template.axes["time"],
+                                    data=ts_off + table.start_time[idx : idx + 1],
+                                ),
+                            },
+                            key=strm_name,
+                        )
+                    )
+            else:
+                out.append(template)
+        else:
+            out_data = info.dset[start_idx:stop_idx]
+            if info.timestamps is not None and start_idx < len(info.timestamps):
+                chunk_t0 = info.timestamps[start_idx]
+            else:
+                chunk_t0 = template.axes["time"].gain * start_idx
+            out.append(
+                replace(
+                    template,
+                    data=out_data,
+                    axes={
+                        **template.axes,
+                        "time": replace(
+                            template.axes["time"],
+                            offset=ts_off + chunk_t0,
+                        ),
+                    },
+                    key=strm_name,
+                )
+            )
+    return out
+
+
+def _prefetch_worker(
+    slicer: NWBSlicer,
+    streams: dict,
+    n_chunks: int,
+    q: queue.Queue,
+    stop: threading.Event,
+) -> None:
+    """Prefetch worker target. Top-level function (no closure over the
+    iterator) so the iterator can be garbage-collected as soon as the user
+    drops their reference; ``__del__`` then runs and cleanly shuts the
+    worker down.
+    """
+    try:
+        for chunk_ix in range(n_chunks):
+            if stop.is_set():
+                return
+            msgs = _build_chunk_messages_static(slicer, streams, chunk_ix)
+            # Block on a full queue, but wake periodically to honour stop.
+            while not stop.is_set():
+                try:
+                    q.put(msgs, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+            else:
+                return
+    except Exception as exc:  # pragma: no cover — surfaces in get()
+        ez.logger.exception("NWBAxisArrayIterator prefetch worker failed: %s", exc)
+        try:
+            q.put(exc, timeout=1.0)
+        except queue.Full:
+            pass
+        return
+    finally:
+        # Always signal end-of-stream so the consumer wakes up.
+        try:
+            q.put(_PREFETCH_END, timeout=1.0)
+        except queue.Full:
+            pass
+
+
 class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, NWBIteratorState]):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -146,65 +255,8 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
         self._state.n_chunks = n_chunks
 
     def _build_chunk_messages(self, chunk_ix: int) -> list[AxisArray]:
-        """Build the messages for ``chunk_ix`` without mutating state.
-
-        This is the only place that issues h5py reads during iteration. It
-        is called either inline (synchronous mode) or from the prefetch
-        worker thread (when ``prefetch_chunks > 0``).
-        """
-        slicer = self._state.slicer
-        ts_off = slicer.ts_off
-        out: list[AxisArray] = []
-        for strm_name, strm_dict in self._state.streams.items():
-            info = strm_dict["info"]
-            start_idx = strm_dict["chunk_offsets"][chunk_ix]
-            if chunk_ix + 1 < len(strm_dict["chunk_offsets"]):
-                stop_idx = strm_dict["chunk_offsets"][chunk_ix + 1]
-            else:
-                stop_idx = info.dset.shape[0]
-            template = info.template
-
-            if info.is_event:
-                if start_idx < stop_idx:
-                    table = info.table_ref
-                    for idx in range(start_idx, stop_idx):
-                        out.append(
-                            replace(
-                                template,
-                                data=info.dset[idx : idx + 1],
-                                axes={
-                                    **template.axes,
-                                    "time": replace(
-                                        template.axes["time"],
-                                        data=ts_off + table.start_time[idx : idx + 1],
-                                    ),
-                                },
-                                key=strm_name,
-                            )
-                        )
-                else:
-                    out.append(template)
-            else:
-                out_data = info.dset[start_idx:stop_idx]
-                if info.timestamps is not None and start_idx < len(info.timestamps):
-                    chunk_t0 = info.timestamps[start_idx]
-                else:
-                    chunk_t0 = template.axes["time"].gain * start_idx
-                out.append(
-                    replace(
-                        template,
-                        data=out_data,
-                        axes={
-                            **template.axes,
-                            "time": replace(
-                                template.axes["time"],
-                                offset=ts_off + chunk_t0,
-                            ),
-                        },
-                        key=strm_name,
-                    )
-                )
-        return out
+        """Sync-side wrapper around :func:`_build_chunk_messages_static`."""
+        return _build_chunk_messages_static(self._state.slicer, self._state.streams, chunk_ix)
 
     def _chunk_step(self):
         """Sync path: build the next chunk and append to the deque."""
@@ -222,41 +274,22 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
         self._state.prefetch_queue = queue.Queue(maxsize=self.settings.prefetch_chunks)
         self._state.prefetch_stop = threading.Event()
 
-        n_chunks = self._state.n_chunks
-        q = self._state.prefetch_queue
-        stop = self._state.prefetch_stop
-
-        def worker() -> None:
-            try:
-                for chunk_ix in range(n_chunks):
-                    if stop.is_set():
-                        return
-                    msgs = self._build_chunk_messages(chunk_ix)
-                    # Block on a full queue, but wake periodically to honour stop.
-                    while not stop.is_set():
-                        try:
-                            q.put(msgs, timeout=0.1)
-                            break
-                        except queue.Full:
-                            continue
-                    else:
-                        return
-            except Exception as exc:  # pragma: no cover — surfaces in get()
-                ez.logger.exception("NWBAxisArrayIterator prefetch worker failed: %s", exc)
-                # Push the exception so the consumer raises it rather than hanging.
-                try:
-                    q.put(exc, timeout=1.0)
-                except queue.Full:
-                    pass
-                return
-            finally:
-                # Always signal end-of-stream so the consumer wakes up.
-                try:
-                    q.put(_PREFETCH_END, timeout=1.0)
-                except queue.Full:
-                    pass
-
-        t = threading.Thread(target=worker, name="NWBIterator-prefetch", daemon=True)
+        # Pass refs as args, not via closure-over-self. Keeping ``self`` out
+        # of the worker's closure is what lets ``del it`` actually free the
+        # iterator and trigger ``__del__``; see ``_prefetch_worker`` for the
+        # full rationale.
+        t = threading.Thread(
+            target=_prefetch_worker,
+            args=(
+                self._state.slicer,
+                self._state.streams,
+                self._state.n_chunks,
+                self._state.prefetch_queue,
+                self._state.prefetch_stop,
+            ),
+            name="NWBIterator-prefetch",
+            daemon=True,
+        )
         self._state.prefetch_thread = t
         t.start()
 
@@ -351,6 +384,22 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
             self._state.slicer.close()
             self._state.slicer = None
 
+    def close(self) -> None:
+        """Shut down the prefetch worker (if any) and close the slicer.
+
+        Safe to call repeatedly. Prefer this over relying on ``__del__`` —
+        in the rare cases where the iterator survives a ``del`` because some
+        other reference is still alive, ``close()`` lets the caller drop
+        resources deterministically rather than waiting for GC.
+        """
+        try:
+            self._stop_prefetch()
+        except Exception:
+            pass
+        if self._state.slicer is not None:
+            self._state.slicer.close()
+            self._state.slicer = None
+
     def __next__(self) -> AxisArray:
         # Fast path: skip BaseProducer.__call__'s run_coroutine_sync round-trip
         # on every call. _reset_state already ran in __init__ and set _hash=0.
@@ -371,12 +420,10 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
         # prefetch worker is mid-``H5Dread`` when this happens it will never
         # release HDF5's per-file lock, so calling ``h5py.File.close()`` here
         # deadlocks forever. The OS reclaims file handles on process exit
-        # anyway, so during finalization just leave them.
+        # anyway, so during finalization just leave them. Since the worker
+        # no longer captures ``self``, normal ``del it`` paths reach this
+        # method *before* finalization — which is the path that actually
+        # cleans up.
         if sys.is_finalizing():
             return
-        try:
-            self._stop_prefetch()
-        except Exception:
-            pass
-        if self._state.slicer is not None:
-            self._state.slicer.close()
+        self.close()

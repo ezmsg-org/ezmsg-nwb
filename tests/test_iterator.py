@@ -437,17 +437,21 @@ def test_prefetch_data_integrity(test_nwb_path, prefetch_chunks):
         np.testing.assert_array_equal(d1, d2)
 
 
-def test_prefetch_runs_in_worker_thread(test_nwb_path):
+def test_prefetch_runs_in_worker_thread(test_nwb_path, monkeypatch):
     """Build calls happen on a non-main thread when prefetch is enabled."""
+    import ezmsg.nwb.iterator as iterator_mod
+
     main_tid = threading.get_ident()
     seen_tids: list[int] = []
+    real = iterator_mod._build_chunk_messages_static
 
-    class Spy(NWBAxisArrayIterator):
-        def _build_chunk_messages(self, chunk_ix):
-            seen_tids.append(threading.get_ident())
-            return super()._build_chunk_messages(chunk_ix)
+    def spy(slicer, streams, chunk_ix):
+        seen_tids.append(threading.get_ident())
+        return real(slicer, streams, chunk_ix)
 
-    it = Spy(
+    monkeypatch.setattr(iterator_mod, "_build_chunk_messages_static", spy)
+
+    it = NWBAxisArrayIterator(
         NWBIteratorSettings(
             filepath=test_nwb_path,
             chunk_dur=1.0,
@@ -460,7 +464,7 @@ def test_prefetch_runs_in_worker_thread(test_nwb_path):
     list(it)
 
     assert seen_tids, "prefetch worker never produced"
-    assert all(tid != main_tid for tid in seen_tids), "_build_chunk_messages ran on the main thread"
+    assert all(tid != main_tid for tid in seen_tids), "_build_chunk_messages_static ran on the main thread"
 
 
 def test_prefetch_stop_iteration(test_nwb_path):
@@ -478,6 +482,42 @@ def test_prefetch_stop_iteration(test_nwb_path):
     with pytest.raises(StopIteration):
         next(it)
     assert it.exhausted
+
+
+def test_prefetch_worker_does_not_keep_iterator_alive(test_nwb_path):
+    """``del it`` must drop the last reference and trigger ``__del__``,
+    even while the prefetch worker is running.
+
+    Regression: the worker used to capture ``self`` via a bound method,
+    keeping the iterator's refcount above zero. ``del it`` then never ran
+    ``__del__`` / ``_stop_prefetch``, leaving the worker alive past the
+    iterator's intended lifetime — which deadlocks at process exit when
+    h5py's atexit close path contends with the worker's phil lock.
+    """
+    import gc
+    import weakref
+
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=0.1,  # many chunks so the worker is actively running
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Broadband"],
+            prefetch_chunks=2,
+        )
+    )
+    next(it)  # ensure worker has started and is producing
+    assert it._state.prefetch_thread is not None
+    assert it._state.prefetch_thread.is_alive()
+
+    ref = weakref.ref(it)
+    del it
+    # Without forcing GC: refcount alone should be enough to drop the
+    # iterator if the worker doesn't capture self.
+    assert ref() is None, (
+        "iterator survived `del` — something (most likely the prefetch worker) " "is holding a strong reference to self"
+    )
+    gc.collect()  # belt-and-suspenders for any cyclic refs
 
 
 def test_prefetch_partial_consumption_clean_close(test_nwb_path):
