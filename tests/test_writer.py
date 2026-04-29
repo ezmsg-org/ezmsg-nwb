@@ -460,17 +460,25 @@ def test_rate_change_raises_and_closes():
     path.unlink(missing_ok=True)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "_prep_from_meta carries _current_msg.data.dtype across loop iterations "
-        "(or reads it as None at construction). Deferred per the writer cleanup TODO."
-    ),
-    raises=(AttributeError, TypeError, ValueError),
-    strict=False,
-)
+def _send_one_message(sink, key: str, dtype, fs: float = 100.0, n_ch: int = 4, n_time: int = 5):
+    """Push a single AxisArray of the right dtype/shape so the file has
+    at least one row written — otherwise ``close`` deletes the empty file.
+    """
+    msg = AxisArray(
+        data=np.zeros((n_time, n_ch), dtype=dtype),
+        dims=["time", "ch"],
+        axes={"time": AxisArray.LinearAxis(gain=1.0 / fs, offset=0.0)},
+        key=key,
+    )
+    sink._process(msg)
+
+
 def test_expected_series_smoke(tmp_path):
     """``expected_series`` should pre-allocate stream containers from a
-    metadata yaml so the file is fully shaped before any message arrives."""
+    metadata yaml so the file is fully shaped before any message arrives.
+
+    With no ``dtype`` field in the yaml, the default is ``float64``.
+    """
     expected_yaml = tmp_path / "expected.yaml"
     expected_yaml.write_text("PreAlloc:\n" "  fs: 100.0\n" "  shape: [-1, 4]\n")
     nwb_path = tmp_path / "expected.nwb"
@@ -483,11 +491,52 @@ def test_expected_series_smoke(tmp_path):
         )
     )
     assert "PreAlloc" in sink._state.series
+
+    _send_one_message(sink, "PreAlloc", np.float64)
     sink.close(write=True)
 
     with pynwb.NWBHDF5IO(str(nwb_path), "r") as io:
         nwbfile = io.read()
         assert "PreAlloc" in nwbfile.acquisition
+        assert nwbfile.acquisition["PreAlloc"].data.dtype == np.float64
+
+
+def test_expected_series_distinct_dtypes_per_stream(tmp_path):
+    """Each pre-allocated stream gets its own dtype from the yaml,
+    independent of the order they appear in the meta dict.
+
+    Regression: ``_prep_from_meta`` used to read dtype from
+    ``self._current_msg.data.dtype``, which carried across loop iterations,
+    so stream B's dtype silently inherited stream A's last value.
+    """
+    expected_yaml = tmp_path / "expected.yaml"
+    expected_yaml.write_text(
+        "FloatStream:\n"
+        "  fs: 100.0\n"
+        "  shape: [-1, 4]\n"
+        "  dtype: float32\n"
+        "IntStream:\n"
+        "  fs: 50.0\n"
+        "  shape: [-1, 2]\n"
+        "  dtype: int16\n"
+    )
+    nwb_path = tmp_path / "multi.nwb"
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=nwb_path,
+            overwrite_old=True,
+            expected_series=expected_yaml,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+    _send_one_message(sink, "FloatStream", np.float32, fs=100.0, n_ch=4)
+    _send_one_message(sink, "IntStream", np.int16, fs=50.0, n_ch=2)
+    sink.close(write=True)
+
+    with pynwb.NWBHDF5IO(str(nwb_path), "r") as io:
+        nwbfile = io.read()
+        assert nwbfile.acquisition["FloatStream"].data.dtype == np.float32
+        assert nwbfile.acquisition["IntStream"].data.dtype == np.int16
 
 
 def test_sample_trigger_routes_to_epochs():
