@@ -154,24 +154,6 @@ def test_nwb_clockdriven_unit_system(test_nwb_path):
 # -- Writer round-trip tests --
 
 
-def _make_writer_continuous_msg() -> AxisArray:
-    return AxisArray(
-        data=np.arange(6, dtype=float).reshape(3, 2),
-        dims=["time", "ch"],
-        axes={"time": AxisArray.Axis.TimeAxis(fs=100.0)},
-        key="sig",
-    )
-
-
-def _make_writer_epochs_msg() -> AxisArray:
-    return AxisArray(
-        data=np.array([["a"], ["b"]], dtype="U"),
-        dims=["time", "ch"],
-        axes={"time": AxisArray.CoordinateAxis(np.array([0.0, 1.0]), dims=["time"], unit="s")},
-        key="epochs",
-    )
-
-
 def test_writer_roundtrip_continuous(test_nwb_path):
     """Test writing continuous data and reading it back."""
     settings = NWBIteratorSettings(
