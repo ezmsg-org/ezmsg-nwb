@@ -554,7 +554,7 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                 data=np.zeros(shape, dtype=self._current_msg.data.dtype),
                 dims=["time", "ch"] + [f"dim{_}" for _ in range(len(shape) - 2)],
                 axes={
-                    "time": AxisArray.Axis.TimeAxis(fs=ss["fs"]),
+                    "time": AxisArray.TimeAxis(fs=ss["fs"]),
                 },
                 key=key,
             )
