@@ -2,6 +2,7 @@
 
 import math
 import threading
+import time
 from collections import Counter
 
 import numpy as np
@@ -406,3 +407,226 @@ def test_electrode_labels_preserved(test_nwb_path):
     msg = next(it)
     ch_labels = list(msg.axes["ch"].data)
     assert ch_labels == [f"elec{i}" for i in range(8)]
+
+
+# --- Prefetch ---
+
+
+@pytest.mark.parametrize("prefetch_chunks", [1, 2, 4])
+def test_prefetch_data_integrity(test_nwb_path, prefetch_chunks):
+    """Prefetched output is byte-identical to the synchronous path."""
+
+    def collect(prefetch):
+        it = NWBAxisArrayIterator(
+            NWBIteratorSettings(
+                filepath=test_nwb_path,
+                chunk_dur=1.0,
+                reference_clock=ReferenceClockType.UNKNOWN,
+                stream_keys=["Broadband", "BinnedSpikes", "phonemes"],
+                prefetch_chunks=prefetch,
+            )
+        )
+        return [(m.key, np.array(m.data, copy=True)) for m in it]
+
+    sync_msgs = collect(0)
+    pref_msgs = collect(prefetch_chunks)
+
+    assert len(sync_msgs) == len(pref_msgs)
+    for (k1, d1), (k2, d2) in zip(sync_msgs, pref_msgs):
+        assert k1 == k2
+        np.testing.assert_array_equal(d1, d2)
+
+
+def test_prefetch_runs_in_worker_thread(test_nwb_path, monkeypatch):
+    """Build calls happen on a non-main thread when prefetch is enabled."""
+    import ezmsg.nwb.iterator as iterator_mod
+
+    main_tid = threading.get_ident()
+    seen_tids: list[int] = []
+    real = iterator_mod._build_chunk_messages_static
+
+    def spy(slicer, streams, chunk_ix):
+        seen_tids.append(threading.get_ident())
+        return real(slicer, streams, chunk_ix)
+
+    monkeypatch.setattr(iterator_mod, "_build_chunk_messages_static", spy)
+
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["BinnedSpikes"],
+            prefetch_chunks=2,
+        )
+    )
+    # Drain — forces every chunk through the worker.
+    list(it)
+
+    assert seen_tids, "prefetch worker never produced"
+    assert all(tid != main_tid for tid in seen_tids), "_build_chunk_messages_static ran on the main thread"
+
+
+def test_prefetch_stop_iteration(test_nwb_path):
+    """End-of-stream raises StopIteration (no deadlock on the queue)."""
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=10.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["BinnedSpikes"],
+            prefetch_chunks=2,
+        )
+    )
+    list(it)
+    with pytest.raises(StopIteration):
+        next(it)
+    assert it.exhausted
+
+
+def test_prefetch_worker_does_not_keep_iterator_alive(test_nwb_path):
+    """``del it`` must drop the last reference and trigger ``__del__``,
+    even while the prefetch worker is running.
+
+    Regression: the worker used to capture ``self`` via a bound method,
+    keeping the iterator's refcount above zero. ``del it`` then never ran
+    ``__del__`` / ``_stop_prefetch``, leaving the worker alive past the
+    iterator's intended lifetime — which deadlocks at process exit when
+    h5py's atexit close path contends with the worker's phil lock.
+    """
+    import gc
+    import weakref
+
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=0.1,  # many chunks so the worker is actively running
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Broadband"],
+            prefetch_chunks=2,
+        )
+    )
+    next(it)  # ensure worker has started and is producing
+    assert it._state.prefetch_thread is not None
+    assert it._state.prefetch_thread.is_alive()
+
+    ref = weakref.ref(it)
+    del it
+    # Without forcing GC: refcount alone should be enough to drop the
+    # iterator if the worker doesn't capture self.
+    assert ref() is None, (
+        "iterator survived `del` — something (most likely the prefetch worker) " "is holding a strong reference to self"
+    )
+    gc.collect()  # belt-and-suspenders for any cyclic refs
+
+
+def test_prefetch_partial_consumption_clean_close(test_nwb_path):
+    """Closing/destroying after partial consumption joins the prefetch worker
+    cleanly without leaking the thread.
+    """
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=0.1,  # many small chunks so the worker stays busy
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Broadband"],
+            prefetch_chunks=2,
+        )
+    )
+    # Consume just one message, leave the rest pending.
+    next(it)
+    worker = it._state.prefetch_thread
+    assert worker is not None and worker.is_alive()
+
+    # __del__ must stop and join the worker.
+    it.__del__()
+
+    # Give the OS a beat for the thread to finish, then verify.
+    deadline = time.time() + 2.0
+    while worker.is_alive() and time.time() < deadline:
+        time.sleep(0.01)
+    assert not worker.is_alive(), "prefetch thread did not stop within 2s"
+
+
+# --- Sync fast path ---
+
+
+def test_next_bypasses_run_coroutine_sync(test_nwb_path):
+    """``__next__`` reads the queue directly via ``_produce_sync`` and never
+    routes through the async ``_produce`` (which would force an event loop).
+    """
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["BinnedSpikes"],
+        )
+    )
+
+    sync_calls = 0
+    async_calls = 0
+
+    orig_sync = it._produce_sync
+    orig_async = it._produce
+
+    def spy_sync():
+        nonlocal sync_calls
+        sync_calls += 1
+        return orig_sync()
+
+    async def spy_async():
+        nonlocal async_calls
+        async_calls += 1
+        return await orig_async()
+
+    it._produce_sync = spy_sync
+    it._produce = spy_async
+
+    next(it)
+    assert sync_calls == 1
+    assert async_calls == 0
+
+
+# --- HDF5 chunk cache plumbing ---
+
+
+def test_rdcc_settings_forwarded_to_h5py(test_nwb_path, monkeypatch):
+    """Custom rdcc_nbytes / rdcc_nslots are passed to ``h5py.File`` on open.
+
+    We can't read them back off the resulting file: HDF5 caches chunk-cache
+    settings from the *first* open of a given file in the process, so the
+    fapl on a second open reflects the first open's values regardless of
+    the kwargs we pass. Verify the plumbing at the call site instead.
+    """
+    import h5py
+
+    import ezmsg.nwb.slicer as slicer_mod
+
+    seen_kwargs: list[dict] = []
+    real_file = h5py.File
+
+    def spy_file(*args, **kwargs):
+        seen_kwargs.append(dict(kwargs))
+        return real_file(*args, **kwargs)
+
+    monkeypatch.setattr(slicer_mod.h5py, "File", spy_file)
+
+    custom_nbytes = 8 * 1024 * 1024
+    custom_nslots = 521  # prime, distinct from default
+
+    NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["BinnedSpikes"],
+            rdcc_nbytes=custom_nbytes,
+            rdcc_nslots=custom_nslots,
+        )
+    )
+
+    assert seen_kwargs, "h5py.File was never called"
+    open_kwargs = seen_kwargs[0]
+    assert open_kwargs["rdcc_nbytes"] == custom_nbytes
+    assert open_kwargs["rdcc_nslots"] == custom_nslots
