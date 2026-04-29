@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import typing
 
@@ -59,6 +60,21 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
     on :class:`NWBClockDrivenSettings`.
     """
 
+    # Fields that can change without forcing a slicer teardown + reopen. The
+    # producer rebinds ``self.settings`` live and, for ``start_offset``,
+    # follows up with :meth:`seek`. Anything else — filepath, stream_key,
+    # reference_clock, reref_now, fs — routes through ``_request_reset`` and
+    # the next clock tick triggers a fresh :meth:`_reset_state`.
+    NONRESET_SETTINGS_FIELDS = frozenset({"start_offset", "playback_rate", "n_time"})
+
+    def update_settings(self, new_settings: NWBClockDrivenSettings) -> None:
+        old_offset = self.settings.start_offset
+        super().update_settings(new_settings)
+        # If super() queued a reset, _reset_state will re-seek from the new
+        # start_offset; only seek on the hot path.
+        if self._hash != -1 and new_settings.start_offset != old_offset:
+            self.seek(new_settings.start_offset)
+
     @property
     def exhausted(self) -> bool:
         if self._state.slicer is None:
@@ -67,6 +83,15 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
             return False  # Time-window streams don't track exhaustion via index
         return self._state.sample_idx >= self._state.n_total_samples
 
+    async def _areset_state(self, time_axis: LinearAxis) -> None:
+        """Offload the slow ``NWBSlicer`` open onto a worker thread so that
+        sibling subscribers (notably ``INPUT_SETTINGS`` for live scrubbing)
+        can keep running while the file is opened. First-message NWB I/O
+        can take 1.5–4 seconds per the writer-module docstring; without
+        this, the unit's event loop is held for the whole duration.
+        """
+        await asyncio.to_thread(self._reset_state, time_axis)
+
     def _reset_state(self, time_axis: LinearAxis) -> None:
         if self._state.slicer is not None:
             self._state.slicer.close()
@@ -74,10 +99,9 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
 
         # Idle mode: no file / stream configured yet. Leave the slicer as
         # None so ``_process`` short-circuits. A later settings push that
-        # sets ``filepath`` lands in the ``_RESET_FIELDS`` path in
-        # ``NWBClockDrivenUnit.on_settings``, which calls
-        # ``create_processor`` — a fresh producer then reruns this method
-        # and loads the file.
+        # sets ``filepath`` / ``stream_key`` falls outside
+        # ``NONRESET_SETTINGS_FIELDS``, so ``update_settings`` queues a reset
+        # and the next clock tick reruns this method and loads the file.
         if not self.settings.filepath or not self.settings.stream_key:
             self._state.template = None
             self._state.has_timestamps = False
@@ -231,45 +255,7 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
             self._state.slicer.close()
 
 
-# Fields whose change semantically forces a full reopen of the NWB file
-# (slicer teardown + rediscovery) and a fresh state. Anything else — start
-# offset, playback rate, chunk size — is hot-updated so playback keeps its
-# current position across scrubbing / speed changes / pause-resume.
-_RESET_FIELDS: frozenset[str] = frozenset({"filepath", "stream_key", "reference_clock", "reref_now", "fs"})
-
-
 class NWBClockDrivenUnit(BaseClockDrivenUnit[NWBClockDrivenSettings, NWBClockDrivenProducer]):
     """Clock-driven NWB unit that reads one stream synchronized to a shared clock."""
 
     SETTINGS = NWBClockDrivenSettings
-
-    @ez.subscriber(BaseClockDrivenUnit.INPUT_SETTINGS)
-    async def on_settings(self, msg: NWBClockDrivenSettings) -> None:
-        """Apply new settings, preserving playback position when possible.
-
-        The base class unconditionally recreates the processor on every
-        settings push, which for us means closing and reopening the NWB
-        file and resetting the playback cursor to ``start_offset``. That's
-        the right behaviour when the file or stream changes, but not for
-        the common GUI interactions — scrubbing, speed changes, pause —
-        which just want to tweak position or emission rate without losing
-        context. We only recreate when a ``_RESET_FIELDS`` field actually
-        changed, and otherwise hot-swap ``self.processor.settings`` plus
-        issue a ``seek`` when ``start_offset`` moved.
-        """
-        prev: NWBClockDrivenSettings = self.SETTINGS
-        processor: NWBClockDrivenProducer | None = getattr(self, "processor", None)
-
-        needs_full_reset = processor is None or any(getattr(prev, f) != getattr(msg, f) for f in _RESET_FIELDS)
-
-        self.apply_settings(msg)
-
-        if needs_full_reset:
-            self.create_processor()
-            return
-
-        # Hot-update path: swap settings on the live producer and seek if
-        # the user moved the playback cursor.
-        processor.settings = msg
-        if prev.start_offset != msg.start_offset:
-            processor.seek(msg.start_offset)
