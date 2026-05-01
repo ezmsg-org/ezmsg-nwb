@@ -539,3 +539,132 @@ def test_writer_event_append_after_reopen(tmp_path):
         df = nwbfile.epochs.to_dataframe()
 
     assert df["label"].tolist() == ["EZNWB-START", "a", "b"]
+
+
+class _SinkSettingsPokerSettings(ez.Settings):
+    sink_filepath: Path
+    target_recording: bool = False
+    publish_after_s: float = 0.5
+    terminate_after_s: float = 2.0
+
+
+class _SinkSettingsPoker(ez.Unit):
+    """Publish a ``NWBSinkSettings`` update to ``NWBSink.INPUT_SETTINGS``
+    mid-run, then raise ``NormalTermination`` after a settle delay so the
+    producer has time to emit the resulting UPDATED event."""
+
+    SETTINGS = _SinkSettingsPokerSettings
+    OUTPUT_SETTINGS = ez.OutputStream(NWBSinkSettings)
+
+    @ez.publisher(OUTPUT_SETTINGS)
+    async def poke(self) -> typing.AsyncGenerator:
+        s = self.SETTINGS
+        await asyncio.sleep(s.publish_after_s)
+        # Flip the ``recording`` flag — same filepath, NONRESET field, so
+        # the sink's file isn't disturbed; the only observable side-effect
+        # is the graph server recording a SettingsChangedEvent for SINK.
+        yield (
+            self.OUTPUT_SETTINGS,
+            NWBSinkSettings(
+                filepath=s.sink_filepath,
+                overwrite_old=True,
+                recording=s.target_recording,
+                inc_clock=ReferenceClockType.UNKNOWN,
+            ),
+        )
+        await asyncio.sleep(s.terminate_after_s)
+        raise ez.NormalTermination
+
+
+def test_writer_pipeline_settings_updated_event_via_graph(tmp_path):
+    """End-to-end: ``PipelineSettingsUnit`` emits an UPDATED event when a
+    settings message is published into another unit's ``INPUT_SETTINGS``
+    while the graph is running, and ``NWBSink`` lands it in the
+    ``settings_annotations`` series alongside the INITIAL snapshot.
+
+    The mid-run change is driven by ``_SinkSettingsPoker`` — when its
+    ``NWBSinkSettings`` message lands at ``NWBSink.INPUT_SETTINGS``, the
+    backend reports the new value to the graph server, which broadcasts a
+    ``SettingsChangedEvent`` that the running ``PipelineSettingsProducer``
+    receives via its subscription and forwards as an ``UPDATED`` event.
+    """
+    from ezmsg.baseproc import PipelineSettingsProducerSettings, PipelineSettingsUnit
+    from ezmsg.core.graphserver import GraphServer
+
+    outpath = tmp_path / "ezmsg_nwb_pipeline_settings_updated.nwb"
+    outpath.unlink(missing_ok=True)
+
+    graph_address = ("127.0.0.1", _find_free_port())
+
+    class _Settings(ez.Settings):
+        producer: PipelineSettingsProducerSettings
+        sink: NWBSinkSettings
+        poker: _SinkSettingsPokerSettings
+
+    class _Pipeline(ez.Collection):
+        SETTINGS = _Settings
+
+        PUB = PipelineSettingsUnit()
+        SINK = NWBSink()
+        POKER = _SinkSettingsPoker()
+
+        def configure(self) -> None:
+            self.PUB.apply_settings(self.SETTINGS.producer)
+            self.SINK.apply_settings(self.SETTINGS.sink)
+            self.POKER.apply_settings(self.SETTINGS.poker)
+
+        def network(self) -> ez.NetworkDefinition:
+            return (
+                (self.PUB.OUTPUT_SIGNAL, self.SINK.INPUT_ANNOTATION),
+                (self.POKER.OUTPUT_SETTINGS, self.SINK.INPUT_SETTINGS),
+            )
+
+    system = _Pipeline(
+        _Settings(
+            producer=PipelineSettingsProducerSettings(graph_address=graph_address),
+            sink=NWBSinkSettings(
+                filepath=outpath,
+                overwrite_old=True,
+                recording=True,
+                inc_clock=ReferenceClockType.UNKNOWN,
+            ),
+            poker=_SinkSettingsPokerSettings(
+                sink_filepath=outpath,
+                target_recording=False,
+                publish_after_s=0.5,
+                terminate_after_s=1.5,
+            ),
+        )
+    )
+
+    server = GraphServer()
+    server.start(graph_address)
+    try:
+        ez.run(SYSTEM=system, graph_address=graph_address)
+    finally:
+        server.stop()
+
+    assert outpath.exists()
+    with NWBHDF5IO(str(outpath), "r") as io:
+        nwbfile = io.read()
+        rows = [json.loads(s) for s in nwbfile.acquisition["settings_annotations"].data[:]]
+
+    initial = [r for r in rows if r["event_type"] == "INITIAL"]
+    updated = [r for r in rows if r["event_type"] == "UPDATED"]
+
+    # Initial snapshot covers the whole session.
+    assert len(initial) >= 3
+    initial_components = {r["component"] for r in initial}
+    assert any(c.endswith("/PUB") for c in initial_components)
+    assert any(c.endswith("/SINK") for c in initial_components)
+    assert any(c.endswith("/POKER") for c in initial_components)
+
+    # POKER's settings push lands as one (or more) UPDATED row whose
+    # component is SINK and whose ``recording`` field is the new value.
+    assert len(updated) >= 1
+    sink_updates = [r for r in updated if r["component"].endswith("/SINK")]
+    assert sink_updates, f"expected an UPDATED row for SINK; got components {sorted({r['component'] for r in updated})}"
+    last = sink_updates[-1]
+    assert last["settings"]["recording"] is False
+
+    outpath.unlink(missing_ok=True)
