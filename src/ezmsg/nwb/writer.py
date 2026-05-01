@@ -90,7 +90,6 @@ from neuroconv.utils import DeepDict, dict_deep_update, load_dict_from_file
 from .util import (
     ReferenceClockType,
     build_nwb_fname,
-    flatten_component_settings,
 )
 
 try:
@@ -138,14 +137,12 @@ class NWBSinkState:
     series: typing.Optional[typing.Dict[str, SeriesState]] = None
     start_timestamp: float = 0.0
     split_count: int = 0
-    # Pipeline-settings tracker (per-file). Cleared on every _reset_state
-    # so a file swap starts with an empty table; the unit re-seeds via
-    # _pending_settings_seed (option B). Watcher updates are serialized
-    # against _process via NWBSinkConsumer._lock.
-    settings_columns: typing.Optional[typing.List[str]] = None
-    settings_state: typing.Optional[typing.Dict[str, typing.Any]] = None
-    settings_active_since: typing.Optional[float] = None
-    settings_prev_component: str = "__init__"
+    # Per-file map of annotation-series name → its h5py string dataset.
+    # Reset on every ``_reset_state`` so a fresh file starts empty; the
+    # entry is created on first sight of each ``table_name`` in an
+    # incoming annotation row.
+    annotation_data: typing.Optional[typing.Dict[str, typing.Any]] = None
+    annotation_ts: typing.Optional[typing.Dict[str, typing.Any]] = None
 
 
 class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkState]):
@@ -162,20 +159,12 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
     # requests a reset so the next message closes the old file and reopens.
     NONRESET_SETTINGS_FIELDS = frozenset({"recording", "split_bytes"})
 
-    # Name of the per-file pipeline-settings TimeIntervals table.
-    SETTINGS_TABLE_NAME: typing.ClassVar[str] = "pipeline_settings"
-
     def __init__(self, *args, settings: typing.Optional[NWBSinkSettings] = None, **kwargs):
         super().__init__(*args, settings=settings, **kwargs)
-        # Serializes _process appends and update_settings_table calls from
-        # the unit's GraphContext watcher task; HDF5 writes from two threads
-        # to the same file are unsafe.
+        # Serializes ``_process`` appends and ``write_annotation`` calls
+        # from the annotation subscriber; HDF5 writes from two threads to
+        # the same file are unsafe.
         self._lock = threading.RLock()
-        # When the unit pre-fetches a graph settings snapshot in
-        # ``on_settings``, it stashes it here so the next ``_reset_state``
-        # (which opens the new file) can seed the table on the new file.
-        # See option (B) re-seed-on-swap design.
-        self._pending_settings_seed: typing.Optional[typing.Tuple[typing.Dict[str, typing.Any], float]] = None
         # ``_current_msg`` is scratch space shared between ``_process`` and
         # helpers like ``_prep_continuous_io`` / ``_prep_from_meta``. Deferred
         # migration into state — see _prep_from_meta cleanup follow-up.
@@ -208,13 +197,8 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         self._state.series = {}
         self._state.start_timestamp = 0.0
         self._state.split_count = 0
-        # Per-file pipeline-settings tracker resets on every reset; the
-        # unit's option-B re-seed populates it again below if a snapshot
-        # was stashed before this reset was triggered.
-        self._state.settings_columns = []
-        self._state.settings_state = {}
-        self._state.settings_active_since = None
-        self._state.settings_prev_component = "__init__"
+        self._state.annotation_data = {}
+        self._state.annotation_ts = {}
 
         self._check_filepath()
         self._nwb_create_or_fail()
@@ -225,14 +209,6 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
             _ = self.get_session_datetime(None)
             self._state.start_timestamp = self.get_session_timestamp(None)
             self._prep_from_meta(meta)
-
-        # Option (B): if the unit pre-fetched a graph settings snapshot
-        # before triggering this reset, seed the new file's settings table.
-        if self._pending_settings_seed is not None:
-            flat, ts = self._pending_settings_seed
-            self._pending_settings_seed = None
-            if flat:
-                self.initialize_settings_table(flat, ts)
 
     def __del__(self):
         if not hasattr(self, "_state"):
@@ -351,14 +327,12 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
 
                 total_bytes = sum(s.bytes_written for s in self._state.series.values())
                 if 0 < self.settings.split_bytes <= total_bytes and "%d" not in str(self._state.filepath):
-                    # Rotate into a fresh file segment, carrying the current
-                    # pipeline-settings state forward so the new file's table
-                    # opens already populated.
-                    self._rotate_file(
-                        timestamp=time.time(),
-                        next_settings_state=dict(self._state.settings_state or {}),
-                        next_settings_prev_component="__split__",
-                    )
+                    self._state.split_count += 1
+                    self.path_on_disk.unlink(missing_ok=True)
+                    new_nwbfile, new_meta = self._copy_nwb()
+                    self.close()
+                    self._nwb_create_or_fail(nwbfile=new_nwbfile)
+                    self._prep_from_meta(new_meta)
 
     @property
     def path_on_disk(self) -> Path:
@@ -536,18 +510,8 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                 )
                 self._prep_event_io()
 
-        # Pre-allocate the pipeline-settings table from a metadata snapshot
-        # if one was carried over (e.g., after a file split via _rotate_file).
-        if self.SETTINGS_TABLE_NAME in meta:
-            settings_meta = meta[self.SETTINGS_TABLE_NAME]
-            sample_values = dict(settings_meta.get("settings_state") or {})
-            if not sample_values:
-                sample_values = {col: "" for col in settings_meta.get("settings_columns", [])}
-            if sample_values:
-                self._prep_settings_table(sample_values)
-
         for key, ss in meta.items():
-            if key in ("epochs", "trials", self.SETTINGS_TABLE_NAME):
+            if key in ("epochs", "trials"):
                 continue
             shape = _sanitize_shape(ss["shape"])
             self._current_msg = AxisArray(
@@ -565,7 +529,7 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
 
         # Add the rate attribute to the timestamps series. Can only do this after flushing.
         for key, ss in meta.items():
-            if key in ("epochs", "trials", self.SETTINGS_TABLE_NAME):
+            if key in ("epochs", "trials"):
                 continue
             series = self._state.nwbfile.acquisition[key]
             series.timestamps.attrs["rate"] = ss["fs"]
@@ -594,10 +558,6 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
     def _close_locked(self, state: NWBSinkState, write: bool, log: bool) -> None:
         if state.io is None:
             return
-        # Flush any open pipeline-settings interval so it lands in the file.
-        if state.settings_state and state.settings_active_since is not None:
-            self._flush_settings_interval(time.time(), state.settings_prev_component)
-            state.settings_active_since = None
         nwbfile = state.nwbfile
         io = state.io
         if write:
@@ -607,18 +567,16 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         for key in ["epochs", "trials"]:
             if hasattr(nwbfile, key) and getattr(nwbfile, key) is not None:
                 b_delete = b_delete and len(getattr(nwbfile, key)) == 1  # EZNWB-START
-        # A populated pipeline_settings table is also "content" — keep the
-        # file even if no acquisition data was written.
-        settings_table = self._get_settings_table()
-        if settings_table is not None and len(settings_table.id) > 0:
+        # Annotation rows are also "content" — keep the file even if no
+        # acquisition data was written.
+        if state.annotation_ts and any(len(ts) > 0 for ts in state.annotation_ts.values()):
             b_delete = False
         io.close()
         state.nwbfile = None
         state.io = None
         state.series = {}
-        state.settings_columns = []
-        state.settings_state = {}
-        state.settings_prev_component = "__init__"
+        state.annotation_data = {}
+        state.annotation_ts = {}
         if log:
             ez.logger.info(f"Closed file at {src_str}")
         if b_delete:
@@ -665,11 +623,7 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                 rate = 1 / time_ax.gain if time_ax.gain != 0 else 0
             self._state.series[self._current_msg.key].ts.attrs["rate"] = rate
 
-    def _copy_nwb(
-        self,
-        settings_columns: typing.Optional[typing.List[str]] = None,
-        settings_state: typing.Optional[typing.Dict[str, typing.Any]] = None,
-    ) -> typing.Tuple[pynwb.NWBFile, dict]:
+    def _copy_nwb(self) -> typing.Tuple[pynwb.NWBFile, dict]:
         copy_keys = [
             "session_description",
             "session_start_time",
@@ -704,16 +658,6 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         for key, ss in self._state.series.items():
             if key not in ["epochs", "trials"]:
                 meta[key] = {"fs": ss.ts.attrs["rate"], "shape": (0,) + ss.shape}
-        # Carry pipeline-settings schema/state forward so the next file can
-        # reopen its table populated. Caller may override via args.
-        cols = list(self._state.settings_columns or []) if settings_columns is None else list(settings_columns)
-        state_dict = dict(self._state.settings_state or {}) if settings_state is None else dict(settings_state)
-        if cols or state_dict:
-            meta[self.SETTINGS_TABLE_NAME] = {
-                "settings_columns": cols,
-                "settings_state": state_dict,
-            }
-
         return nwbfile, meta
 
     def _nwb_create_or_fail(self, nwbfile: typing.Optional[pynwb.NWBFile] = None) -> None:
@@ -786,6 +730,19 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                     ss.data = series.data
                     ss.ts = series.timestamps
 
+        # Annotation series datasets share the same file handle; reopen
+        # invalidates them, so refresh from the live nwbfile.
+        if self._state.annotation_data is not None:
+            for name in list(self._state.annotation_data.keys()):
+                if name in self._state.nwbfile.acquisition:
+                    series = self._state.nwbfile.acquisition[name]
+                    self._state.annotation_data[name] = (
+                        series.data.dataset if isinstance(series.data, H5DataIO) else series.data
+                    )
+                    self._state.annotation_ts[name] = (
+                        series.timestamps.dataset if isinstance(series.timestamps, H5DataIO) else series.timestamps
+                    )
+
     def _append_events(
         self,
         key: str,
@@ -798,260 +755,88 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
             fun(start_time=ev_t, stop_time=ev_t + 0, **{"label": ",".join(ev_str)})
 
     # ------------------------------------------------------------------
-    # Pipeline-settings tracker
+    # Annotation series writer
     #
-    # The unit's GraphContext watcher feeds prepared settings events into
-    # ``update_settings_table``; we record them as a per-file ``TimeIntervals``
-    # table named ``SETTINGS_TABLE_NAME``. A schema-incompatible update (new
-    # column, scalar↔array shape change) rotates into a fresh file segment
-    # so the table layout stays consistent within any one file.
+    # The unit's ``INPUT_ANNOTATION`` subscriber forwards anything with a
+    # ``flatten_for_table()`` method (e.g. ``PipelineSettingsEvent``) to
+    # ``write_annotation``. Each row becomes one entry in a per-file
+    # ``pynwb.misc.AnnotationSeries`` named after ``msg.table_name``,
+    # auto-created on first sight and appended to thereafter.
     # ------------------------------------------------------------------
 
-    def _configure_appendable_table(
-        self,
-        table: typing.Any,
-        sample_values: typing.Optional[typing.Dict[str, typing.Any]] = None,
-    ) -> None:
-        """Configure a dynamic table so its columns remain appendable after flush/reopen."""
-        table.id.set_data_io(H5DataIO, {"maxshape": (None,), "chunks": True})
-        for col in table.colnames:
-            sample_value = None if sample_values is None else sample_values.get(col)
-            if sample_value is None:
-                col_shape = getattr(table[col].data, "shape", ())
-                maxshape = (None,) + tuple(col_shape[1:]) if len(col_shape) > 1 else (None,)
-            elif np.isscalar(sample_value) or isinstance(sample_value, (str, bytes)):
-                maxshape = (None,)
-            else:
-                col_shape = np.asarray(sample_value).shape
-                maxshape = (None,) + tuple(col_shape)
-            table[col].set_data_io(H5DataIO, {"maxshape": maxshape, "chunks": True})
+    def _prep_annotation_series(self, name: str, description: str = "") -> None:
+        """Create an empty appendable ``AnnotationSeries`` and stash its datasets."""
+        if self._state.annotation_data is None:
+            self._state.annotation_data = {}
+            self._state.annotation_ts = {}
+        if name in self._state.annotation_data:
+            return
 
-    def _get_settings_table(self) -> typing.Any:
-        """Return the pipeline-settings intervals table if it exists."""
         nwbfile = self._state.nwbfile
-        if nwbfile is None or nwbfile.intervals is None:
-            return None
-        try:
-            return nwbfile.intervals[self.SETTINGS_TABLE_NAME]
-        except Exception:
-            return None
+        if nwbfile is None:
+            raise RuntimeError("Cannot prepare annotation series before NWB file is open.")
 
-    def _prep_settings_table(self, flat_settings: typing.Dict[str, typing.Any]) -> None:
-        """Create the pipeline-settings intervals table and its columns."""
-        if self._get_settings_table() is not None:
-            return
-
-        intervals = pynwb.epoch.TimeIntervals(
-            name=self.SETTINGS_TABLE_NAME,
-            description="Flattened ezmsg settings snapshots active over each logged interval",
+        dataio = H5DataIO(
+            data=np.array([], dtype=h5py.string_dtype()),
+            maxshape=(None,),
+            chunks=True,
         )
-        intervals.add_column(
-            name="updated_component",
-            description="component that triggered the snapshot transition",
+        tsio = H5DataIO(
+            shape=(0,),
+            dtype=np.float64,
+            maxshape=(None,),
+            fillvalue=np.nan,
         )
-        for column_name in flat_settings:
-            intervals.add_column(name=column_name, description="flattened ezmsg setting")
-        self._state.nwbfile.add_time_intervals(intervals)
-
-        table = self._get_settings_table()
-        if table is None:
-            raise RuntimeError("Failed to create settings table")
-
-        self._state.settings_columns = list(flat_settings.keys())
-        self._configure_appendable_table(table, flat_settings)
-
-    def _settings_relative_time(self, timestamp: float) -> float:
-        """Convert an absolute timestamp into file-relative session time."""
-        return timestamp - self.get_session_timestamp(None)
-
-    def _settings_value_shape(self, value: typing.Any) -> typing.Tuple[int, ...]:
-        """Return the per-cell shape occupied by a settings value."""
-        if value is None or np.isscalar(value) or isinstance(value, (str, bytes)):
-            return ()
-        try:
-            return tuple(np.asarray(value).shape)
-        except Exception:
-            return ()
-
-    def _column_value_shape(self, column_name: str) -> typing.Tuple[int, ...]:
-        """Return the current per-cell shape stored for a settings column."""
-        table = self._get_settings_table()
-        if table is not None and column_name in table.colnames:
-            data = table[column_name].data
-            if hasattr(data, "shape"):
-                shape = tuple(data.shape)
-                return shape[1:] if len(shape) > 1 else ()
-
-        state = self._state.settings_state or {}
-        if column_name in state:
-            return self._settings_value_shape(state[column_name])
-        return ()
-
-    def _validate_settings_columns(self, flat_settings: typing.Dict[str, typing.Any]) -> None:
-        """Ensure incoming settings keys match the established settings-table schema."""
-        cols = self._state.settings_columns or []
-        missing = [name for name in flat_settings if name not in cols]
-        if missing:
-            raise ValueError(
-                f"Received settings fields not present in settings table schema: {', '.join(sorted(missing))}"
-            )
-
-    def _settings_update_requires_rotation(self, flat_settings: typing.Dict[str, typing.Any]) -> bool:
-        """Return whether an incoming settings update is incompatible with the current table schema."""
-        cols = self._state.settings_columns or []
-        for column_name, value in flat_settings.items():
-            if column_name not in cols:
-                return True
-            current_shape = self._column_value_shape(column_name)
-            new_shape = self._settings_value_shape(value)
-            current_is_scalar = current_shape == ()
-            new_is_scalar = new_shape == ()
-            if current_is_scalar != new_is_scalar:
-                return True
-            if not current_is_scalar and current_shape != new_shape:
-                return True
-        return False
-
-    def _merged_settings_state(self, flat_settings: typing.Dict[str, typing.Any]) -> typing.Dict[str, typing.Any]:
-        """Return the full settings snapshot after applying a partial settings update."""
-        cols = self._state.settings_columns or []
-        state = self._state.settings_state or {}
-        merged = {column_name: state.get(column_name, "") for column_name in cols}
-        merged.update(flat_settings)
-        return merged
-
-    def _rotate_file(
-        self,
-        timestamp: float,
-        next_settings_state: typing.Optional[typing.Dict[str, typing.Any]],
-        next_settings_prev_component: str,
-    ) -> None:
-        """Close the current NWB file and open a new segment seeded with the given settings state."""
-        state = self._state
-        if state.settings_state and state.settings_active_since is not None:
-            self._flush_settings_interval(timestamp, state.settings_prev_component)
-
-        next_settings_state = dict(next_settings_state or {})
-        next_settings_columns = list(next_settings_state.keys())
-
-        # Prevent close() from re-appending the interval we just flushed.
-        state.settings_active_since = None
-
-        # Advance to the next file segment before creating the replacement file.
-        state.split_count += 1
-        self.path_on_disk.unlink(missing_ok=True)
-
-        new_nwbfile, new_meta = self._copy_nwb(
-            settings_columns=[],
-            settings_state={},
+        series = pynwb.misc.AnnotationSeries(
+            name=name,
+            data=dataio,
+            timestamps=tsio,
+            description=description or f"Annotations written by NWBSink to '{name}'",
         )
-        self.close()
-        self._nwb_create_or_fail(nwbfile=new_nwbfile)
-        self._prep_from_meta(new_meta)
+        nwbfile.add_acquisition(series)
 
-        if next_settings_state:
-            self._prep_settings_table(next_settings_state)
-            self._state.settings_state = {
-                col: next_settings_state.get(col, "") for col in (self._state.settings_columns or [])
-            }
-            self._state.settings_active_since = timestamp
-            self._state.settings_prev_component = next_settings_prev_component
-            self._apply_settings_update(next_settings_prev_component, next_settings_state, timestamp)
-            self._flush_io(reopen=True)
-        else:
-            self._state.settings_columns = next_settings_columns
-            self._state.settings_state = next_settings_state
-            self._state.settings_active_since = None
-            self._state.settings_prev_component = next_settings_prev_component
+        # Flush + reopen to materialize h5py datasets we can append to.
+        self._flush_io(reopen=True)
 
-    def _apply_settings_update(
-        self,
-        component_address: str,
-        flat_settings: typing.Dict[str, typing.Any],
-        timestamp: float,
-    ) -> None:
-        """Commit a prepared settings snapshot into the in-memory active state."""
-        self._flush_settings_interval(timestamp, self._state.settings_prev_component)
-        if not self._state.settings_state:
-            self._state.settings_state = {col: "" for col in (self._state.settings_columns or [])}
-        self._state.settings_state.update(flat_settings)
-        self._state.settings_active_since = timestamp
-        self._state.settings_prev_component = component_address
+        live_series = self._state.nwbfile.acquisition[name]
+        data_ds = live_series.data.dataset if isinstance(live_series.data, H5DataIO) else live_series.data
+        ts_ds = (
+            live_series.timestamps.dataset if isinstance(live_series.timestamps, H5DataIO) else live_series.timestamps
+        )
+        self._state.annotation_data[name] = data_ds
+        self._state.annotation_ts[name] = ts_ds
 
-    def initialize_settings_table(self, flat_settings: typing.Dict[str, typing.Any], timestamp: float) -> None:
-        """Seed the pipeline-settings table from a prepared flat settings snapshot.
+    def write_annotation(self, table_name: str, timestamp: float, data: str) -> None:
+        """Append one row to the named ``AnnotationSeries``, creating it if needed.
 
-        Renamed from ``initialize_settings`` to disambiguate from the
-        baseproc ``update_settings``/settings-message machinery that handles
-        ``NWBSinkSettings`` updates on the unit.
+        ``timestamp`` is wall-clock seconds. The value stored in the file is
+        ``timestamp - start_timestamp`` once a data message has set
+        ``start_timestamp`` (the file-relative convention NWB expects);
+        before then, the wall-clock value is passed through unmodified — the
+        sink has no baseline to subtract against, and inventing one (e.g.
+        from ``datetime.now()``) would silently desync from the eventual
+        data anchor. Annotations written before any data arrives therefore
+        carry whatever baseline their producer chose; downstream readers
+        should treat them accordingly.
         """
         with self._lock:
-            if not flat_settings:
+            if self._state.io is None:
+                # File closed (between reset and first message); silently drop.
                 return
-            if not self._state.settings_columns:
-                self._prep_settings_table(flat_settings)
-            self._validate_settings_columns(flat_settings)
-            self._state.settings_state = {
-                col: flat_settings.get(col, "") for col in (self._state.settings_columns or [])
-            }
-            self._state.settings_active_since = timestamp
-            self._state.settings_prev_component = "__init__"
-            self._apply_settings_update("__init__", flat_settings, self.get_session_timestamp())
-            self._flush_io(reopen=True)
+            if self._state.annotation_data is None or table_name not in self._state.annotation_data:
+                self._prep_annotation_series(table_name)
 
-    def update_settings_table(
-        self,
-        component_address: str,
-        flat_settings: typing.Dict[str, typing.Any],
-        timestamp: float,
-    ) -> None:
-        """Record a prepared settings update into the pipeline-settings table.
+            if self._state.start_timestamp != 0.0:
+                relative_ts = float(timestamp) - self._state.start_timestamp
+            else:
+                relative_ts = float(timestamp)
 
-        Renamed from ``update_settings`` to avoid shadowing the inherited
-        baseproc method of the same name (which applies ``NWBSinkSettings``
-        updates from ``INPUT_SETTINGS``). This one is the GraphContext
-        watcher's callback for ANY component's settings changes.
-        """
-        with self._lock:
-            if not flat_settings:
-                return
-            if not self._state.settings_columns:
-                self._prep_settings_table(flat_settings)
-                self._state.settings_state = {col: "" for col in (self._state.settings_columns or [])}
-                self._state.settings_active_since = timestamp
-
-            if self._settings_update_requires_rotation(flat_settings):
-                self._rotate_file(
-                    timestamp=timestamp,
-                    next_settings_state=self._merged_settings_state(flat_settings),
-                    next_settings_prev_component=component_address,
-                )
-                return
-
-            self._validate_settings_columns(flat_settings)
-            self._apply_settings_update(component_address, flat_settings, timestamp)
-
-    def _flush_settings_interval(self, end_timestamp: float, updated_component: str) -> None:
-        """Append the currently active settings snapshot as a closed NWB interval."""
-        state = self._state
-        if not state.settings_state or state.settings_active_since is None:
-            return
-
-        table = self._get_settings_table()
-        if table is None:
-            return
-
-        start_time = self._settings_relative_time(state.settings_active_since)
-        stop_time = self._settings_relative_time(end_timestamp)
-        if stop_time < start_time:
-            stop_time = start_time
-
-        table.add_interval(
-            start_time=start_time,
-            stop_time=stop_time,
-            updated_component=updated_component,
-            **state.settings_state,
-        )
+            data_ds = self._state.annotation_data[table_name]
+            ts_ds = self._state.annotation_ts[table_name]
+            data_ds.resize(len(data_ds) + 1, axis=0)
+            data_ds[-1] = data
+            ts_ds.resize(len(ts_ds) + 1, axis=0)
+            ts_ds[-1] = relative_ts
 
     def _prep_event_io(self):
         """
@@ -1177,133 +962,43 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
 class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
     SETTINGS = NWBSinkSettings
 
-    async def initialize(self) -> None:
-        """Discover the components in this session and start the GraphServer
-        settings watcher. The watcher mirrors EVERY component's settings
-        changes (including this sink's own) into the consumer's
-        ``pipeline_settings`` TimeIntervals table.
+    # Accept any object exposing the ``NWBPointRow`` shape (``table_name``,
+    # ``timestamp``, ``flatten_for_table`` returning ``{"data": str}``).
+    # Typed as ``object`` so the sink is open to multiple producer types
+    # (pipeline settings, user-defined annotation messages, …) without
+    # requiring a base class. Routing is by duck-typing in ``on_annotation``.
+    INPUT_ANNOTATION = ez.InputStream(object)
+
+    @ez.subscriber(INPUT_ANNOTATION)
+    async def on_annotation(self, msg: typing.Any) -> None:
+        """Append one row to the per-table ``AnnotationSeries`` named by ``msg.table_name``.
+
+        Ignores messages that don't quack like an ``NWBPointRow`` so other
+        traffic on this stream (if any) doesn't crash the sink. Any exception
+        from the writer is logged and swallowed — annotation logging is
+        best-effort and must not break primary acquisition recording.
         """
-        await super().initialize()
-        self._settings_ctx: typing.Optional[ez.GraphContext] = None
-        self._settings_watch_task: typing.Optional[asyncio.Task[None]] = None
-        self._settings_component_addresses: typing.Set[str] = set()
-        self._settings_last_timestamp: float = time.time()
-
-        try:
-            ctx = ez.GraphContext(auto_start=False)
-            await ctx.__aenter__()
-            self._settings_ctx = ctx
-
-            snapshot = await ctx.snapshot()
-            session_components = self._session_component_addresses(snapshot)
-            if not session_components:
-                return
-
-            self._settings_component_addresses = session_components
-            settings_snapshot = await ctx.settings_snapshot()
-            settings_events = await ctx.settings_events(after_seq=0)
-
-            flat_snapshot: typing.Dict[str, typing.Any] = {}
-            for component_address in sorted(session_components):
-                if component_address in settings_snapshot:
-                    flat_snapshot.update(
-                        flatten_component_settings(component_address, settings_snapshot[component_address])
-                    )
-
-            latest_timestamp = max(
-                (event.timestamp for event in settings_events if event.component_address in session_components),
-                default=time.time(),
-            )
-            last_seq = max((event.seq for event in settings_events), default=0)
-            self._settings_last_timestamp = latest_timestamp
-
-            if flat_snapshot:
-                await asyncio.to_thread(
-                    self.processor.initialize_settings_table,
-                    flat_snapshot,
-                    latest_timestamp,
-                )
-
-            self._settings_watch_task = asyncio.create_task(
-                self._watch_graph_settings(after_seq=last_seq),
-                name=f"{self.address}-settings-watch",
-            )
-
-        except Exception as exc:
-            ez.logger.warning(f"{self.address} could not initialize GraphServer-backed settings logging: {exc}")
-            if self._settings_ctx is not None:
-                await self._settings_ctx.__aexit__(None, None, None)
-                self._settings_ctx = None
-
-    def _session_component_addresses(self, graph_snapshot: typing.Any) -> typing.Set[str]:
-        """Return the component addresses that belong to this unit's active session."""
-        for session in graph_snapshot.sessions.values():
-            metadata = session.metadata
-            if metadata is None:
-                continue
-            if self.address in metadata.components:
-                return set(metadata.components.keys())
-        return set()
-
-    async def _watch_graph_settings(self, after_seq: int) -> None:
-        """Forward graph settings events to the consumer's settings-table writer."""
-        if self._settings_ctx is None:
+        flatten = getattr(msg, "flatten_for_table", None)
+        table_name = getattr(msg, "table_name", None)
+        timestamp = getattr(msg, "timestamp", None)
+        if not callable(flatten) or not isinstance(table_name, str) or not isinstance(timestamp, (int, float)):
             return
-        async for event in self._settings_ctx.subscribe_settings_events(after_seq=after_seq):
-            if event.component_address not in self._settings_component_addresses:
-                continue
-            flat_settings = flatten_component_settings(event.component_address, event.value)
-            try:
-                await asyncio.to_thread(
-                    self.processor.update_settings_table,
-                    event.component_address,
-                    flat_settings,
-                    event.timestamp,
-                )
-                self._settings_last_timestamp = event.timestamp
-            except Exception as exc:
-                ez.logger.warning(
-                    f"{self.address} failed to record settings update for {event.component_address}: {exc}"
-                )
-
-    async def _take_pipeline_snapshot(self) -> typing.Dict[str, typing.Any]:
-        """Build a flat settings snapshot covering this session's components."""
-        if self._settings_ctx is None or not self._settings_component_addresses:
-            return {}
-        settings_snapshot = await self._settings_ctx.settings_snapshot()
-        flat: typing.Dict[str, typing.Any] = {}
-        for component_address in sorted(self._settings_component_addresses):
-            if component_address in settings_snapshot:
-                flat.update(flatten_component_settings(component_address, settings_snapshot[component_address]))
-        return flat
-
-    @ez.subscriber(BaseConsumerUnit.INPUT_SETTINGS)
-    async def on_settings(self, msg: NWBSinkSettings) -> None:
-        """Apply ``NWBSinkSettings`` updates and, when the change requires a
-        file swap, pre-fetch a pipeline-settings snapshot so the new file's
-        table opens already populated (option B re-seed-on-swap).
-        """
-        will_reset = bool(
-            {f.name for f in dataclasses.fields(msg) if getattr(self.SETTINGS, f.name) != getattr(msg, f.name)}
-            - NWBSinkConsumer.NONRESET_SETTINGS_FIELDS
-        )
-        if will_reset and getattr(self, "_settings_ctx", None) is not None:
-            snapshot = await self._take_pipeline_snapshot()
-            if snapshot:
-                self.processor._pending_settings_seed = (snapshot, time.time())
-        # Replicate the inherited base behaviour: rebind unit settings then
-        # delegate to the processor so it can diff + maybe request reset.
-        self.apply_settings(msg)
-        self.processor.update_settings(self.SETTINGS)
+        try:
+            row = flatten()
+        except Exception as exc:
+            ez.logger.warning(f"{self.address} annotation flatten_for_table raised: {exc}")
+            return
+        data = row.get("data") if isinstance(row, typing.Mapping) else None
+        if not isinstance(data, str):
+            ez.logger.warning(
+                f"{self.address} annotation row missing 'data: str' (got {type(data).__name__}); skipping."
+            )
+            return
+        try:
+            await asyncio.to_thread(self.processor.write_annotation, table_name, float(timestamp), data)
+        except Exception as exc:
+            ez.logger.warning(f"{self.address} failed to write annotation to '{table_name}': {exc}")
 
     async def shutdown(self) -> None:
-        if getattr(self, "_settings_watch_task", None) is not None:
-            self._settings_watch_task.cancel()
-            try:
-                await self._settings_watch_task
-            except asyncio.CancelledError:
-                pass
-        if getattr(self, "_settings_ctx", None) is not None:
-            await self._settings_ctx.__aexit__(None, None, None)
         await super().shutdown()
         self.processor.close()

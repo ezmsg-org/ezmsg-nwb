@@ -1,6 +1,7 @@
 """Integration tests for ezmsg-nwb: ezmsg system tests and writer round-trip."""
 
 import asyncio
+import json
 import tempfile
 import typing
 from dataclasses import field
@@ -14,7 +15,12 @@ from ezmsg.baseproc.clock import Clock, ClockSettings
 from ezmsg.util.messagecodec import message_log
 from ezmsg.util.messagelogger import MessageLogger, MessageLoggerSettings
 from ezmsg.util.messages.axisarray import AxisArray
-from ezmsg.util.terminate import TerminateOnTotal, TerminateOnTotalSettings
+from ezmsg.util.terminate import (
+    TerminateOnTimeout,
+    TerminateOnTimeoutSettings,
+    TerminateOnTotal,
+    TerminateOnTotalSettings,
+)
 from pynwb import NWBHDF5IO
 
 from ezmsg.nwb import (
@@ -391,9 +397,9 @@ def _make_writer_epochs_msg() -> AxisArray:
     )
 
 
-def test_writer_pipeline_settings_shutdown_persist(tmp_path):
-    """Pipeline settings created before first data should persist and append on close."""
-    outpath = tmp_path / "ezmsg_nwb_settings_shutdown_test.nwb"
+def test_writer_annotation_then_data_lands_in_acquisition(tmp_path):
+    """Annotations written before data should still materialize on close."""
+    outpath = tmp_path / "ezmsg_nwb_annotation_then_data_test.nwb"
 
     sink = NWBSinkConsumer(
         settings=NWBSinkSettings(
@@ -402,73 +408,114 @@ def test_writer_pipeline_settings_shutdown_persist(tmp_path):
             inc_clock=ReferenceClockType.UNKNOWN,
         )
     )
-    sink.initialize_settings_table({"component_foo": "bar"}, timestamp=1.0)
+    sink.write_annotation("settings_annotations", timestamp=0.5, data='{"step": "init"}')
     sink._process(_make_writer_continuous_msg())
+    sink.write_annotation("settings_annotations", timestamp=1.5, data='{"step": "running"}')
     sink.close(write=False)
 
     assert outpath.exists()
 
     with NWBHDF5IO(outpath, "r") as io:
         nwbfile = io.read()
-        table = nwbfile.intervals["pipeline_settings"]
-        df = table.to_dataframe()
-
-    assert df["updated_component"].tolist() == ["__init__", "__init__"]
-    assert df["component_foo"].tolist() == ["bar", "bar"]
+        series = nwbfile.acquisition["settings_annotations"]
+        assert list(series.data[:]) == ['{"step": "init"}', '{"step": "running"}']
 
 
-def test_writer_pipeline_settings_created_after_first_flush(tmp_path):
-    """Pipeline settings created after the first stream flush should still be materialized."""
-    outpath = tmp_path / "ezmsg_nwb_settings_late_create_test.nwb"
+def _find_free_port() -> int:
+    """Pick a free TCP port for an isolated GraphServer."""
+    import socket
 
-    sink = NWBSinkConsumer(
-        settings=NWBSinkSettings(
-            filepath=outpath,
-            overwrite_old=True,
-            inc_clock=ReferenceClockType.UNKNOWN,
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_writer_pipeline_settings_event_via_graph(tmp_path):
+    """End-to-end: ``PipelineSettingsUnit`` publishes its session's settings
+    snapshot through the graph and ``NWBSink`` lands the events in a
+    ``settings_annotations`` AnnotationSeries.
+
+    Uses the real producer (which opens a ``GraphContext`` against the
+    running ``GraphServer``) so this exercises Phase 1 end-to-end rather
+    than a mock publisher. We pre-start a ``GraphServer`` at a known free
+    port and pin both ``ez.run`` and the producer to that address so the
+    producer's ``GraphContext`` connects to the same server the runner is
+    using. (When ``ez.run`` is given an explicit ``graph_address``,
+    ``GraphService.ensure`` will *not* auto-start a server — it expects
+    one already listening at that address. That's why we start one here.)
+    """
+    from ezmsg.baseproc import PipelineSettingsProducerSettings, PipelineSettingsUnit
+    from ezmsg.core.graphserver import GraphServer
+
+    outpath = tmp_path / "ezmsg_nwb_pipeline_settings_via_graph.nwb"
+    outpath.unlink(missing_ok=True)
+
+    graph_address = ("127.0.0.1", _find_free_port())
+
+    class _Settings(ez.Settings):
+        producer: PipelineSettingsProducerSettings
+        sink: NWBSinkSettings
+        term: TerminateOnTimeoutSettings
+
+    class _Pipeline(ez.Collection):
+        SETTINGS = _Settings
+
+        PUB = PipelineSettingsUnit()
+        SINK = NWBSink()
+        TERM = TerminateOnTimeout()
+
+        def configure(self) -> None:
+            self.PUB.apply_settings(self.SETTINGS.producer)
+            self.SINK.apply_settings(self.SETTINGS.sink)
+            self.TERM.apply_settings(self.SETTINGS.term)
+
+        def network(self) -> ez.NetworkDefinition:
+            # Fan PUB's events out to the sink AND the terminator: the
+            # terminator resets its idle clock on every event, then fires
+            # ``NormalTermination`` after the producer goes quiet (no more
+            # settings changes after the initial snapshot).
+            return (
+                (self.PUB.OUTPUT_SIGNAL, self.SINK.INPUT_ANNOTATION),
+                (self.PUB.OUTPUT_SIGNAL, self.TERM.INPUT),
+            )
+
+    system = _Pipeline(
+        _Settings(
+            producer=PipelineSettingsProducerSettings(graph_address=graph_address),
+            sink=NWBSinkSettings(
+                filepath=outpath,
+                overwrite_old=True,
+                inc_clock=ReferenceClockType.UNKNOWN,
+            ),
+            term=TerminateOnTimeoutSettings(time=1.5),
         )
     )
-    sink._process(_make_writer_continuous_msg())
-    sink.initialize_settings_table({"component_foo": "bar"}, timestamp=1.0)
-    sink.close(write=False)
+
+    server = GraphServer()
+    server.start(graph_address)
+    try:
+        ez.run(SYSTEM=system, graph_address=graph_address)
+    finally:
+        server.stop()
 
     assert outpath.exists()
-
-    with NWBHDF5IO(outpath, "r") as io:
+    with NWBHDF5IO(str(outpath), "r") as io:
         nwbfile = io.read()
-        assert nwbfile.intervals is not None
-        table = nwbfile.intervals["pipeline_settings"]
-        df = table.to_dataframe()
+        series = nwbfile.acquisition["settings_annotations"]
+        rows = [json.loads(s) for s in series.data[:]]
 
-    assert df["updated_component"].tolist() == ["__init__", "__init__"]
-    assert df["component_foo"].tolist() == ["bar", "bar"]
+    # PipelineSettingsUnit emits one INITIAL row per in-scope component;
+    # the session contains the Collection (SYSTEM) plus PUB + SINK + TERM.
+    assert all(r["event_type"] == "INITIAL" for r in rows)
+    components = {r["component"] for r in rows}
+    # Addresses use ``/`` as the separator (e.g. "SYSTEM/PUB"). Don't pin
+    # the root ("SYSTEM" only because we passed it that way to ez.run);
+    # confirm the snapshot covers each unit.
+    assert any(c.endswith("/PUB") for c in components)
+    assert any(c.endswith("/SINK") for c in components)
+    assert any(c.endswith("/TERM") for c in components)
 
-
-def test_writer_pipeline_settings_shape_change_rotates_file(tmp_path):
-    """An incompatible settings update should rotate to a new file instead of erroring on close."""
-    outpath = tmp_path / "ezmsg_nwb_settings_rotate_integration_test.nwb"
-    rotated_path = tmp_path / "ezmsg_nwb_settings_rotate_integration_test_01.nwb"
-
-    sink = NWBSinkConsumer(
-        settings=NWBSinkSettings(
-            filepath=outpath,
-            overwrite_old=True,
-            inc_clock=ReferenceClockType.UNKNOWN,
-        )
-    )
-    sink.initialize_settings_table({"component_list": [[1, 2], [3, 4]]}, timestamp=1.0)
-    sink._process(_make_writer_continuous_msg())
-    sink.update_settings_table("component", {"component_list": [[1, 2], [3, 4], [5, 6]]}, timestamp=2.0)
-    sink.close(write=False)
-
-    assert outpath.exists()
-    assert rotated_path.exists()
-
-    with NWBHDF5IO(rotated_path, "r") as io:
-        nwbfile = io.read()
-        df = nwbfile.intervals["pipeline_settings"].to_dataframe()
-
-    np.testing.assert_array_equal(df["component_list"].iloc[-1], np.array([[1, 2], [3, 4], [5, 6]]))
+    outpath.unlink(missing_ok=True)
 
 
 def test_writer_event_append_after_reopen(tmp_path):

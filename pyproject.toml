@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
   "ezmsg>=3.9.0",
-  "ezmsg-baseproc>=1.9.0",
+  "ezmsg-baseproc>=1.10.1",
   "numpy>=1.26.0",
   "pynwb",
   "h5py",
@@ -74,5 +74,6 @@ known-first-party = ["ezmsg.nwb"]
 known-third-party = ["ezmsg"]
 
 [tool.uv.sources]
+ezmsg-baseproc = { path = "../ezmsg-baseproc", editable = true }
 # Uncomment to use development version of ezmsg from git
 #ezmsg = { git = "https://github.com/ezmsg-org/ezmsg.git", branch = "dev" }
