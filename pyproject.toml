@@ -34,6 +34,7 @@ lint = [
 test = [
   "pytest>=8.0.0",
   "pytest-asyncio>=0.24.0",
+  "pytest-xdist>=3.5.0",
 ]
 docs = [
   "sphinx>=8.0",
@@ -59,6 +60,7 @@ packages = ["src/ezmsg"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+addopts = "-n auto --dist=loadfile"
 
 [tool.ruff]
 line-length = 120
@@ -74,6 +76,5 @@ known-first-party = ["ezmsg.nwb"]
 known-third-party = ["ezmsg"]
 
 [tool.uv.sources]
-ezmsg-baseproc = { path = "../ezmsg-baseproc", editable = true }
 # Uncomment to use development version of ezmsg from git
 #ezmsg = { git = "https://github.com/ezmsg-org/ezmsg.git", branch = "dev" }

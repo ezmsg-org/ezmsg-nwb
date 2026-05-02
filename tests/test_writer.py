@@ -461,14 +461,6 @@ def test_rate_change_raises_and_closes():
     path.unlink(missing_ok=True)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "_prep_from_meta carries _current_msg.data.dtype across loop iterations "
-        "(or reads it as None at construction). Deferred per the writer cleanup TODO."
-    ),
-    raises=(AttributeError, TypeError, ValueError),
-    strict=False,
-)
 def test_expected_series_smoke(tmp_path):
     """``expected_series`` should pre-allocate stream containers from a
     metadata yaml so the file is fully shaped before any message arrives."""

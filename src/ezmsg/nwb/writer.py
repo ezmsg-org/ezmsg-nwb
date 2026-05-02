@@ -514,8 +514,15 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
             if key in ("epochs", "trials"):
                 continue
             shape = _sanitize_shape(ss["shape"])
+            # Per-stream dtype: pull from the metadata if specified
+            # (e.g. ``dtype: float64`` in the yaml), else default to
+            # float32 — the prior code reused ``self._current_msg``'s
+            # dtype across iterations, which was either ``None`` (when
+            # called pre-message from ``_reset_state``) or the wrong
+            # type carried over from an epochs/trials iteration.
+            dtype = np.dtype(ss.get("dtype", np.float32))
             self._current_msg = AxisArray(
-                data=np.zeros(shape, dtype=self._current_msg.data.dtype),
+                data=np.zeros(shape, dtype=dtype),
                 dims=["time", "ch"] + [f"dim{_}" for _ in range(len(shape) - 2)],
                 axes={
                     "time": AxisArray.TimeAxis(fs=ss["fs"]),
@@ -570,6 +577,9 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         # Annotation rows are also "content" — keep the file even if no
         # acquisition data was written.
         if state.annotation_ts and any(len(ts) > 0 for ts in state.annotation_ts.values()):
+            b_delete = False
+        # empty file is the intended artifact even if no data was streamed.
+        if self.settings.expected_series is not None:
             b_delete = False
         io.close()
         state.nwbfile = None
