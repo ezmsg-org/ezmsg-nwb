@@ -988,6 +988,11 @@ class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
         except Exception as exc:
             ez.logger.warning(f"{self.address} annotation flatten_for_table raised: {exc}")
             return
+        if row is None:
+            # Producer's signal that this is a control message (e.g. the
+            # ``INIT_FINAL_COMPONENT_ADDRESS`` sentinel from the pipeline-
+            # settings producer). No row to write; silently skip.
+            return
         data = row.get("data") if isinstance(row, typing.Mapping) else None
         if not isinstance(data, str):
             ez.logger.warning(

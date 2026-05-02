@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
   "ezmsg>=3.9.0",
-  "ezmsg-baseproc>=1.10.1",
+  "ezmsg-baseproc>=1.10.2",
   "numpy>=1.26.0",
   "pynwb",
   "h5py",
