@@ -479,8 +479,14 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         return meta_dict
 
     def _prep_from_meta(self, meta: dict):
-        """
-        Prepare the NWBFile and NWBHDF5IO objects from metadata.
+        """Pre-allocate NWB containers from a metadata dict.
+
+        ``meta`` maps each stream name to ``{"fs": <hz>, "shape": <list>,
+        "dtype": <numpy-dtype-spec>}``. Special keys ``"epochs"`` and
+        ``"trials"`` create event tables and ignore ``dtype`` / ``fs``.
+        ``dtype`` is optional and defaults to ``float64`` for continuous
+        streams — picked to match the timestamp datasets and the typical
+        units of physiological data.
 
         Args:
             meta: The metadata dict to use to create the NWBFile and NWBHDF5IO objects.
@@ -514,13 +520,13 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
             if key in ("epochs", "trials"):
                 continue
             shape = _sanitize_shape(ss["shape"])
-            # Per-stream dtype: pull from the metadata if specified
-            # (e.g. ``dtype: float64`` in the yaml), else default to
-            # float32 — the prior code reused ``self._current_msg``'s
-            # dtype across iterations, which was either ``None`` (when
-            # called pre-message from ``_reset_state``) or the wrong
-            # type carried over from an epochs/trials iteration.
-            dtype = np.dtype(ss.get("dtype", np.float32))
+            # Each stream gets its own dtype from the meta dict. Reading
+            # ``self._current_msg.data.dtype`` here used to be the bug —
+            # ``_current_msg`` is ``None`` on the construction-time prep
+            # path and silently carries the previous iteration's dtype on
+            # subsequent loops, so streams with different dtypes ended up
+            # sharing whichever type happened to land last.
+            dtype = np.dtype(ss.get("dtype", "float64"))
             self._current_msg = AxisArray(
                 data=np.zeros(shape, dtype=dtype),
                 dims=["time", "ch"] + [f"dim{_}" for _ in range(len(shape) - 2)],
@@ -667,7 +673,16 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                 meta[key] = {"fs": 0.0, "shape": (0, 1)}
         for key, ss in self._state.series.items():
             if key not in ["epochs", "trials"]:
-                meta[key] = {"fs": ss.ts.attrs["rate"], "shape": (0,) + ss.shape}
+                # Carry dtype across the split so the rebuilt file matches
+                # the closed one. Without this, the rebuilt series would
+                # default to float64 in ``_prep_from_meta`` and silently
+                # change shape/type at every split.
+                meta[key] = {
+                    "fs": ss.ts.attrs["rate"],
+                    "shape": (0,) + ss.shape,
+                    "dtype": ss.data.dtype,
+                }
+
         return nwbfile, meta
 
     def _nwb_create_or_fail(self, nwbfile: typing.Optional[pynwb.NWBFile] = None) -> None:

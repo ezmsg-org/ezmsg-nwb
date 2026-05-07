@@ -75,9 +75,16 @@ class NWBSlicer:
         reference_clock: Which reference clock to use for timestamps.
         reref_now: If True, re-reference timestamps to the current time.
         stream_keys: Optional filter for which streams to discover.
+        rdcc_nbytes: HDF5 raw data chunk cache size in bytes. Larger values reduce
+            re-decoding when consecutive reads cross HDF5 chunk boundaries.
+        rdcc_nslots: HDF5 raw data chunk cache slot count. Should be a prime number
+            roughly 10x the number of chunks expected to be hot at once.
     """
 
     disk_cache = remfile.DiskCache(str(Path("~").expanduser() / ".ezmsg" / "nwb-cache"))
+
+    DEFAULT_RDCC_NBYTES: typing.ClassVar[int] = 64 * 1024 * 1024
+    DEFAULT_RDCC_NSLOTS: typing.ClassVar[int] = 10007
 
     def __init__(
         self,
@@ -85,11 +92,15 @@ class NWBSlicer:
         reference_clock: ReferenceClockType = ReferenceClockType.SYSTEM,
         reref_now: bool = False,
         stream_keys: typing.Optional[list[str]] = None,
+        rdcc_nbytes: int = DEFAULT_RDCC_NBYTES,
+        rdcc_nslots: int = DEFAULT_RDCC_NSLOTS,
     ):
         self._filepath = filepath
         self._reference_clock = reference_clock
         self._reref_now = reref_now
         self._stream_keys = stream_keys
+        self._rdcc_nbytes = rdcc_nbytes
+        self._rdcc_nslots = rdcc_nslots
 
         self._io: pynwb.NWBHDF5IO | None = None
         self._ts_off: float = 0.0
@@ -103,10 +114,11 @@ class NWBSlicer:
         """Open the NWB file and discover all streams."""
         if str(self._filepath).startswith("http"):
             f = remfile.File(self._filepath, disk_cache=self.disk_cache)
-            file = h5py.File(f)
+            file = h5py.File(f, rdcc_nbytes=self._rdcc_nbytes, rdcc_nslots=self._rdcc_nslots)
             self._io = pynwb.NWBHDF5IO(file=file)
         else:
-            self._io = pynwb.NWBHDF5IO(self._filepath, "r")
+            file = h5py.File(self._filepath, "r", rdcc_nbytes=self._rdcc_nbytes, rdcc_nslots=self._rdcc_nslots)
+            self._io = pynwb.NWBHDF5IO(file=file)
         nwbfile = self._io.read()
 
         # Compute timestamp offset
@@ -162,7 +174,19 @@ class NWBSlicer:
         all_timeseries = _extract_timeseries_from_container(nwbfile)
         for module_name, module in nwbfile.processing.items():
             all_timeseries.extend(_extract_timeseries_from_container(module, address=f"root/{module_name}"))
-        all_timeseries = set(all_timeseries)  # Remove duplicates
+        # Dedupe by NWB hierarchy address while preserving discovery order.
+        # ``set(all_timeseries)`` works but its iteration order depends on
+        # object hashes (which differ between file opens), so it produced
+        # a different stream order on every NWBSlicer instance — surprising
+        # for any code that compares messages from two iterators.
+        seen_addresses: set[str] = set()
+        deduped: list[tuple[str, pynwb.TimeSeries]] = []
+        for addr, ts in all_timeseries:
+            if addr in seen_addresses:
+                continue
+            seen_addresses.add(addr)
+            deduped.append((addr, ts))
+        all_timeseries = deduped
 
         for address, child in all_timeseries:
             if type(child) is pynwb.misc.Units:
