@@ -70,6 +70,7 @@ import dataclasses
 import datetime
 import os
 import re
+import threading
 import time
 import typing
 import warnings
@@ -86,7 +87,10 @@ from ezmsg.util.messages.util import replace
 from hdmf.backends.hdf5.h5_utils import H5DataIO
 from neuroconv.utils import DeepDict, dict_deep_update, load_dict_from_file
 
-from .util import ReferenceClockType, build_nwb_fname
+from .util import (
+    ReferenceClockType,
+    build_nwb_fname,
+)
 
 try:
     from ezmsg.baseproc import SampleTriggerMessage
@@ -126,9 +130,6 @@ class SeriesState:
 
 @processor_state
 class NWBSinkState:
-    # hash is required by the stateful machinery we'll migrate onto in
-    # step 3; carrying it now keeps the state class identical across the
-    # base-class switch.
     hash: int = -1
     filepath: typing.Optional[Path] = None
     io: typing.Optional[pynwb.NWBHDF5IO] = None
@@ -136,6 +137,12 @@ class NWBSinkState:
     series: typing.Optional[typing.Dict[str, SeriesState]] = None
     start_timestamp: float = 0.0
     split_count: int = 0
+    # Per-file map of annotation-series name → its h5py string dataset.
+    # Reset on every ``_reset_state`` so a fresh file starts empty; the
+    # entry is created on first sight of each ``table_name`` in an
+    # incoming annotation row.
+    annotation_data: typing.Optional[typing.Dict[str, typing.Any]] = None
+    annotation_ts: typing.Optional[typing.Dict[str, typing.Any]] = None
 
 
 class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkState]):
@@ -154,6 +161,10 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
 
     def __init__(self, *args, settings: typing.Optional[NWBSinkSettings] = None, **kwargs):
         super().__init__(*args, settings=settings, **kwargs)
+        # Serializes ``_process`` appends and ``write_annotation`` calls
+        # from the annotation subscriber; HDF5 writes from two threads to
+        # the same file are unsafe.
+        self._lock = threading.RLock()
         # ``_current_msg`` is scratch space shared between ``_process`` and
         # helpers like ``_prep_continuous_io`` / ``_prep_from_meta``. Deferred
         # migration into state — see _prep_from_meta cleanup follow-up.
@@ -186,6 +197,8 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         self._state.series = {}
         self._state.start_timestamp = 0.0
         self._state.split_count = 0
+        self._state.annotation_data = {}
+        self._state.annotation_ts = {}
 
         self._check_filepath()
         self._nwb_create_or_fail()
@@ -207,127 +220,132 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         await asyncio.to_thread(self._process, message)
 
     def _process(self, message: AxisArray) -> None:
-        self._current_msg = message
+        with self._lock:
+            self._current_msg = message
 
-        # Adjust incoming data
-        if _HAS_SAMPLE_TRIGGER and isinstance(self._current_msg, SampleTriggerMessage):
-            # SampleTriggerMessage. Rewrite as AxisArray.
-            timestamp = self._current_msg.timestamp
-            period = self._current_msg.period
-            if period is not None and len(period) > 0:
-                timestamp = timestamp + period[0]
-            # Wrap value in a 2D shape (1, 1) so ``_append_events`` iterates
-            # rows of label-iterables (matching the convention used by the
-            # plain ``key="epochs"`` AxisArray path). A 1D shape would make
-            # ``",".join(ev_str)`` join the characters of a single string.
-            self._current_msg = AxisArray(
-                data=np.array([[self._current_msg.value]]),
-                dims=["time", "ch"],
-                axes={"time": AxisArray.LinearAxis(gain=1.0, offset=timestamp)},
-                key="epochs",
-            )
-        elif not hasattr(self._current_msg, "data"):
-            return
-        else:
-            axis = self.settings.axis
-            targ_ax_ix = self._current_msg.get_axis_idx(axis)
-            if targ_ax_ix != 0:
-                self._current_msg = replace(
-                    self._current_msg,
-                    data=np.moveaxis(self._current_msg.data, targ_ax_ix, 0),
-                    dims=[axis] + self._current_msg.dims[:targ_ax_ix] + self._current_msg.dims[targ_ax_ix + 1 :],
+            # Adjust incoming data
+            if _HAS_SAMPLE_TRIGGER and isinstance(self._current_msg, SampleTriggerMessage):
+                # SampleTriggerMessage. Rewrite as AxisArray.
+                timestamp = self._current_msg.timestamp
+                period = self._current_msg.period
+                if period is not None and len(period) > 0:
+                    timestamp = timestamp + period[0]
+                # Wrap value in a 2D shape (1, 1) so ``_append_events`` iterates
+                # rows of label-iterables (matching the convention used by the
+                # plain ``key="epochs"`` AxisArray path). A 1D shape would make
+                # ``",".join(ev_str)`` join the characters of a single string.
+                self._current_msg = AxisArray(
+                    data=np.array([[self._current_msg.value]]),
+                    dims=["time", "ch"],
+                    axes={"time": AxisArray.LinearAxis(gain=1.0, offset=timestamp)},
+                    key="epochs",
                 )
-
-        # Is this a new series?
-        b_new = self._state.io is None
-        b_new = b_new or self._current_msg.key not in self._state.series
-
-        # If inc message key is in state.series but properties do not match previous dataset properties
-        #  then close io and raise error
-        if not b_new and not self._check_msg_consistency():
-            nwbfile = self._state.nwbfile
-            b_final_write = hasattr(nwbfile, "epochs") and nwbfile.epochs is not None
-            b_final_write = b_final_write or (hasattr(nwbfile, "trials") and nwbfile.trials is not None)
-            self.close(write=b_final_write)
-            raise ValueError("Data provided to NWBSink has changed shape. Closing NWB file.")
-
-        if b_new:
-            # Use first incoming timestamp to set the session start time.
-            key = self._current_msg.key
-            axis = self.settings.axis
-            t0 = None
-            if axis in ["time", "win"] or "time" in self._current_msg.axes:
-                targ_dim = axis if axis in ["time", "win"] else "time"
-                if hasattr(self._current_msg.axes[targ_dim], "data"):
-                    t0 = self._current_msg.axes[targ_dim].data[0]
-                else:
-                    t0 = self._current_msg.axes[targ_dim].offset
-            _ = self.get_session_datetime(t0)
-            self._state.start_timestamp = self.get_session_timestamp(t0)
-            if self.settings.inc_clock == ReferenceClockType.MONOTONIC:
-                self._state.start_timestamp += time.monotonic() - time.time()
-
-            # Create the container(s) for the new stream.
-            if key in ["epochs", "trials"]:
-                self._prep_event_io()
-                self._flush_io(reopen=True)
-            elif self._current_msg.data.dtype.type is np.str_:
-                raise ValueError(f"Cannot stream varlen str data to series {key}. Use 'epochs' or 'trials' instead.")
+            elif not hasattr(self._current_msg, "data"):
+                return
             else:
-                self._prep_continuous_io()
-                self._flush_io(reopen=True)
-                self._update_rate_for_current()
-
-        if self.settings.recording and self._current_msg.data.size:
-            axis = self.settings.axis
-            timestamps = None
-            if axis in ["time", "win"] or "time" in self._current_msg.axes:
-                targ_dim = axis if axis in ["time", "win"] else "time"
-                time_ax = self._current_msg.axes[targ_dim]
-                if hasattr(time_ax, "data"):
-                    timestamps = time_ax.data - self._state.start_timestamp
-                else:
-                    timestamps = (np.arange(len(self._current_msg.data)) * time_ax.gain) + (
-                        time_ax.offset - self._state.start_timestamp
+                axis = self.settings.axis
+                targ_ax_ix = self._current_msg.get_axis_idx(axis)
+                if targ_ax_ix != 0:
+                    self._current_msg = replace(
+                        self._current_msg,
+                        data=np.moveaxis(self._current_msg.data, targ_ax_ix, 0),
+                        dims=[axis] + self._current_msg.dims[:targ_ax_ix] + self._current_msg.dims[targ_ax_ix + 1 :],
                     )
 
-            key = self._current_msg.key
-            if key in ["epochs", "trials"]:
-                self._append_events(key, timestamps, self._current_msg.data)
-            else:
-                series_state = self._state.series[key]
-                # Write data
-                dataset = series_state.data
-                dataset.resize(len(dataset) + len(self._current_msg.data), axis=0)
-                dataset[-len(self._current_msg.data) :] = self._current_msg.data
-                series_state.bytes_written += self._current_msg.data.nbytes
+            # Is this a new series?
+            b_new = self._state.io is None
+            b_new = b_new or self._current_msg.key not in self._state.series
 
-                # Write timestamps
-                if timestamps is not None:
-                    ts = series_state.ts
-                    ts.resize(len(ts) + len(timestamps), axis=0)
-                    ts[-len(timestamps) :] = timestamps
-                    series_state.bytes_written += timestamps.nbytes
+            # If inc message key is in state.series but properties do not match previous dataset properties
+            #  then close io and raise error
+            if not b_new and not self._check_msg_consistency():
+                nwbfile = self._state.nwbfile
+                b_final_write = hasattr(nwbfile, "epochs") and nwbfile.epochs is not None
+                b_final_write = b_final_write or (hasattr(nwbfile, "trials") and nwbfile.trials is not None)
+                self.close(write=b_final_write)
+                raise ValueError("Data provided to NWBSink has changed shape. Closing NWB file.")
 
-            total_bytes = sum(s.bytes_written for s in self._state.series.values())
-            if 0 < self.settings.split_bytes <= total_bytes and "%d" not in str(self._state.filepath):
-                self._state.split_count += 1
-                self.path_on_disk.unlink(missing_ok=True)
-                new_nwbfile, new_meta = self._copy_nwb()
-                self.close()
-                self._nwb_create_or_fail(nwbfile=new_nwbfile)
-                self._prep_from_meta(new_meta)
+            if b_new:
+                # Use first incoming timestamp to set the session start time.
+                key = self._current_msg.key
+                axis = self.settings.axis
+                t0 = None
+                if axis in ["time", "win"] or "time" in self._current_msg.axes:
+                    targ_dim = axis if axis in ["time", "win"] else "time"
+                    if hasattr(self._current_msg.axes[targ_dim], "data"):
+                        t0 = self._current_msg.axes[targ_dim].data[0]
+                    else:
+                        t0 = self._current_msg.axes[targ_dim].offset
+                _ = self.get_session_datetime(t0)
+                self._state.start_timestamp = self.get_session_timestamp(t0)
+                if self.settings.inc_clock == ReferenceClockType.MONOTONIC:
+                    self._state.start_timestamp += time.monotonic() - time.time()
+
+                # Create the container(s) for the new stream.
+                if key in ["epochs", "trials"]:
+                    self._prep_event_io()
+                    self._flush_io(reopen=True)
+                elif self._current_msg.data.dtype.type is np.str_:
+                    raise ValueError(
+                        f"Cannot stream varlen str data to series {key}. Use 'epochs' or 'trials' instead."
+                    )
+                else:
+                    self._prep_continuous_io()
+                    self._flush_io(reopen=True)
+                    self._update_rate_for_current()
+
+            if self.settings.recording and self._current_msg.data.size:
+                axis = self.settings.axis
+                timestamps = None
+                if axis in ["time", "win"] or "time" in self._current_msg.axes:
+                    targ_dim = axis if axis in ["time", "win"] else "time"
+                    time_ax = self._current_msg.axes[targ_dim]
+                    if hasattr(time_ax, "data"):
+                        timestamps = time_ax.data - self._state.start_timestamp
+                    else:
+                        timestamps = (np.arange(len(self._current_msg.data)) * time_ax.gain) + (
+                            time_ax.offset - self._state.start_timestamp
+                        )
+
+                key = self._current_msg.key
+                if key in ["epochs", "trials"]:
+                    self._append_events(key, timestamps, self._current_msg.data)
+                else:
+                    series_state = self._state.series[key]
+                    # Write data
+                    dataset = series_state.data
+                    dataset.resize(len(dataset) + len(self._current_msg.data), axis=0)
+                    dataset[-len(self._current_msg.data) :] = self._current_msg.data
+                    series_state.bytes_written += self._current_msg.data.nbytes
+
+                    # Write timestamps
+                    if timestamps is not None:
+                        ts = series_state.ts
+                        ts.resize(len(ts) + len(timestamps), axis=0)
+                        ts[-len(timestamps) :] = timestamps
+                        series_state.bytes_written += timestamps.nbytes
+
+                total_bytes = sum(s.bytes_written for s in self._state.series.values())
+                if 0 < self.settings.split_bytes <= total_bytes and "%d" not in str(self._state.filepath):
+                    self._state.split_count += 1
+                    self.path_on_disk.unlink(missing_ok=True)
+                    new_nwbfile, new_meta = self._copy_nwb()
+                    self.close()
+                    self._nwb_create_or_fail(nwbfile=new_nwbfile)
+                    self._prep_from_meta(new_meta)
 
     @property
     def path_on_disk(self) -> Path:
         fp = Path(self._state.filepath)
-        if self.settings.split_bytes > 0:
-            if "%d" in str(fp):
-                return Path(re.sub("%d", "0", str(fp)))
-            else:
-                return fp.parent / (fp.stem + f"_{self._state.split_count:02}" + fp.suffix)
-        else:
-            return fp
+        if "%d" in str(fp):
+            return Path(re.sub("%d", "0", str(fp)))
+        # Suffix when ``split_bytes`` is configured (uniform "<stem>_NN" naming
+        # for the whole split-set, starting at _00) OR when a settings-driven
+        # rotation has incremented split_count past 0 (the original file kept
+        # its bare name, subsequent segments get "_01", "_02", ...).
+        if self.settings.split_bytes > 0 or self._state.split_count > 0:
+            return fp.parent / (fp.stem + f"_{self._state.split_count:02}" + fp.suffix)
+        return fp
 
     def get_session_datetime(self, try_t0: typing.Optional[float] = None) -> datetime.datetime:
         """
@@ -499,7 +517,7 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                 self._prep_event_io()
 
         for key, ss in meta.items():
-            if key in ["epochs", "trials"]:
+            if key in ("epochs", "trials"):
                 continue
             shape = _sanitize_shape(ss["shape"])
             # Each stream gets its own dtype from the meta dict. Reading
@@ -524,9 +542,10 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
 
         # Add the rate attribute to the timestamps series. Can only do this after flushing.
         for key, ss in meta.items():
-            if key not in ["epochs", "trials"]:
-                series = self._state.nwbfile.acquisition[key]
-                series.timestamps.attrs["rate"] = ss["fs"]
+            if key in ("epochs", "trials"):
+                continue
+            series = self._state.nwbfile.acquisition[key]
+            series.timestamps.attrs["rate"] = ss["fs"]
 
     def close(self, write=False, log=True) -> None:
         """
@@ -540,6 +559,18 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         state = getattr(self, "_state", None)
         if state is None or state.io is None:
             return
+        # If __init__ raised before the lock was set up, fall through without
+        # locking; nothing else can be racing on this half-built instance.
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            self._close_locked(state, write=write, log=log)
+            return
+        with lock:
+            self._close_locked(state, write=write, log=log)
+
+    def _close_locked(self, state: NWBSinkState, write: bool, log: bool) -> None:
+        if state.io is None:
+            return
         nwbfile = state.nwbfile
         io = state.io
         if write:
@@ -549,10 +580,19 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         for key in ["epochs", "trials"]:
             if hasattr(nwbfile, key) and getattr(nwbfile, key) is not None:
                 b_delete = b_delete and len(getattr(nwbfile, key)) == 1  # EZNWB-START
+        # Annotation rows are also "content" — keep the file even if no
+        # acquisition data was written.
+        if state.annotation_ts and any(len(ts) > 0 for ts in state.annotation_ts.values()):
+            b_delete = False
+        # empty file is the intended artifact even if no data was streamed.
+        if self.settings.expected_series is not None:
+            b_delete = False
         io.close()
         state.nwbfile = None
         state.io = None
         state.series = {}
+        state.annotation_data = {}
+        state.annotation_ts = {}
         if log:
             ez.logger.info(f"Closed file at {src_str}")
         if b_delete:
@@ -715,6 +755,19 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                     ss.data = series.data
                     ss.ts = series.timestamps
 
+        # Annotation series datasets share the same file handle; reopen
+        # invalidates them, so refresh from the live nwbfile.
+        if self._state.annotation_data is not None:
+            for name in list(self._state.annotation_data.keys()):
+                if name in self._state.nwbfile.acquisition:
+                    series = self._state.nwbfile.acquisition[name]
+                    self._state.annotation_data[name] = (
+                        series.data.dataset if isinstance(series.data, H5DataIO) else series.data
+                    )
+                    self._state.annotation_ts[name] = (
+                        series.timestamps.dataset if isinstance(series.timestamps, H5DataIO) else series.timestamps
+                    )
+
     def _append_events(
         self,
         key: str,
@@ -725,6 +778,90 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         fun = {"epochs": nwbfile.add_epoch, "trials": nwbfile.add_trial}[key]
         for ev_t, ev_str in zip(timestamps, data):
             fun(start_time=ev_t, stop_time=ev_t + 0, **{"label": ",".join(ev_str)})
+
+    # ------------------------------------------------------------------
+    # Annotation series writer
+    #
+    # The unit's ``INPUT_ANNOTATION`` subscriber forwards anything with a
+    # ``flatten_for_table()`` method (e.g. ``PipelineSettingsEvent``) to
+    # ``write_annotation``. Each row becomes one entry in a per-file
+    # ``pynwb.misc.AnnotationSeries`` named after ``msg.table_name``,
+    # auto-created on first sight and appended to thereafter.
+    # ------------------------------------------------------------------
+
+    def _prep_annotation_series(self, name: str, description: str = "") -> None:
+        """Create an empty appendable ``AnnotationSeries`` and stash its datasets."""
+        if self._state.annotation_data is None:
+            self._state.annotation_data = {}
+            self._state.annotation_ts = {}
+        if name in self._state.annotation_data:
+            return
+
+        nwbfile = self._state.nwbfile
+        if nwbfile is None:
+            raise RuntimeError("Cannot prepare annotation series before NWB file is open.")
+
+        dataio = H5DataIO(
+            data=np.array([], dtype=h5py.string_dtype()),
+            maxshape=(None,),
+            chunks=True,
+        )
+        tsio = H5DataIO(
+            shape=(0,),
+            dtype=np.float64,
+            maxshape=(None,),
+            fillvalue=np.nan,
+        )
+        series = pynwb.misc.AnnotationSeries(
+            name=name,
+            data=dataio,
+            timestamps=tsio,
+            description=description or f"Annotations written by NWBSink to '{name}'",
+        )
+        nwbfile.add_acquisition(series)
+
+        # Flush + reopen to materialize h5py datasets we can append to.
+        self._flush_io(reopen=True)
+
+        live_series = self._state.nwbfile.acquisition[name]
+        data_ds = live_series.data.dataset if isinstance(live_series.data, H5DataIO) else live_series.data
+        ts_ds = (
+            live_series.timestamps.dataset if isinstance(live_series.timestamps, H5DataIO) else live_series.timestamps
+        )
+        self._state.annotation_data[name] = data_ds
+        self._state.annotation_ts[name] = ts_ds
+
+    def write_annotation(self, table_name: str, timestamp: float, data: str) -> None:
+        """Append one row to the named ``AnnotationSeries``, creating it if needed.
+
+        ``timestamp`` is wall-clock seconds. The value stored in the file is
+        ``timestamp - start_timestamp`` once a data message has set
+        ``start_timestamp`` (the file-relative convention NWB expects);
+        before then, the wall-clock value is passed through unmodified — the
+        sink has no baseline to subtract against, and inventing one (e.g.
+        from ``datetime.now()``) would silently desync from the eventual
+        data anchor. Annotations written before any data arrives therefore
+        carry whatever baseline their producer chose; downstream readers
+        should treat them accordingly.
+        """
+        with self._lock:
+            if self._state.io is None:
+                # File closed (between reset and first message); silently drop.
+                return
+            if self._state.annotation_data is None or table_name not in self._state.annotation_data:
+                self._prep_annotation_series(table_name)
+
+            if self._state.start_timestamp != 0.0:
+                relative_ts = float(timestamp) - self._state.start_timestamp
+            else:
+                relative_ts = float(timestamp)
+
+            data_ds = self._state.annotation_data[table_name]
+            ts_ds = self._state.annotation_ts[table_name]
+            data_ds.resize(len(data_ds) + 1, axis=0)
+            data_ds[-1] = data
+            ts_ds.resize(len(ts_ds) + 1, axis=0)
+            ts_ds[-1] = relative_ts
 
     def _prep_event_io(self):
         """
@@ -849,6 +986,48 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
 
 class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
     SETTINGS = NWBSinkSettings
+
+    # Accept any object exposing the ``NWBPointRow`` shape (``table_name``,
+    # ``timestamp``, ``flatten_for_table`` returning ``{"data": str}``).
+    # Typed as ``object`` so the sink is open to multiple producer types
+    # (pipeline settings, user-defined annotation messages, …) without
+    # requiring a base class. Routing is by duck-typing in ``on_annotation``.
+    INPUT_ANNOTATION = ez.InputStream(object)
+
+    @ez.subscriber(INPUT_ANNOTATION)
+    async def on_annotation(self, msg: typing.Any) -> None:
+        """Append one row to the per-table ``AnnotationSeries`` named by ``msg.table_name``.
+
+        Ignores messages that don't quack like an ``NWBPointRow`` so other
+        traffic on this stream (if any) doesn't crash the sink. Any exception
+        from the writer is logged and swallowed — annotation logging is
+        best-effort and must not break primary acquisition recording.
+        """
+        flatten = getattr(msg, "flatten_for_table", None)
+        table_name = getattr(msg, "table_name", None)
+        timestamp = getattr(msg, "timestamp", None)
+        if not callable(flatten) or not isinstance(table_name, str) or not isinstance(timestamp, (int, float)):
+            return
+        try:
+            row = flatten()
+        except Exception as exc:
+            ez.logger.warning(f"{self.address} annotation flatten_for_table raised: {exc}")
+            return
+        if row is None:
+            # Producer's signal that this is a control message (e.g. the
+            # ``INIT_FINAL_COMPONENT_ADDRESS`` sentinel from the pipeline-
+            # settings producer). No row to write; silently skip.
+            return
+        data = row.get("data") if isinstance(row, typing.Mapping) else None
+        if not isinstance(data, str):
+            ez.logger.warning(
+                f"{self.address} annotation row missing 'data: str' (got {type(data).__name__}); skipping."
+            )
+            return
+        try:
+            await asyncio.to_thread(self.processor.write_annotation, table_name, float(timestamp), data)
+        except Exception as exc:
+            ez.logger.warning(f"{self.address} failed to write annotation to '{table_name}': {exc}")
 
     async def shutdown(self) -> None:
         await super().shutdown()

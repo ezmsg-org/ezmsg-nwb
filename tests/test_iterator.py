@@ -515,7 +515,7 @@ def test_prefetch_worker_does_not_keep_iterator_alive(test_nwb_path):
     # Without forcing GC: refcount alone should be enough to drop the
     # iterator if the worker doesn't capture self.
     assert ref() is None, (
-        "iterator survived `del` — something (most likely the prefetch worker) " "is holding a strong reference to self"
+        "iterator survived `del` — something (most likely the prefetch worker) is holding a strong reference to self"
     )
     gc.collect()  # belt-and-suspenders for any cyclic refs
 

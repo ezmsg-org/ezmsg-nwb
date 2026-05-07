@@ -1,6 +1,7 @@
 """Tests for NWB writer module."""
 
 import dataclasses
+import json
 import tempfile
 from pathlib import Path
 
@@ -8,9 +9,9 @@ import numpy as np
 import pynwb
 import pytest
 from ezmsg.util.messages.axisarray import AxisArray
+from pynwb import NWBHDF5IO
 
-from ezmsg.nwb import NWBSinkSettings, ReferenceClockType
-from ezmsg.nwb.writer import NWBSinkConsumer
+from ezmsg.nwb import NWBSinkConsumer, NWBSinkSettings, ReferenceClockType
 
 
 @pytest.fixture(autouse=True)
@@ -480,7 +481,7 @@ def test_expected_series_smoke(tmp_path):
     With no ``dtype`` field in the yaml, the default is ``float64``.
     """
     expected_yaml = tmp_path / "expected.yaml"
-    expected_yaml.write_text("PreAlloc:\n" "  fs: 100.0\n" "  shape: [-1, 4]\n")
+    expected_yaml.write_text("PreAlloc:\n  fs: 100.0\n  shape: [-1, 4]\n")
     nwb_path = tmp_path / "expected.nwb"
     sink = NWBSinkConsumer(
         settings=NWBSinkSettings(
@@ -570,3 +571,137 @@ def test_sample_trigger_routes_to_epochs():
         assert "trigger_a" in labels
 
     path.unlink(missing_ok=True)
+
+
+# -- annotation series writer --
+
+
+def test_write_annotation_creates_series_and_appends(tmp_path):
+    """First annotation write should create the AnnotationSeries; subsequent
+    writes should append rows."""
+    outpath = tmp_path / "ezmsg_nwb_annotation_test.nwb"
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+
+    sink.write_annotation("settings_annotations", timestamp=1.0, data='{"k": "a"}')
+    sink.write_annotation("settings_annotations", timestamp=2.0, data='{"k": "b"}')
+    sink.close(write=False)
+
+    with NWBHDF5IO(outpath, "r") as io:
+        nwbfile = io.read()
+        series = nwbfile.acquisition["settings_annotations"]
+        assert list(series.data[:]) == ['{"k": "a"}', '{"k": "b"}']
+        np.testing.assert_array_equal(series.timestamps[:], np.array([1.0, 2.0]))
+
+
+def test_write_annotation_keeps_file_with_no_acquisition_data(tmp_path):
+    """A file with only annotations (no acquisition) should not be deleted on close."""
+    outpath = tmp_path / "ezmsg_nwb_annotation_only_test.nwb"
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+    sink.write_annotation("settings_annotations", timestamp=1.0, data="row")
+    sink.close(write=False)
+    assert outpath.exists()
+
+
+def test_write_annotation_after_data_uses_data_baseline(tmp_path):
+    """Annotation timestamps stored in-file should be relative to the data anchor.
+
+    With UNKNOWN clock, ``start_timestamp`` is latched off the first data
+    message's axis offset (here, 0). An annotation at wall-clock 1.0 should
+    therefore land at relative time 1.0 in the file.
+    """
+    outpath = tmp_path / "ezmsg_nwb_annotation_after_data_test.nwb"
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+
+    sink._process(
+        AxisArray(
+            data=np.arange(6, dtype=float).reshape(3, 2),
+            dims=["time", "ch"],
+            axes={"time": AxisArray.TimeAxis(fs=100.0)},
+            key="sig",
+        )
+    )
+    sink.write_annotation("settings_annotations", timestamp=1.0, data="row")
+    sink.close(write=False)
+
+    with NWBHDF5IO(outpath, "r") as io:
+        nwbfile = io.read()
+        ts = nwbfile.acquisition["settings_annotations"].timestamps[:]
+    np.testing.assert_array_equal(ts, np.array([1.0]))
+
+
+def test_write_annotation_multiple_tables_coexist(tmp_path):
+    """Two distinct table_names should produce two distinct AnnotationSeries."""
+    outpath = tmp_path / "ezmsg_nwb_annotation_multi_test.nwb"
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+
+    sink.write_annotation("settings_annotations", timestamp=1.0, data="A")
+    sink.write_annotation("user_notes", timestamp=2.0, data="B")
+    sink.write_annotation("settings_annotations", timestamp=3.0, data="C")
+    sink.close(write=False)
+
+    with NWBHDF5IO(outpath, "r") as io:
+        nwbfile = io.read()
+        assert list(nwbfile.acquisition["settings_annotations"].data[:]) == ["A", "C"]
+        assert list(nwbfile.acquisition["user_notes"].data[:]) == ["B"]
+
+
+def test_write_annotation_serializes_json_payload(tmp_path):
+    """Sanity check: a self-describing JSON payload round-trips through the file."""
+    outpath = tmp_path / "ezmsg_nwb_annotation_json_test.nwb"
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+
+    payload = json.dumps({"component": "X.Y", "event_type": "INITIAL", "seq": 0, "settings": {"foo": 1}})
+    sink.write_annotation("settings_annotations", timestamp=0.5, data=payload)
+    sink.close(write=False)
+
+    with NWBHDF5IO(outpath, "r") as io:
+        nwbfile = io.read()
+        round_tripped = json.loads(nwbfile.acquisition["settings_annotations"].data[0])
+    assert round_tripped["component"] == "X.Y"
+    assert round_tripped["settings"] == {"foo": 1}
+
+
+def test_close_is_idempotent_after_annotation(tmp_path):
+    """Closing twice after writing annotations should not error."""
+    outpath = tmp_path / "ezmsg_nwb_annotation_double_close_test.nwb"
+    sink = NWBSinkConsumer(
+        settings=NWBSinkSettings(
+            filepath=outpath,
+            overwrite_old=True,
+            inc_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+    sink.write_annotation("settings_annotations", timestamp=1.0, data="row")
+    sink.close(write=False)
+    sink.close(write=False)
+    assert outpath.exists()

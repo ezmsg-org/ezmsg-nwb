@@ -10,7 +10,8 @@ class ReferenceClockType(Enum):
 
 
 def build_nwb_fname(metadata: DeepDict) -> str:
+    """Build a default NWB filename from the session metadata."""
     fname_str = f"sub-{metadata['Subject']['subject_id']}"
-    ses = metadata["NWBFile"].get("session_id", metadata["NWBFile"]["session_start_time"].strftime("%Y%m%dT%H%M"))
+    ses = metadata["NWBFile"].get("session_id", metadata["NWBFile"]["session_start_time"].strftime("%Y%m%dT%H%M%S"))
     fname_str += f"_ses-{ses}"
     return f"{fname_str}_ephys.nwb"
