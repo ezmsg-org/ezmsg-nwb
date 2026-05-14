@@ -85,6 +85,19 @@ def test_stream_keys_filter(test_nwb_path):
     assert keys_seen == {"Broadband", "trials"}
 
 
+def test_stream_keys_no_match_raises(test_nwb_path):
+    """When stream_keys matches nothing, fail loudly rather than overflow on int(-inf)."""
+    with pytest.raises(ValueError, match="No streams discovered"):
+        NWBAxisArrayIterator(
+            NWBIteratorSettings(
+                filepath=test_nwb_path,
+                chunk_dur=1.0,
+                reference_clock=ReferenceClockType.UNKNOWN,
+                stream_keys=["does_not_exist"],
+            )
+        )
+
+
 # --- Message shape and structure ---
 
 

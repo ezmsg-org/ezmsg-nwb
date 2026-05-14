@@ -224,6 +224,18 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
         )
         self._state.slicer = slicer
 
+        # Fail loudly when no streams were discovered.
+        if not slicer.stream_names:
+            raise ValueError(
+                f"No streams discovered in {self.settings.filepath!s}"
+                + (
+                    f" matching stream_keys={self.settings.stream_keys!r}"
+                    if self.settings.stream_keys is not None
+                    else ""
+                )
+                + "."
+            )
+
         # Build per-stream chunk offset tables from slicer metadata
         start_time = slicer.start_time
         stop_time = slicer.stop_time
