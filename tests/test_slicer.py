@@ -42,6 +42,142 @@ def test_stream_discovery_filter(test_nwb_path):
     s.close()
 
 
+def _build_manufacturer_prefixed_nwb(path):
+    """Build a tiny NWB with an ElectricalSeries named ``CereLink_NPLAY``
+    backed by a Device whose ``manufacturer`` attribute is ``"CereLink"``.
+
+    Mirrors the layout Orion writes: storage container path prefixed by the
+    manufacturer, with the manufacturer also stamped on the Device so
+    downstream readers can reconstruct the bare device name.
+    """
+    import datetime
+
+    from pynwb import NWBHDF5IO, NWBFile
+    from pynwb.ecephys import ElectricalSeries
+    from pynwb.file import Subject
+
+    rng = np.random.default_rng(0)
+    nwbfile = NWBFile(
+        session_description="prefix-test",
+        identifier="manufacturer-prefix-test",
+        session_start_time=datetime.datetime.now(datetime.timezone.utc),
+        subject=Subject(subject_id="sub1", age="P30Y", sex="U"),
+    )
+    device = nwbfile.create_device(name="CereLink_NPLAY", manufacturer="CereLink")
+    group = nwbfile.create_electrode_group(
+        name="CereLink_NPLAY", description="prefix-test group", location="cortex", device=device
+    )
+    nwbfile.add_electrode_column(name="label", description="Electrode label")
+    for i in range(4):
+        nwbfile.add_electrode(x=float(i), y=0.0, z=0.0, location="cortex", group=group, label=f"e{i}")
+    region = nwbfile.create_electrode_table_region(region=list(range(4)), description="all")
+
+    bb_n = 100
+    es = ElectricalSeries(
+        name="CereLink_NPLAY",
+        data=rng.standard_normal((bb_n, 4)).astype(np.float32),
+        starting_time=0.0,
+        rate=1000.0,
+        electrodes=region,
+    )
+    nwbfile.add_acquisition(es)
+
+    with NWBHDF5IO(str(path), "w") as io:
+        io.write(nwbfile)
+
+
+def test_stream_keys_match_via_manufacturer_prefix(tmp_path):
+    """stream_keys=['NPLAY'] matches a container 'CereLink_NPLAY' whose
+    Device.manufacturer == 'CereLink'. The stream is exposed under the
+    user-requested bare key, and messages carry key='NPLAY' so downstream
+    fitters keyed by the request find their data."""
+    nwb_path = tmp_path / "prefix.nwb"
+    _build_manufacturer_prefixed_nwb(nwb_path)
+
+    s = NWBSlicer(
+        filepath=str(nwb_path),
+        reference_clock=ReferenceClockType.UNKNOWN,
+        stream_keys=["NPLAY"],
+    )
+    try:
+        assert s.stream_names == ["NPLAY"], f"expected the matched key to be the bare request, got {s.stream_names}"
+        info = s.get_stream_info("NPLAY")
+        assert info.template.key == "NPLAY"
+        msg = s.read_by_index("NPLAY", 0, 10)
+        assert msg.key == "NPLAY"
+        assert msg.data.shape == (10, 4)
+    finally:
+        s.close()
+
+
+def test_stream_keys_exact_match_wins_over_manufacturer(tmp_path):
+    """Exact-match takes precedence: stream_keys=['CereLink_NPLAY'] yields
+    the literal container name."""
+    nwb_path = tmp_path / "prefix.nwb"
+    _build_manufacturer_prefixed_nwb(nwb_path)
+
+    s = NWBSlicer(
+        filepath=str(nwb_path),
+        reference_clock=ReferenceClockType.UNKNOWN,
+        stream_keys=["CereLink_NPLAY"],
+    )
+    try:
+        assert s.stream_names == ["CereLink_NPLAY"]
+        msg = s.read_by_index("CereLink_NPLAY", 0, 5)
+        assert msg.key == "CereLink_NPLAY"
+    finally:
+        s.close()
+
+
+def test_stream_keys_manufacturer_unknown_does_not_match(tmp_path):
+    """A bare request like 'NPLAY' must NOT match 'CereLink_NPLAY' when the
+    Device has no real manufacturer (unset or 'unknown'). Otherwise legacy
+    files without manufacturer metadata could accidentally match unrelated
+    streams that happen to share a suffix."""
+    import datetime
+
+    from pynwb import NWBHDF5IO, NWBFile
+    from pynwb.ecephys import ElectricalSeries
+    from pynwb.file import Subject
+
+    rng = np.random.default_rng(0)
+    path = tmp_path / "unknown_mfg.nwb"
+    nwbfile = NWBFile(
+        session_description="x",
+        identifier="x",
+        session_start_time=datetime.datetime.now(datetime.timezone.utc),
+        subject=Subject(subject_id="s", age="P30Y", sex="U"),
+    )
+    # No manufacturer (or "unknown") on the device → suffix match must be
+    # rejected.
+    device = nwbfile.create_device(name="CereLink_NPLAY", manufacturer="unknown")
+    group = nwbfile.create_electrode_group(name="CereLink_NPLAY", description="x", location="cortex", device=device)
+    nwbfile.add_electrode_column(name="label", description="Electrode label")
+    for i in range(2):
+        nwbfile.add_electrode(x=0.0, y=0.0, z=0.0, location="cortex", group=group, label=f"e{i}")
+    region = nwbfile.create_electrode_table_region(region=list(range(2)), description="all")
+    es = ElectricalSeries(
+        name="CereLink_NPLAY",
+        data=rng.standard_normal((50, 2)).astype(np.float32),
+        starting_time=0.0,
+        rate=500.0,
+        electrodes=region,
+    )
+    nwbfile.add_acquisition(es)
+    with NWBHDF5IO(str(path), "w") as io:
+        io.write(nwbfile)
+
+    s = NWBSlicer(
+        filepath=str(path),
+        reference_clock=ReferenceClockType.UNKNOWN,
+        stream_keys=["NPLAY"],
+    )
+    try:
+        assert s.stream_names == [], f"unknown manufacturer should not enable suffix match, got {s.stream_names}"
+    finally:
+        s.close()
+
+
 def test_stream_info_continuous(slicer):
     """Continuous timestamped stream metadata is correct."""
     info = slicer.get_stream_info("Broadband")

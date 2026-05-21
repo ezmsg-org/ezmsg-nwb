@@ -67,6 +67,72 @@ def _extract_timeseries_from_container(container, address: str | None = None) ->
     return timeseries
 
 
+def _electrode_group_manufacturer(child: pynwb.TimeSeries) -> str:
+    """Return the manufacturer of the Device backing this TimeSeries.
+
+    Only meaningful for ElectricalSeries / FeatureExtraction-style containers
+    whose ``electrodes`` DynamicTableRegion links back to an ElectrodeGroup →
+    Device. Returns ``""`` when the link is absent, unreadable, or the
+    Device's ``manufacturer`` attribute is unset/"unknown".
+    """
+    try:
+        electrodes = getattr(child, "electrodes", None)
+        if electrodes is None:
+            return ""
+        # ``electrodes`` is a DynamicTableRegion; .table → ElectrodesTable.
+        table = getattr(electrodes, "table", None)
+        if table is None:
+            return ""
+        # Grab any electrode row's group (they all share the device for an
+        # ElectricalSeries with a single ElectrodeGroup).
+        group_col = table["group"]
+        if len(group_col) == 0:
+            return ""
+        group = group_col[0]
+        device = getattr(group, "device", None)
+        if device is None:
+            return ""
+        manufacturer = getattr(device, "manufacturer", "") or ""
+        if manufacturer.lower() == "unknown":
+            return ""
+        return str(manufacturer)
+    except (AttributeError, KeyError, IndexError, TypeError):
+        return ""
+
+
+def _match_stream_key(child: pynwb.TimeSeries, stream_keys: list[str] | None) -> str | None:
+    """Resolve the user-facing key for a TimeSeries given the *stream_keys* filter.
+
+    Returns:
+    * ``child.name`` if *stream_keys* is None (no filter — keep the literal
+      NWB container name).
+    * ``child.name`` if it appears in *stream_keys* (exact match).
+    * The bare ``<key>`` portion if ``child.name == f"{manufacturer}_{key}"``
+      for some ``<key>`` in *stream_keys* and the linked Device's
+      ``manufacturer`` attribute equals ``<manufacturer>``. This keeps
+      configs that name the bare device (e.g. ``["NPLAY"]``) working when
+      the NWB writer prefixes containers with the manufacturer (e.g.
+      ``"CereLink_NPLAY"``). The returned ``<key>`` is then used as the
+      stream's storage key and template ``.key``, so downstream consumers
+      see the name they asked for.
+    * ``None`` when nothing matches and the stream should be skipped.
+    """
+    if stream_keys is None:
+        return child.name
+    if child.name in stream_keys:
+        return child.name
+    manufacturer = _electrode_group_manufacturer(child)
+    if not manufacturer:
+        return None
+    prefix = f"{manufacturer}_"
+    if not child.name.startswith(prefix):
+        return None
+    stripped = child.name[len(prefix) :]
+    if stripped in stream_keys:
+        return stripped
+    return None
+
+
 class NWBSlicer:
     """Shared NWB file handling: open, discover streams, and slice data.
 
@@ -191,91 +257,100 @@ class NWBSlicer:
         for address, child in all_timeseries:
             if type(child) is pynwb.misc.Units:
                 ez.logger.warning("Units found in NWB file. Not yet supported.")
-            elif isinstance(child, pynwb.TimeSeries) and (self._stream_keys is None or child.name in self._stream_keys):
-                if child.data.size == 0:
-                    ez.logger.warning(f"Skipping empty TimeSeries: {child.name} {type(child)}")
-                    continue
+                continue
+            if not isinstance(child, pynwb.TimeSeries):
+                continue
+            matched_key = _match_stream_key(child, self._stream_keys)
+            if matched_key is None:
+                continue
+            if child.data.size == 0:
+                ez.logger.warning(f"Skipping empty TimeSeries: {child.name} {type(child)}")
+                continue
 
-                has_timestamps = hasattr(child, "timestamps") and child.timestamps is not None
+            has_timestamps = hasattr(child, "timestamps") and child.timestamps is not None
 
-                if has_timestamps:
-                    # Determine nominal rate
-                    if hasattr(child, "rate") and child.rate is not None:
-                        rate = child.rate
-                    elif "rate" in child.timestamps.attrs:
-                        rate = child.timestamps.attrs["rate"]
-                    else:
-                        dts = np.diff(child.timestamps[:])
-                        if np.var(dts) < 1e-3 or np.var(dts) < 0.05 * np.median(dts):
-                            rate = 1 / np.median(dts)
-                        else:
-                            rate = 0.0
-
-                    t0_val = child.timestamps[0]
-                    start_time = min(start_time, self._ts_off + t0_val)
-                    gain = 1 / rate if rate != 0 else 1.0
-                    stop_time = max(stop_time, self._ts_off + child.timestamps[-1] + gain)
-                    stop_time = max(
-                        stop_time,
-                        self._ts_off + t0_val + (child.data.shape[0] + 1) * gain,
-                    )
-                    tvec = child.timestamps
-                else:
+            if has_timestamps:
+                # Determine nominal rate
+                if hasattr(child, "rate") and child.rate is not None:
                     rate = child.rate
-                    t0_val = child.starting_time
-                    gain = 1 / rate if rate != 0 else 1.0
-                    start_time = min(start_time, self._ts_off + t0_val)
-                    stop_time = max(
-                        stop_time,
-                        self._ts_off + t0_val + (child.data.shape[0] + 1) * gain,
-                    )
-                    tvec = child.starting_time + np.arange(child.data.shape[0]) / rate
-
-                # Build axes metadata
-                axes: dict[str, typing.Any] = {}
-                if math.isclose(rate, 0.0):
-                    axes["time"] = AxisArray.CoordinateAxis(data=np.array([]), dims=["time"], unit="s")
+                elif "rate" in child.timestamps.attrs:
+                    rate = child.timestamps.attrs["rate"]
                 else:
-                    axes["time"] = AxisArray.LinearAxis.create_time_axis(fs=rate, offset=self._ts_off)
-                if hasattr(child, "electrodes") and child.electrodes is not None:
-                    # ``child.electrodes`` is a DynamicTableRegion whose
-                    # ``.data`` holds the positional indices into the full
-                    # electrodes table. Subset with iloc so the returned
-                    # channel labels line up 1:1 with the data columns —
-                    # otherwise an ElectricalSeries that references a
-                    # strict subset of the electrodes table produces a
-                    # ch-axis whose length does not match data.shape[1].
-                    region_idx = np.asarray(child.electrodes.data)
-                    full_df = child.electrodes.table.to_dataframe()
-                    el_df = full_df.iloc[region_idx]
-                    if "label" in el_df.columns:
-                        ch_labels = el_df["label"].values.tolist()
+                    dts = np.diff(child.timestamps[:])
+                    if np.var(dts) < 1e-3 or np.var(dts) < 0.05 * np.median(dts):
+                        rate = 1 / np.median(dts)
                     else:
-                        ch_labels = [f"ch_{idx}" for idx in el_df.index.tolist()]
-                    axes["ch"] = AxisArray.CoordinateAxis(data=np.array(ch_labels), dims=["ch"])
+                        rate = 0.0
 
-                self._streams[child.name] = StreamInfo(
-                    dset=child.data,
-                    template=AxisArray(
-                        data=np.zeros((0,) + child.data.shape[1:], dtype=child.data.dtype),
-                        dims=(["time", "ch"] + [f"dim_{_}" for _ in range(2, child.data.ndim)])
-                        if child.data.ndim > 1
-                        else ["time"],
-                        axes=axes,
-                        key=child.name,
-                    ),
-                    fs=rate,
-                    t0=(
-                        child.starting_time
-                        if (hasattr(child, "starting_time") and child.starting_time is not None)
-                        else child.timestamps[0]
-                    ),
-                    n_samples=child.data.shape[0],
-                    timestamps=tvec if has_timestamps else None,
-                    has_timestamps=has_timestamps,
-                    is_event=False,
-                    table_ref=None,
+                t0_val = child.timestamps[0]
+                start_time = min(start_time, self._ts_off + t0_val)
+                gain = 1 / rate if rate != 0 else 1.0
+                stop_time = max(stop_time, self._ts_off + child.timestamps[-1] + gain)
+                stop_time = max(
+                    stop_time,
+                    self._ts_off + t0_val + (child.data.shape[0] + 1) * gain,
                 )
+                tvec = child.timestamps
+            else:
+                rate = child.rate
+                t0_val = child.starting_time
+                gain = 1 / rate if rate != 0 else 1.0
+                start_time = min(start_time, self._ts_off + t0_val)
+                stop_time = max(
+                    stop_time,
+                    self._ts_off + t0_val + (child.data.shape[0] + 1) * gain,
+                )
+                tvec = child.starting_time + np.arange(child.data.shape[0]) / rate
+
+            # Build axes metadata
+            axes: dict[str, typing.Any] = {}
+            if math.isclose(rate, 0.0):
+                axes["time"] = AxisArray.CoordinateAxis(data=np.array([]), dims=["time"], unit="s")
+            else:
+                axes["time"] = AxisArray.LinearAxis.create_time_axis(fs=rate, offset=self._ts_off)
+            if hasattr(child, "electrodes") and child.electrodes is not None:
+                # ``child.electrodes`` is a DynamicTableRegion whose
+                # ``.data`` holds the positional indices into the full
+                # electrodes table. Subset with iloc so the returned
+                # channel labels line up 1:1 with the data columns —
+                # otherwise an ElectricalSeries that references a
+                # strict subset of the electrodes table produces a
+                # ch-axis whose length does not match data.shape[1].
+                region_idx = np.asarray(child.electrodes.data)
+                full_df = child.electrodes.table.to_dataframe()
+                el_df = full_df.iloc[region_idx]
+                if "label" in el_df.columns:
+                    ch_labels = el_df["label"].values.tolist()
+                else:
+                    ch_labels = [f"ch_{idx}" for idx in el_df.index.tolist()]
+                axes["ch"] = AxisArray.CoordinateAxis(data=np.array(ch_labels), dims=["ch"])
+
+            # ``matched_key`` is the user-facing key — equal to ``child.name``
+            # when there's no stream_keys filter or an exact match, or the
+            # bare ``<key>`` portion when the user requested an unprefixed
+            # device name and the container is ``"<manufacturer>_<key>"``.
+            self._streams[matched_key] = StreamInfo(
+                dset=child.data,
+                template=AxisArray(
+                    data=np.zeros((0,) + child.data.shape[1:], dtype=child.data.dtype),
+                    dims=(["time", "ch"] + [f"dim_{_}" for _ in range(2, child.data.ndim)])
+                    if child.data.ndim > 1
+                    else ["time"],
+                    axes=axes,
+                    key=matched_key,
+                ),
+                fs=rate,
+                t0=(
+                    child.starting_time
+                    if (hasattr(child, "starting_time") and child.starting_time is not None)
+                    else child.timestamps[0]
+                ),
+                n_samples=child.data.shape[0],
+                timestamps=tvec if has_timestamps else None,
+                has_timestamps=has_timestamps,
+                is_event=False,
+                table_ref=None,
+            )
 
         self._start_time = start_time
         self._stop_time = stop_time
