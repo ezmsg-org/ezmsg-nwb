@@ -45,6 +45,17 @@ class NWBIteratorSettings(ez.Settings):
     """HDF5 raw data chunk cache size in bytes (forwarded to NWBSlicer)."""
     rdcc_nslots: int = NWBSlicer.DEFAULT_RDCC_NSLOTS
     """HDF5 raw data chunk cache slot count (forwarded to NWBSlicer)."""
+    gap_tol: float = 0.5
+    """Gap threshold for timestamped continuous streams, as a fraction of the
+    nominal sample period: a gap is declared when an interval exceeds
+    ``(1 + gap_tol) / fs``. Chunks spanning a gap are split into gap-free
+    messages so the regular ``LinearAxis`` never misplaces post-gap samples.
+
+    The default ``0.5`` (1.5x period) sits between neural-data jitter (<~1.05x)
+    and the smallest real gap (one dropped sample = ~2x), so it catches every
+    gap without splitting on jitter. Set very large to disable splitting. No
+    effect on rate-only streams or event tables.
+    """
 
 
 @processor_state
@@ -63,6 +74,7 @@ def _build_chunk_messages_static(
     slicer: NWBSlicer,
     streams: dict,
     chunk_ix: int,
+    gap_tol: float = 0.5,
 ) -> list[AxisArray]:
     """Build the messages for ``chunk_ix`` from explicit slicer/streams refs.
 
@@ -114,29 +126,59 @@ def _build_chunk_messages_static(
                 out.append(template)
         else:
             out_data = info.dset[start_idx:stop_idx]
-            if info.timestamps is not None and start_idx < len(info.timestamps):
-                # Explicit timestamps are already absolute (file-relative) times.
-                chunk_t0 = info.timestamps[start_idx]
+            time_axis = template.axes["time"]
+
+            # Timestamped continuous stream on a regular LinearAxis: a single
+            # chunk that spans a gap in the explicit timestamps would emit a
+            # uniform time axis that misplaces every post-gap sample. Split it
+            # into gap-free runs, each anchored on its own first timestamp.
+            # Rate-only streams (no per-sample timestamps) and CoordinateAxis
+            # streams (no ``gain`` to compare against) keep the old single-chunk
+            # path.
+            if info.has_timestamps and info.timestamps is not None and hasattr(time_axis, "gain") and len(out_data):
+                ts_chunk = np.asarray(info.timestamps[start_idx:stop_idx])
+                if ts_chunk.shape[0] > 1:
+                    gap_after = np.flatnonzero(np.diff(ts_chunk) > time_axis.gain * (1.0 + gap_tol))
+                else:
+                    gap_after = np.empty(0, dtype=int)
+                # Run boundaries within the chunk: [0, gap1+1, gap2+1, ..., len].
+                bounds = [0, *(gap_after + 1).tolist(), ts_chunk.shape[0]]
+                for b0, b1 in zip(bounds[:-1], bounds[1:]):
+                    out.append(
+                        replace(
+                            template,
+                            data=out_data[b0:b1],
+                            axes={
+                                **template.axes,
+                                "time": replace(time_axis, offset=ts_off + ts_chunk[b0]),
+                            },
+                            key=strm_name,
+                        )
+                    )
             else:
-                # Rate-only: the absolute time of ``start_idx`` is the stream's
-                # own start (``info.t0``) plus the within-stream offset. Omitting
-                # ``info.t0`` would label a late-starting stream as if it began
-                # at the file origin, mis-timing it against other streams.
-                chunk_t0 = float(info.t0) + template.axes["time"].gain * start_idx
-            out.append(
-                replace(
-                    template,
-                    data=out_data,
-                    axes={
-                        **template.axes,
-                        "time": replace(
-                            template.axes["time"],
-                            offset=ts_off + chunk_t0,
-                        ),
-                    },
-                    key=strm_name,
+                if info.timestamps is not None and start_idx < len(info.timestamps):
+                    # Explicit timestamps are already absolute (file-relative) times.
+                    chunk_t0 = info.timestamps[start_idx]
+                else:
+                    # Rate-only: the absolute time of ``start_idx`` is the stream's
+                    # own start (``info.t0``) plus the within-stream offset. Omitting
+                    # ``info.t0`` would label a late-starting stream as if it began
+                    # at the file origin, mis-timing it against other streams.
+                    chunk_t0 = float(info.t0) + time_axis.gain * start_idx
+                out.append(
+                    replace(
+                        template,
+                        data=out_data,
+                        axes={
+                            **template.axes,
+                            "time": replace(
+                                time_axis,
+                                offset=ts_off + chunk_t0,
+                            ),
+                        },
+                        key=strm_name,
+                    )
                 )
-            )
     return out
 
 
@@ -146,6 +188,7 @@ def _prefetch_worker(
     n_chunks: int,
     q: queue.Queue,
     stop: threading.Event,
+    gap_tol: float = 0.5,
 ) -> None:
     """Prefetch worker target. Top-level function (no closure over the
     iterator) so the iterator can be garbage-collected as soon as the user
@@ -156,7 +199,7 @@ def _prefetch_worker(
         for chunk_ix in range(n_chunks):
             if stop.is_set():
                 return
-            msgs = _build_chunk_messages_static(slicer, streams, chunk_ix)
+            msgs = _build_chunk_messages_static(slicer, streams, chunk_ix, gap_tol)
             # Block on a full queue, but wake periodically to honour stop.
             while not stop.is_set():
                 try:
@@ -302,7 +345,9 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
 
     def _build_chunk_messages(self, chunk_ix: int) -> list[AxisArray]:
         """Sync-side wrapper around :func:`_build_chunk_messages_static`."""
-        return _build_chunk_messages_static(self._state.slicer, self._state.streams, chunk_ix)
+        return _build_chunk_messages_static(
+            self._state.slicer, self._state.streams, chunk_ix, self.settings.gap_tol
+        )
 
     def _chunk_step(self):
         """Sync path: build the next chunk and append to the deque."""
@@ -332,6 +377,7 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
                 self._state.n_chunks,
                 self._state.prefetch_queue,
                 self._state.prefetch_stop,
+                self.settings.gap_tol,
             ),
             name="NWBIterator-prefetch",
             daemon=True,
