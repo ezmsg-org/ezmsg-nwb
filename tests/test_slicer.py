@@ -29,6 +29,17 @@ def gappy_slicer(gappy_nwb_path):
     s.close()
 
 
+@pytest.fixture
+def irregular_slicer(irregular_nwb_path):
+    s = NWBSlicer(
+        filepath=irregular_nwb_path,
+        reference_clock=ReferenceClockType.UNKNOWN,
+        stream_keys=["Irregular"],
+    )
+    yield s
+    s.close()
+
+
 # --- Stream discovery ---
 
 
@@ -410,6 +421,23 @@ def test_read_by_time_gap_tol_disables_coordinate_axis(gappy_slicer):
     msg = gappy_slicer.read_by_time("Gappy", 1.0, 3.0, gap_tol=1e6)
     assert hasattr(msg.axes["time"], "gain")  # LinearAxis
     assert msg.data.shape[0] == 100
+
+
+def test_read_by_time_irregular_stream_coordinate_axis(irregular_slicer):
+    """A stream with no usable rate (CoordinateAxis template, no ``gain``) can
+    never be described by a uniform LinearAxis, so every window emits a
+    CoordinateAxis carrying the true per-sample timestamps. Covers the
+    ``not has_gain`` branch of read_by_time.
+    """
+    from conftest import irregular_timestamps
+
+    true_ts = irregular_timestamps()
+    msg = irregular_slicer.read_by_time("Irregular", float(true_ts[50]), float(true_ts[150]))
+    assert msg.data.shape[0] == 100  # samples 50..149
+    assert hasattr(msg.axes["time"], "data")  # CoordinateAxis
+    assert not hasattr(msg.axes["time"], "gain")
+    idx = msg.data[:, 0].astype(int)  # data value == global sample index
+    np.testing.assert_allclose(np.asarray(msg.axes["time"].data), true_ts[idx], atol=1e-9)
 
 
 # --- Lifecycle ---
