@@ -2,6 +2,9 @@
 
 import threading
 
+import numpy as np
+import pytest
+from conftest import gappy_timestamps
 from ezmsg.util.messages.axisarray import AxisArray, LinearAxis
 
 from ezmsg.nwb.clockdriven import NWBClockDrivenProducer, NWBClockDrivenSettings
@@ -391,6 +394,81 @@ def test_playback_rate_zero_pauses(test_nwb_path):
     for _ in range(3):
         assert producer(AxisArray.LinearAxis(gain=1.0, offset=0.0)) is None
     assert producer._state.sample_idx == 0
+
+
+# --- Timestamp gaps (Solution B) ---
+
+
+def _gappy_producer(path, **overrides):
+    settings = NWBClockDrivenSettings(
+        fs=0.0,
+        n_time=10,
+        filepath=path,
+        stream_key="Gappy",
+        reference_clock=ReferenceClockType.UNKNOWN,
+        **overrides,
+    )
+    return NWBClockDrivenProducer(settings=settings)
+
+
+def test_clockdriven_clean_window_linear_axis(gappy_nwb_path):
+    """A gap-free window emits a regular LinearAxis chunk."""
+    p = _gappy_producer(gappy_nwb_path, start_offset=0.0)
+    r = p(AxisArray.LinearAxis(gain=1.0, offset=0.0))  # window [0, 1.0)
+    assert r is not None
+    assert r.data.shape[0] == 100
+    assert hasattr(r.axes["time"], "gain")  # LinearAxis
+    assert not hasattr(r.axes["time"], "data")
+
+
+def test_clockdriven_window_inside_gap_emits_empty(gappy_nwb_path):
+    """During the gap the producer emits zero-length chunks (no fabricated
+    data); the clock cursor still advances so sibling streams stay aligned."""
+    p = _gappy_producer(gappy_nwb_path, start_offset=1.6)
+    r = p(AxisArray.LinearAxis(gain=0.1, offset=0.0))  # window [1.6, 1.7) inside gap
+    assert r is not None
+    assert r.data.shape[0] == 0
+    # Cursor advanced by dt (from t0 + start_offset = 1.6 to 1.7) despite
+    # emitting nothing, so sibling producers on the same clock stay aligned.
+    assert p._state.file_t == pytest.approx(1.7, abs=1e-9)
+
+
+def test_clockdriven_window_spanning_gap_coordinate_axis(gappy_nwb_path):
+    """A window containing samples on both sides of the gap emits a
+    CoordinateAxis with the true timestamps, not a misleading LinearAxis."""
+    p = _gappy_producer(gappy_nwb_path, start_offset=1.0)
+    r = p(AxisArray.LinearAxis(gain=2.0, offset=0.0))  # window [1.0, 3.0)
+    assert r is not None
+    assert r.data.shape[0] == 100
+    assert hasattr(r.axes["time"], "data")  # CoordinateAxis
+    ts = np.asarray(r.axes["time"].data)
+    assert ts[49] == pytest.approx(1.49, abs=1e-6)
+    assert ts[50] == pytest.approx(2.50, abs=1e-6)
+
+
+def test_clockdriven_gap_tol_keeps_linear_axis(gappy_nwb_path):
+    """A large gap_tol keeps a gap-spanning window on a single LinearAxis."""
+    p = _gappy_producer(gappy_nwb_path, start_offset=1.0, gap_tol=1e6)
+    r = p(AxisArray.LinearAxis(gain=2.0, offset=0.0))
+    assert r is not None
+    assert hasattr(r.axes["time"], "gain")  # LinearAxis despite the gap
+    assert r.data.shape[0] == 100
+
+
+def test_clockdriven_sweep_across_gap_preserves_all_samples(gappy_nwb_path):
+    """Sweeping the whole stream tick-by-tick recovers every sample in order:
+    no data lost in the gap, no duplication, cursor advances monotonically."""
+    p = _gappy_producer(gappy_nwb_path, start_offset=0.0)
+    chunks = []
+    # 40 ticks * 0.1 s = 4.0 s covers the full 0..3.99 s stream.
+    for _ in range(40):
+        r = p(AxisArray.LinearAxis(gain=0.1, offset=0.0))
+        if r is not None and r.data.shape[0] > 0:
+            chunks.append(np.asarray(r.data))
+    data = np.concatenate(chunks, axis=0)
+    n = len(gappy_timestamps())
+    assert data.shape[0] == n
+    np.testing.assert_array_equal(data[:, 0], np.arange(n, dtype=np.float32))
 
 
 # --- Unit class ---

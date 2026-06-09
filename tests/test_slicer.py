@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from conftest import gappy_timestamps
 
 from ezmsg.nwb.slicer import NWBSlicer
 from ezmsg.nwb.util import ReferenceClockType
@@ -12,6 +13,17 @@ def slicer(test_nwb_path):
     s = NWBSlicer(
         filepath=test_nwb_path,
         reference_clock=ReferenceClockType.UNKNOWN,
+    )
+    yield s
+    s.close()
+
+
+@pytest.fixture
+def gappy_slicer(gappy_nwb_path):
+    s = NWBSlicer(
+        filepath=gappy_nwb_path,
+        reference_clock=ReferenceClockType.UNKNOWN,
+        stream_keys=["Gappy"],
     )
     yield s
     s.close()
@@ -347,6 +359,57 @@ def test_read_by_time_events_empty_window(slicer):
     """read_by_time on event stream with no events returns zero-length template."""
     msg = slicer.read_by_time("trials", 99999.0, 100000.0)
     assert msg.data.shape[0] == 0
+
+
+# --- Timestamp gaps (Solution B: CoordinateAxis on gappy windows) ---------
+
+
+def test_read_by_time_clean_window_linear_axis(gappy_slicer):
+    """A gap-free window keeps the cheap regular LinearAxis representation."""
+    msg = gappy_slicer.read_by_time("Gappy", 0.0, 1.0)
+    assert msg.data.shape[0] == 100  # samples 0..99 @ 100 Hz
+    assert hasattr(msg.axes["time"], "gain")  # LinearAxis
+    assert not hasattr(msg.axes["time"], "data")
+    assert msg.axes["time"].offset == pytest.approx(0.0, abs=1e-6)
+
+
+def test_read_by_time_gap_spanning_window_coordinate_axis(gappy_slicer):
+    """A window that straddles the gap must emit a CoordinateAxis carrying the
+    true per-sample timestamps rather than a uniform LinearAxis that would
+    misplace every post-gap sample.
+    """
+    msg = gappy_slicer.read_by_time("Gappy", 1.0, 3.0)
+    # 50 pre-gap (t 1.00..1.49) + 50 post-gap (t 2.50..2.99).
+    assert msg.data.shape[0] == 100
+    assert hasattr(msg.axes["time"], "data")  # CoordinateAxis
+    assert not hasattr(msg.axes["time"], "gain")
+    ts = np.asarray(msg.axes["time"].data)
+    assert ts.shape[0] == 100
+    # The jump across the gap is preserved, not flattened.
+    assert ts[49] == pytest.approx(1.49, abs=1e-6)
+    assert ts[50] == pytest.approx(2.50, abs=1e-6)
+
+
+def test_read_by_time_coordinate_timestamps_match_true(gappy_slicer):
+    """CoordinateAxis timestamps equal the file's true timestamps per sample."""
+    msg = gappy_slicer.read_by_time("Gappy", 1.0, 3.0)
+    true_ts = gappy_timestamps()
+    idx = msg.data[:, 0].astype(int)  # data value == global sample index
+    np.testing.assert_allclose(np.asarray(msg.axes["time"].data), true_ts[idx], atol=1e-9)
+
+
+def test_read_by_time_window_inside_gap_empty(gappy_slicer):
+    """A window entirely inside the gap returns a zero-length result."""
+    msg = gappy_slicer.read_by_time("Gappy", 1.7, 2.3)
+    assert msg.data.shape[0] == 0
+
+
+def test_read_by_time_gap_tol_disables_coordinate_axis(gappy_slicer):
+    """A large gap_tol widens the threshold so even a gap-spanning window stays
+    a single LinearAxis chunk — the knob works (and loses no samples)."""
+    msg = gappy_slicer.read_by_time("Gappy", 1.0, 3.0, gap_tol=1e6)
+    assert hasattr(msg.axes["time"], "gain")  # LinearAxis
+    assert msg.data.shape[0] == 100
 
 
 # --- Lifecycle ---

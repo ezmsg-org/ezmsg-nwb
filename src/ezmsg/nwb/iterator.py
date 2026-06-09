@@ -15,7 +15,7 @@ from ezmsg.baseproc.stateful import BaseStatefulProducer
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
 
-from .slicer import NWBSlicer
+from .slicer import NWBSlicer, find_gaps
 from .util import ReferenceClockType
 
 # Sentinel pushed to the prefetch queue to indicate end-of-stream. Identity-compared.
@@ -137,10 +137,7 @@ def _build_chunk_messages_static(
             # path.
             if info.has_timestamps and info.timestamps is not None and hasattr(time_axis, "gain") and len(out_data):
                 ts_chunk = np.asarray(info.timestamps[start_idx:stop_idx])
-                if ts_chunk.shape[0] > 1:
-                    gap_after = np.flatnonzero(np.diff(ts_chunk) > time_axis.gain * (1.0 + gap_tol))
-                else:
-                    gap_after = np.empty(0, dtype=int)
+                gap_after = find_gaps(ts_chunk, time_axis.gain, gap_tol)
                 # Run boundaries within the chunk: [0, gap1+1, gap2+1, ..., len].
                 bounds = [0, *(gap_after + 1).tolist(), ts_chunk.shape[0]]
                 for b0, b1 in zip(bounds[:-1], bounds[1:]):
