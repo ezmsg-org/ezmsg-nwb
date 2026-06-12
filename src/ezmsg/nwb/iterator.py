@@ -77,9 +77,17 @@ def _build_chunk_messages_static(
     out: list[AxisArray] = []
     for strm_name, strm_dict in streams.items():
         info = strm_dict["info"]
-        start_idx = strm_dict["chunk_offsets"][chunk_ix]
-        if chunk_ix + 1 < len(strm_dict["chunk_offsets"]):
-            stop_idx = strm_dict["chunk_offsets"][chunk_ix + 1]
+        chunk_offsets = strm_dict["chunk_offsets"]
+        # Defensive: offset tables are built one entry per global chunk, so this
+        # never trips in normal operation. It guards against a caller handing us
+        # a stream whose table is shorter than ``n_chunks`` — index out of bounds
+        # would otherwise crash the whole chunk instead of just dropping that
+        # stream for this index.
+        if chunk_ix >= len(chunk_offsets):
+            continue
+        start_idx = chunk_offsets[chunk_ix]
+        if chunk_ix + 1 < len(chunk_offsets):
+            stop_idx = chunk_offsets[chunk_ix + 1]
         else:
             stop_idx = info.dset.shape[0]
         template = info.template
@@ -107,9 +115,14 @@ def _build_chunk_messages_static(
         else:
             out_data = info.dset[start_idx:stop_idx]
             if info.timestamps is not None and start_idx < len(info.timestamps):
+                # Explicit timestamps are already absolute (file-relative) times.
                 chunk_t0 = info.timestamps[start_idx]
             else:
-                chunk_t0 = template.axes["time"].gain * start_idx
+                # Rate-only: the absolute time of ``start_idx`` is the stream's
+                # own start (``info.t0``) plus the within-stream offset. Omitting
+                # ``info.t0`` would label a late-starting stream as if it began
+                # at the file origin, mis-timing it against other streams.
+                chunk_t0 = float(info.t0) + template.axes["time"].gain * start_idx
             out.append(
                 replace(
                     template,
@@ -253,11 +266,28 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
                 chunk_boundaries = start_time + np.arange(n_chunks) * self.settings.chunk_dur - slicer.ts_off
                 chunk_ix_offsets = np.searchsorted(timestamps, chunk_boundaries, side="left").astype(int)
             else:
-                samps_per_chunk = self.settings.chunk_dur / template.axes["time"].gain
-                t0_abs = float(info.t0) + float(slicer.ts_off)
-                first_chunk = max(0, int((t0_abs - float(start_time)) // self.settings.chunk_dur))
-                chunk_ix_offsets = np.arange(n_chunks - first_chunk) * samps_per_chunk
-                chunk_ix_offsets = chunk_ix_offsets.astype(int)
+                # Sample index at each GLOBAL chunk boundary, computed from the
+                # stream's own start time (``info.t0``) and nominal gain. Building
+                # offsets on the shared global grid — rather than from each
+                # stream's own first sample — keeps streams that start at
+                # different times mutually aligned: chunk ``j`` covers the same
+                # wall-clock window for every stream. Boundaries before this
+                # stream begins go negative and boundaries past its end overshoot
+                # ``n_samples``; clamping turns both into empty slices, so a
+                # late-starting / early-ending stream simply contributes nothing
+                # to the chunks outside its span instead of being shifted.
+                gain = template.axes["time"].gain
+                chunk_boundaries = start_time + np.arange(n_chunks) * self.settings.chunk_dur - slicer.ts_off
+                # First sample at/after each boundary — ``searchsorted(side="left")``
+                # semantics on a regular grid, matching the event branch above.
+                # Use ceil, not round: round assigns a boundary to the nearest
+                # sample, which can pull a pre-boundary sample into the chunk when
+                # chunk_dur isn't an integer multiple of the sample period and
+                # disagree with the timestamped/event paths. The epsilon absorbs
+                # floating-point drift so an exact boundary isn't bumped up a sample.
+                rel = (chunk_boundaries - float(info.t0)) / gain
+                chunk_ix_offsets = np.ceil(rel - 1e-6).astype(int)
+                chunk_ix_offsets = np.clip(chunk_ix_offsets, 0, info.dset.shape[0])
 
             self._state.streams[name] = {
                 "info": info,

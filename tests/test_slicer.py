@@ -277,6 +277,47 @@ def test_read_by_index_has_linear_axis(slicer):
     assert hasattr(msg.axes["time"], "gain")  # LinearAxis
 
 
+def test_read_by_index_offset_includes_starting_time(tmp_path):
+    """For a rate-only stream with non-zero ``starting_time``, the emitted time
+    offset must include that start time (sample indices are 0-based from the
+    stream start). Regression: previously the offset was ``ts_off + gain*idx``,
+    omitting ``t0``, which mis-timed late-starting streams.
+    """
+    import datetime
+
+    from pynwb import NWBHDF5IO, NWBFile, TimeSeries
+
+    path = tmp_path / "late_start.nwb"
+    nwb = NWBFile(
+        session_description="m",
+        identifier="m",
+        session_start_time=datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc),
+    )
+    rate = 100.0
+    nwb.add_acquisition(
+        TimeSeries(
+            name="Late",
+            data=np.arange(int(3 * rate), dtype=np.float32)[:, None],
+            unit="V",
+            rate=rate,
+            starting_time=2.0,
+        )
+    )
+    with NWBHDF5IO(str(path), "w") as io:
+        io.write(nwb)
+
+    s = NWBSlicer(filepath=path, reference_clock=ReferenceClockType.UNKNOWN)
+    try:
+        gain = 1.0 / rate
+        # Sample 0 is at the stream's start time (2.0 s); sample 50 is 0.5 s later.
+        msg0 = s.read_by_index("Late", 0, 10)
+        msg50 = s.read_by_index("Late", 50, 60)
+        assert msg0.axes["time"].offset == pytest.approx(2.0)
+        assert msg50.axes["time"].offset == pytest.approx(2.0 + 50 * gain)
+    finally:
+        s.close()
+
+
 # --- Timestamped continuous slicing ---
 
 
