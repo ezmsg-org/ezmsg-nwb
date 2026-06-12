@@ -278,7 +278,15 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
                 # to the chunks outside its span instead of being shifted.
                 gain = template.axes["time"].gain
                 chunk_boundaries = start_time + np.arange(n_chunks) * self.settings.chunk_dur - slicer.ts_off
-                chunk_ix_offsets = np.round((chunk_boundaries - float(info.t0)) / gain).astype(int)
+                # First sample at/after each boundary — ``searchsorted(side="left")``
+                # semantics on a regular grid, matching the event branch above.
+                # Use ceil, not round: round assigns a boundary to the nearest
+                # sample, which can pull a pre-boundary sample into the chunk when
+                # chunk_dur isn't an integer multiple of the sample period and
+                # disagree with the timestamped/event paths. The epsilon absorbs
+                # floating-point drift so an exact boundary isn't bumped up a sample.
+                rel = (chunk_boundaries - float(info.t0)) / gain
+                chunk_ix_offsets = np.ceil(rel - 1e-6).astype(int)
                 chunk_ix_offsets = np.clip(chunk_ix_offsets, 0, info.dset.shape[0])
 
             self._state.streams[name] = {

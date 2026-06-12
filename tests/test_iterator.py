@@ -498,6 +498,54 @@ def test_late_starting_stream_stays_aligned(tmp_path):
     assert first_offset["B"][1] == 1000.0
 
 
+def test_chunk_offsets_match_searchsorted_for_noninteger_period(tmp_path):
+    """When chunk_dur is not an integer multiple of the sample period, chunk
+    offsets must be the first sample at/after each boundary (searchsorted
+    side='left' / ceil), not the nearest sample (round) — otherwise a
+    pre-boundary sample leaks into the next chunk and disagrees with the
+    event/timestamped paths.
+    """
+    import datetime
+
+    from pynwb import NWBHDF5IO, NWBFile, TimeSeries
+
+    path = tmp_path / "noninteger.nwb"
+    nwb = NWBFile(
+        session_description="m",
+        identifier="m",
+        session_start_time=datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc),
+    )
+    rate = 256.0  # 256 samples/s -> 25.6 samples per 0.1 s chunk (non-integer)
+    nwb.add_acquisition(
+        TimeSeries(
+            name="S",
+            data=np.arange(int(3 * rate), dtype=np.float32)[:, None],
+            unit="V",
+            rate=rate,
+            starting_time=0.0,
+        )
+    )
+    with NWBHDF5IO(str(path), "w") as io:
+        io.write(nwb)
+
+    chunk_dur = 0.1
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=path,
+            chunk_dur=chunk_dur,
+            reference_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+    offsets = np.asarray(it._state.streams["S"]["chunk_offsets"])
+    n_chunks = it._state.n_chunks
+    n_samples = int(3 * rate)
+
+    boundaries = np.arange(n_chunks) * chunk_dur  # start_time=0, ts_off=0, t0=0
+    sample_times = np.arange(n_samples) / rate
+    expected = np.clip(np.searchsorted(sample_times, boundaries, side="left"), 0, n_samples)
+    np.testing.assert_array_equal(offsets, expected)
+
+
 # --- Channel axis preserved ---
 
 
