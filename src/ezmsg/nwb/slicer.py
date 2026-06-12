@@ -393,9 +393,15 @@ class NWBSlicer:
         template = info.template
 
         if info.timestamps is not None and start_idx < len(info.timestamps):
+            # Explicit timestamps are already absolute (file-relative) times.
             chunk_t0 = info.timestamps[start_idx]
         else:
-            chunk_t0 = template.axes["time"].gain * start_idx
+            # Rate-only: ``start_idx`` is 0-based from the stream's own start, so
+            # its absolute time is ``info.t0`` plus the within-stream offset.
+            # Omitting ``info.t0`` would mis-time a stream whose ``starting_time``
+            # is non-zero and disagree with the clock-driven producer's
+            # ``file_t = t0 + idx/fs`` bookkeeping.
+            chunk_t0 = float(info.t0) + template.axes["time"].gain * start_idx
 
         return replace(
             template,
