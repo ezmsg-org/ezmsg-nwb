@@ -77,9 +77,17 @@ def _build_chunk_messages_static(
     out: list[AxisArray] = []
     for strm_name, strm_dict in streams.items():
         info = strm_dict["info"]
-        start_idx = strm_dict["chunk_offsets"][chunk_ix]
-        if chunk_ix + 1 < len(strm_dict["chunk_offsets"]):
-            stop_idx = strm_dict["chunk_offsets"][chunk_ix + 1]
+        chunk_offsets = strm_dict["chunk_offsets"]
+        # Streams can have fewer chunks than the file-wide ``n_chunks`` when
+        # they start later or end earlier than the overall time range, so
+        # their ``chunk_offsets`` table runs out before ``chunk_ix`` does.
+        # Once a stream is past its last chunk it simply has no data here —
+        # skip it rather than indexing out of bounds.
+        if chunk_ix >= len(chunk_offsets):
+            continue
+        start_idx = chunk_offsets[chunk_ix]
+        if chunk_ix + 1 < len(chunk_offsets):
+            stop_idx = chunk_offsets[chunk_ix + 1]
         else:
             stop_idx = info.dset.shape[0]
         template = info.template

@@ -404,6 +404,34 @@ def test_multi_stream_interleaving(test_nwb_path):
     assert abs(first_binned - first_raw) <= 1
 
 
+def test_ragged_stream_lengths_do_not_crash(test_nwb_path):
+    """Streams whose chunk_offsets tables are shorter than the file-wide
+    ``n_chunks`` (e.g. a stream that starts later or ends earlier than the
+    overall time range) must not raise an IndexError; the shorter stream
+    simply stops contributing once its chunks run out.
+    """
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["BinnedSpikes", "RawAnalog"],
+        )
+    )
+    # Simulate a ragged stream: truncate RawAnalog's offset table so it has
+    # fewer chunks than the file-wide n_chunks (3). Without the guard in
+    # _build_chunk_messages_static this raises IndexError at the last chunk.
+    short = it._state.streams["RawAnalog"]
+    short["chunk_offsets"] = short["chunk_offsets"][:-1]
+
+    keys = [m.key for m in it]  # full iteration must not raise
+
+    # The full-length stream still produces messages for every chunk...
+    assert keys.count("BinnedSpikes") == it._state.n_chunks
+    # ...while the truncated stream contributes one fewer.
+    assert keys.count("RawAnalog") == it._state.n_chunks - 1
+
+
 # --- Channel axis preserved ---
 
 
