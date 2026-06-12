@@ -405,10 +405,11 @@ def test_multi_stream_interleaving(test_nwb_path):
 
 
 def test_ragged_stream_lengths_do_not_crash(test_nwb_path):
-    """Streams whose chunk_offsets tables are shorter than the file-wide
-    ``n_chunks`` (e.g. a stream that starts later or ends earlier than the
-    overall time range) must not raise an IndexError; the shorter stream
-    simply stops contributing once its chunks run out.
+    """Defensive guard: a stream whose chunk_offsets table is shorter than the
+    file-wide ``n_chunks`` must not raise an IndexError; that stream simply
+    stops contributing once its table runs out. Offset tables are normally
+    built one-entry-per-chunk (see ``test_late_starting_stream_stays_aligned``),
+    so this exercises the bounds guard against a short table directly.
     """
     it = NWBAxisArrayIterator(
         NWBIteratorSettings(
@@ -430,6 +431,71 @@ def test_ragged_stream_lengths_do_not_crash(test_nwb_path):
     assert keys.count("BinnedSpikes") == it._state.n_chunks
     # ...while the truncated stream contributes one fewer.
     assert keys.count("RawAnalog") == it._state.n_chunks - 1
+
+
+def test_late_starting_stream_stays_aligned(tmp_path):
+    """A stream that starts partway into the recording must be emitted in the
+    chunks that match its real wall-clock time — not shifted to chunk 0 — and
+    its message time offsets must reflect its true start time. Regression for
+    streams with different ``starting_time`` (e.g. CereLink Hub2 vs NPLAY).
+    """
+    import datetime
+
+    from pynwb import NWBHDF5IO, NWBFile, TimeSeries
+
+    path = tmp_path / "late_start.nwb"
+    nwb = NWBFile(
+        session_description="m",
+        identifier="m",
+        session_start_time=datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc),
+    )
+    rate = 100.0
+    # Stream A: t=0..5s. Stream B: t=2..5s (starts 2 chunks / 2 s later).
+    nwb.add_acquisition(
+        TimeSeries(
+            name="A",
+            data=np.arange(int(5 * rate), dtype=np.float32)[:, None],
+            unit="V",
+            rate=rate,
+            starting_time=0.0,
+        )
+    )
+    nwb.add_acquisition(
+        TimeSeries(
+            name="B",
+            data=(1000 + np.arange(int(3 * rate), dtype=np.float32))[:, None],
+            unit="V",
+            rate=rate,
+            starting_time=2.0,
+        )
+    )
+    with NWBHDF5IO(str(path), "w") as io:
+        io.write(nwb)
+
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+        )
+    )
+    # Offset tables are built one entry per global chunk for every stream.
+    n_chunks = it._state.n_chunks
+    assert len(it._state.streams["A"]["chunk_offsets"]) == n_chunks
+    assert len(it._state.streams["B"]["chunk_offsets"]) == n_chunks
+
+    # First non-empty message for each stream: when does each first appear and
+    # at what time offset?
+    first_offset = {}
+    for m in it:
+        if m.data.size and m.key not in first_offset:
+            first_offset[m.key] = (m.axes["time"].offset, float(m.data.flat[0]))
+
+    # A begins at t=0; B begins at t=2.0 with its own first sample (1000) —
+    # NOT shifted to t=0.
+    assert first_offset["A"][0] == pytest.approx(0.0)
+    assert first_offset["B"][0] == pytest.approx(2.0)
+    assert first_offset["B"][1] == 1000.0
 
 
 # --- Channel axis preserved ---
