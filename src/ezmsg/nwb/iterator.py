@@ -168,17 +168,21 @@ def _prefetch_worker(
                 return
     except Exception as exc:  # pragma: no cover — surfaces in get()
         ez.logger.exception("NWBAxisArrayIterator prefetch worker failed: %s", exc)
-        try:
-            q.put(exc, timeout=1.0)
-        except queue.Full:
-            pass
+        while not stop.is_set():
+            try:
+                q.put(exc, timeout=0.1)
+                break
+            except queue.Full:
+                continue
         return
     finally:
         # Always signal end-of-stream so the consumer wakes up.
-        try:
-            q.put(_PREFETCH_END, timeout=1.0)
-        except queue.Full:
-            pass
+        while not stop.is_set():
+            try:
+                q.put(_PREFETCH_END, timeout=0.1)
+                break
+            except queue.Full:
+                continue
 
 
 class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, NWBIteratorState]):
