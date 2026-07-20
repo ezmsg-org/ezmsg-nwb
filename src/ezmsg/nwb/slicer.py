@@ -20,6 +20,12 @@ from ezmsg.util.messages.util import replace
 
 from .util import ReferenceClockType
 
+# Default gap threshold as a fraction of the nominal sample period (1.5x period).
+# Sits between neural-data jitter (<~1.05x) and the smallest real gap (one dropped
+# sample = ~2x), so it catches every gap without splitting on jitter. Shared as the
+# default for the slicer, iterator, and clock-driven producer.
+DEFAULT_GAP_TOL = 0.5
+
 
 def find_gaps(timestamps: np.ndarray, gain: float, gap_tol: float) -> np.ndarray:
     """Indices ``i`` where a gap separates sample ``i`` from sample ``i + 1``.
@@ -431,7 +437,9 @@ class NWBSlicer:
             key=stream_key,
         )
 
-    def read_by_time(self, stream_key: str, t_start: float, t_end: float, gap_tol: float = 0.5) -> AxisArray:
+    def read_by_time(
+        self, stream_key: str, t_start: float, t_end: float, gap_tol: float = DEFAULT_GAP_TOL
+    ) -> AxisArray:
         """Read data by time window [t_start, t_end).
 
         For timestamped continuous streams and event/interval tables.

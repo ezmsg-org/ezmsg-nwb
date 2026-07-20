@@ -12,7 +12,7 @@ from ezmsg.baseproc.protocols import processor_state
 from ezmsg.baseproc.units import BaseClockDrivenUnit
 from ezmsg.util.messages.axisarray import AxisArray, LinearAxis
 
-from .slicer import NWBSlicer
+from .slicer import DEFAULT_GAP_TOL, NWBSlicer
 from .util import ReferenceClockType
 
 
@@ -32,7 +32,7 @@ class NWBClockDrivenSettings(ClockDrivenSettings):
     meaningful when ``n_time`` is ``None`` (variable chunk size); with a fixed
     ``n_time`` the rate acts as a pause/unpause gate since chunk size is fixed.
     """
-    gap_tol: float = 0.5
+    gap_tol: float = DEFAULT_GAP_TOL
     """Gap threshold for timestamped continuous streams, as a fraction of the
     nominal sample period (forwarded to ``NWBSlicer.read_by_time``).
 

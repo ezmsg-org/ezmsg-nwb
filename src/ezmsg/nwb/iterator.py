@@ -15,7 +15,7 @@ from ezmsg.baseproc.stateful import BaseStatefulProducer
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
 
-from .slicer import NWBSlicer, find_gaps
+from .slicer import DEFAULT_GAP_TOL, NWBSlicer, find_gaps
 from .util import ReferenceClockType
 
 # Sentinel pushed to the prefetch queue to indicate end-of-stream. Identity-compared.
@@ -45,7 +45,7 @@ class NWBIteratorSettings(ez.Settings):
     """HDF5 raw data chunk cache size in bytes (forwarded to NWBSlicer)."""
     rdcc_nslots: int = NWBSlicer.DEFAULT_RDCC_NSLOTS
     """HDF5 raw data chunk cache slot count (forwarded to NWBSlicer)."""
-    gap_tol: float = 0.5
+    gap_tol: float = DEFAULT_GAP_TOL
     """Gap threshold for timestamped continuous streams, as a fraction of the
     nominal sample period: a gap is declared when an interval exceeds
     ``(1 + gap_tol) / fs``. Chunks spanning a gap are split into gap-free
@@ -74,7 +74,7 @@ def _build_chunk_messages_static(
     slicer: NWBSlicer,
     streams: dict,
     chunk_ix: int,
-    gap_tol: float = 0.5,
+    gap_tol: float = DEFAULT_GAP_TOL,
 ) -> list[AxisArray]:
     """Build the messages for ``chunk_ix`` from explicit slicer/streams refs.
 
@@ -185,7 +185,7 @@ def _prefetch_worker(
     n_chunks: int,
     q: queue.Queue,
     stop: threading.Event,
-    gap_tol: float = 0.5,
+    gap_tol: float = DEFAULT_GAP_TOL,
 ) -> None:
     """Prefetch worker target. Top-level function (no closure over the
     iterator) so the iterator can be garbage-collected as soon as the user
@@ -342,9 +342,7 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
 
     def _build_chunk_messages(self, chunk_ix: int) -> list[AxisArray]:
         """Sync-side wrapper around :func:`_build_chunk_messages_static`."""
-        return _build_chunk_messages_static(
-            self._state.slicer, self._state.streams, chunk_ix, self.settings.gap_tol
-        )
+        return _build_chunk_messages_static(self._state.slicer, self._state.streams, chunk_ix, self.settings.gap_tol)
 
     def _chunk_step(self):
         """Sync path: build the next chunk and append to the deque."""
