@@ -12,7 +12,7 @@ from ezmsg.baseproc.protocols import processor_state
 from ezmsg.baseproc.units import BaseClockDrivenUnit
 from ezmsg.util.messages.axisarray import AxisArray, LinearAxis
 
-from .slicer import NWBSlicer
+from .slicer import DEFAULT_GAP_TOL, NWBSlicer
 from .util import ReferenceClockType
 
 
@@ -31,6 +31,18 @@ class NWBClockDrivenSettings(ClockDrivenSettings):
     ``0.0`` pauses (the producer emits nothing). Values other than 0.0/1.0 are only
     meaningful when ``n_time`` is ``None`` (variable chunk size); with a fixed
     ``n_time`` the rate acts as a pause/unpause gate since chunk size is fixed.
+    """
+    gap_tol: float = DEFAULT_GAP_TOL
+    """Gap threshold for timestamped continuous streams, as a fraction of the
+    nominal sample period (forwarded to ``NWBSlicer.read_by_time``).
+
+    The clock cadence is never altered: ``file_t`` always advances by ``dt`` per
+    tick so sibling producers on the same clock stay aligned, and windows that
+    fall inside a gap emit zero-length chunks. When a single window straddles a
+    gap (interval > ``(1 + gap_tol)`` nominal periods), that chunk's time axis
+    becomes a ``CoordinateAxis`` carrying the true per-sample timestamps rather
+    than a uniform ``LinearAxis`` that would misplace post-gap samples. Set very
+    large to keep a single LinearAxis across gaps. No effect on event streams.
     """
 
 
@@ -242,7 +254,7 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
 
         t_start = self._state.file_t
         t_end = t_start + dt
-        output = slicer.read_by_time(self.settings.stream_key, t_start, t_end)
+        output = slicer.read_by_time(self.settings.stream_key, t_start, t_end, gap_tol=self.settings.gap_tol)
         self._state.file_t = t_end
         return output
 

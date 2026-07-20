@@ -20,6 +20,27 @@ from ezmsg.util.messages.util import replace
 
 from .util import ReferenceClockType
 
+# Default gap threshold as a fraction of the nominal sample period (1.5x period).
+# Sits between neural-data jitter (<~1.05x) and the smallest real gap (one dropped
+# sample = ~2x), so it catches every gap without splitting on jitter. Shared as the
+# default for the slicer, iterator, and clock-driven producer.
+DEFAULT_GAP_TOL = 0.5
+
+
+def find_gaps(timestamps: np.ndarray, gain: float, gap_tol: float) -> np.ndarray:
+    """Indices ``i`` where a gap separates sample ``i`` from sample ``i + 1``.
+
+    A gap is an inter-sample interval exceeding ``(1 + gap_tol) * gain`` — i.e.
+    the timestamps jump by more than ``(1 + gap_tol)`` nominal sample periods.
+    Returns the left-edge indices as an ``int`` array (empty when there are
+    fewer than two samples, no usable ``gain``, or no gaps). Shared by the
+    iterator (which splits chunks at gaps) and the slicer's ``read_by_time``
+    (which switches to a CoordinateAxis when a window spans one).
+    """
+    if gain <= 0.0 or timestamps.shape[0] < 2:
+        return np.empty(0, dtype=int)
+    return np.flatnonzero(np.diff(timestamps) > gain * (1.0 + gap_tol))
+
 
 @dataclass
 class StreamInfo:
@@ -416,12 +437,22 @@ class NWBSlicer:
             key=stream_key,
         )
 
-    def read_by_time(self, stream_key: str, t_start: float, t_end: float) -> AxisArray:
+    def read_by_time(
+        self, stream_key: str, t_start: float, t_end: float, gap_tol: float = DEFAULT_GAP_TOL
+    ) -> AxisArray:
         """Read data by time window [t_start, t_end).
 
         For timestamped continuous streams and event/interval tables.
         t_start and t_end are in the same reference frame as the stored timestamps
         (i.e., file-relative, before ts_off).
+
+        ``gap_tol`` is the gap threshold as a fraction of the nominal sample
+        period (see :func:`find_gaps`). When a continuous window's samples are
+        regularly spaced the result carries a cheap ``LinearAxis``; when the
+        window straddles a gap, the time axis becomes a ``CoordinateAxis``
+        carrying the true per-sample timestamps so the gap is represented
+        faithfully instead of silently flattening post-gap samples onto a
+        uniform axis. Ignored for event streams.
         """
         info = self._streams[stream_key]
         template = info.template
@@ -466,11 +497,35 @@ class NWBSlicer:
             stop_idx = int(np.searchsorted(ts_arr, t_end, side="left"))
 
             out_data = info.dset[start_idx:stop_idx]
+            time_axis = template.axes["time"]
+            ts_window = np.asarray(ts_arr[start_idx:stop_idx])
+            has_gain = hasattr(time_axis, "gain")
+
+            # A window straddling a gap (or any stream with no usable rate)
+            # cannot be described by a uniform LinearAxis without misplacing
+            # samples. Emit a CoordinateAxis carrying the true per-sample
+            # timestamps instead — the same representation events use. Gap-free
+            # windows keep the cheaper LinearAxis.
+            emit_coords = (not has_gain) or find_gaps(ts_window, time_axis.gain, gap_tol).size > 0
+            if emit_coords:
+                return replace(
+                    template,
+                    data=out_data,
+                    axes={
+                        **template.axes,
+                        "time": AxisArray.CoordinateAxis(
+                            data=self._ts_off + ts_window,
+                            dims=["time"],
+                            unit=getattr(time_axis, "unit", "s"),
+                        ),
+                    },
+                    key=stream_key,
+                )
 
             if start_idx < len(ts_arr):
                 chunk_t0 = ts_arr[start_idx]
             else:
-                chunk_t0 = template.axes["time"].gain * start_idx if hasattr(template.axes["time"], "gain") else 0.0
+                chunk_t0 = time_axis.gain * start_idx
 
             return replace(
                 template,
@@ -478,7 +533,7 @@ class NWBSlicer:
                 axes={
                     **template.axes,
                     "time": replace(
-                        template.axes["time"],
+                        time_axis,
                         offset=self._ts_off + chunk_t0,
                     ),
                 },
