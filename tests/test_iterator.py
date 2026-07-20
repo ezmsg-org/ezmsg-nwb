@@ -703,6 +703,39 @@ def test_prefetch_partial_consumption_clean_close(test_nwb_path):
     assert not worker.is_alive(), "prefetch thread did not stop within 2s"
 
 
+def test_prefetch_end_sentinel_survives_slow_consumer():
+    """Regression: the end-of-stream sentinel must be delivered even when the
+    consumer keeps the bounded queue full past the worker's per-put timeout.
+
+    The sentinel (and worker exceptions) were previously put with a fixed 1s
+    timeout and silently dropped on ``queue.Full``, so a consumer that stayed
+    full longer than that never received the sentinel and its final ``get()``
+    blocked forever.
+    """
+    import queue as _queue
+
+    from ezmsg.nwb.iterator import _PREFETCH_END, _prefetch_worker
+
+    q: _queue.Queue = _queue.Queue(maxsize=1)
+    q.put(object())  # occupy the single slot so the worker's sentinel put blocks
+    stop = threading.Event()
+
+    # n_chunks=0 -> the worker goes straight to the finally sentinel put; slicer
+    # and streams are unused on that path.
+    worker = threading.Thread(target=_prefetch_worker, args=(None, {}, 0, q, stop), daemon=True)
+    worker.start()
+
+    # Free the slot only after the old fixed 1s put timeout would have elapsed,
+    # so a non-retrying worker has already dropped the sentinel by now.
+    time.sleep(1.3)
+    q.get_nowait()  # remove the occupying item, making room for the sentinel
+
+    got = q.get(timeout=2.0)  # a retrying worker delivers it once room appears
+    assert got is _PREFETCH_END
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+
 # --- Sync fast path ---
 
 
