@@ -7,8 +7,12 @@ from collections import Counter
 
 import numpy as np
 import pytest
+from conftest import GAPPY_N_POST, GAPPY_N_PRE
 
 from ezmsg.nwb import NWBAxisArrayIterator, NWBIteratorSettings, ReferenceClockType
+
+# The gappy-stream fixture (``gappy_nwb_path``) and its GAPPY_* parameters live
+# in conftest.py so the slicer and clock-driven tests can share them.
 
 
 async def test_areset_state_runs_reset_in_worker_thread(test_nwb_path):
@@ -600,9 +604,9 @@ def test_prefetch_runs_in_worker_thread(test_nwb_path, monkeypatch):
     seen_tids: list[int] = []
     real = iterator_mod._build_chunk_messages_static
 
-    def spy(slicer, streams, chunk_ix):
+    def spy(slicer, streams, chunk_ix, gap_tol=0.5):
         seen_tids.append(threading.get_ident())
-        return real(slicer, streams, chunk_ix)
+        return real(slicer, streams, chunk_ix, gap_tol)
 
     monkeypatch.setattr(iterator_mod, "_build_chunk_messages_static", spy)
 
@@ -818,3 +822,145 @@ def test_rdcc_settings_forwarded_to_h5py(test_nwb_path, monkeypatch):
     open_kwargs = seen_kwargs[0]
     assert open_kwargs["rdcc_nbytes"] == custom_nbytes
     assert open_kwargs["rdcc_nslots"] == custom_nslots
+
+
+# --- Timestamp gaps (Solution A: split chunks at gaps) ----------------------
+
+
+def test_gappy_whole_stream_not_one_gap_spanning_chunk(gappy_nwb_path):
+    """A chunk big enough to cover the whole gappy stream must be split into
+    two gap-free messages, not emitted as one chunk that silently spans the
+    gap with a uniform LinearAxis.
+    """
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=gappy_nwb_path,
+            chunk_dur=100.0,  # whole stream in a single chunk
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Gappy"],
+        )
+    )
+    msgs = [m for m in it if m.data.shape[0] > 0]
+
+    assert len(msgs) == 2, "gappy stream was not split at the gap"
+    assert msgs[0].data.shape[0] == GAPPY_N_PRE
+    assert msgs[1].data.shape[0] == GAPPY_N_POST
+    # Offsets reflect the real first-timestamp of each gap-free run.
+    assert msgs[0].axes["time"].offset == pytest.approx(0.0, abs=1e-6)
+    assert msgs[1].axes["time"].offset == pytest.approx(2.50, abs=1e-6)
+    # Sample ordering and identity preserved across the split.
+    assert msgs[0].data[0, 0] == 0
+    assert msgs[0].data[-1, 0] == GAPPY_N_PRE - 1
+    assert msgs[1].data[0, 0] == GAPPY_N_PRE
+    assert msgs[1].data[-1, 0] == GAPPY_N_PRE + GAPPY_N_POST - 1
+
+
+def test_gappy_midchunk_split(gappy_nwb_path):
+    """When the gap falls in the middle of an index-based chunk, that chunk is
+    split into two messages while gap-free chunks pass through unchanged.
+
+    chunk_dur=1.0 @ 100 Hz -> 100 samples/chunk. The gap sits between sample
+    149 and 150, i.e. inside the second chunk (samples 100..199).
+    """
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=gappy_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Gappy"],
+        )
+    )
+    msgs = [m for m in it if m.data.shape[0] > 0]
+
+    # chunk0: samples 0..99 (gap-free) -> 1 msg
+    # chunk1: samples 100..199 spans gap -> split 100..149 / 150..199
+    # chunk2: samples 200..299 (gap-free) -> 1 msg
+    assert len(msgs) == 4
+    sizes = [m.data.shape[0] for m in msgs]
+    assert sizes == [100, 50, 50, 100]
+    # The two halves of the split chunk sit on either side of the gap.
+    assert msgs[1].axes["time"].offset == pytest.approx(1.00, abs=1e-6)
+    assert msgs[2].axes["time"].offset == pytest.approx(2.50, abs=1e-6)
+
+
+def test_gappy_segments_match_true_timestamps(gappy_nwb_path):
+    """Every emitted message's reconstructed time axis (offset + i*gain) must
+    match the file's true per-sample timestamps within a fraction of a sample.
+    """
+    from ezmsg.nwb.slicer import NWBSlicer
+
+    slicer = NWBSlicer(
+        filepath=gappy_nwb_path,
+        reference_clock=ReferenceClockType.UNKNOWN,
+        stream_keys=["Gappy"],
+    )
+    true_ts = np.asarray(slicer.get_stream_info("Gappy").timestamps[:])
+    slicer.close()
+
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=gappy_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Gappy"],
+        )
+    )
+    for m in it:
+        if m.data.shape[0] == 0:
+            continue
+        gain = m.axes["time"].gain
+        offset = m.axes["time"].offset
+        idx = m.data[:, 0].astype(int)  # data value == global sample index
+        reconstructed = offset + np.arange(m.data.shape[0]) * gain
+        np.testing.assert_allclose(reconstructed, true_ts[idx], atol=gain * 0.5)
+
+
+def test_gappy_total_samples_and_order_preserved(gappy_nwb_path):
+    """Splitting at gaps must not drop, duplicate, or reorder samples."""
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=gappy_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Gappy"],
+        )
+    )
+    data = np.concatenate([m.data for m in it if m.data.shape[0] > 0], axis=0)
+    n = GAPPY_N_PRE + GAPPY_N_POST
+    assert data.shape[0] == n
+    np.testing.assert_array_equal(data[:, 0], np.arange(n, dtype=np.float32))
+
+
+def test_gap_tol_disables_split(gappy_nwb_path):
+    """A large ``gap_tol`` widens the gap threshold enough that the stream is
+    emitted as a single (gap-spanning) chunk again — the knob works.
+    """
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=gappy_nwb_path,
+            chunk_dur=100.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Gappy"],
+            gap_tol=1e6,
+        )
+    )
+    msgs = [m for m in it if m.data.shape[0] > 0]
+    assert len(msgs) == 1
+    assert msgs[0].data.shape[0] == GAPPY_N_PRE + GAPPY_N_POST
+
+
+def test_jittered_stream_not_oversplit(test_nwb_path):
+    """The lightly-jittered Broadband stream (no real gaps) must not be split:
+    sub-microsecond jitter stays well under the gap threshold.
+    """
+    it = NWBAxisArrayIterator(
+        NWBIteratorSettings(
+            filepath=test_nwb_path,
+            chunk_dur=1.0,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Broadband"],
+        )
+    )
+    msgs = [m for m in it if m.data.shape[0] > 0]
+    # 3 s of 1 kHz data in 1 s chunks -> exactly 3 non-empty messages.
+    assert len(msgs) == 3
