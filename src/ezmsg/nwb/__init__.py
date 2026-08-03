@@ -23,6 +23,8 @@ from .pipeline_settings import (
 from .reader import NWBIteratorUnit as NWBIteratorUnit
 from .slicer import NWBSlicer as NWBSlicer
 from .util import ReferenceClockType as ReferenceClockType
+from .util import as_text as as_text
+from .util import as_text_array as as_text_array
 from .util import build_nwb_fname as build_nwb_fname
 from .writer import NWBSink as NWBSink
 from .writer import NWBSinkConsumer as NWBSinkConsumer
