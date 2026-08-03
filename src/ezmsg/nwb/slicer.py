@@ -18,7 +18,7 @@ import remfile
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
 
-from .util import ReferenceClockType
+from .util import ReferenceClockType, as_text, as_text_array
 
 # Default gap threshold as a fraction of the nominal sample period (1.5x period).
 # Sits between neural-data jitter (<~1.05x) and the smallest real gap (one dropped
@@ -88,6 +88,23 @@ def _extract_timeseries_from_container(container, address: str | None = None) ->
     return timeseries
 
 
+def _is_bytes_text(dset: typing.Any) -> bool:
+    """True when this dataset's values arrive as ``bytes`` rather than ``str``.
+
+    Covers both shapes the character-set problem takes: a fixed-length column
+    (dtype ``S``) and a variable-length one declared ASCII, which h5py hands
+    back as an object array of ``bytes``. See :func:`~.util.as_text`.
+    """
+    dtype = getattr(dset, "dtype", None)
+    if dtype is None:
+        return False
+    if dtype.kind == "S":
+        return True
+    if dtype.kind != "O" or 0 in dset.shape:
+        return False
+    return isinstance(dset[(0,) * dset.ndim], bytes)
+
+
 def _electrode_group_manufacturer(child: pynwb.TimeSeries) -> str:
     """Return the manufacturer of the Device backing this TimeSeries.
 
@@ -113,10 +130,16 @@ def _electrode_group_manufacturer(child: pynwb.TimeSeries) -> str:
         device = getattr(group, "device", None)
         if device is None:
             return ""
-        manufacturer = getattr(device, "manufacturer", "") or ""
+        # ``as_text``, not ``str``: this value becomes a prefix to match on, and
+        # a bytes repr ("b'CereLink'") matches nothing, so every stream the
+        # caller named by bare device would be skipped in silence. hdmf happens
+        # to decode ASCII *attributes* on the way out even though it leaves
+        # datasets alone -- so this is a guard against that asymmetry changing,
+        # not a live bug.
+        manufacturer = as_text(getattr(device, "manufacturer", "") or "")
         if manufacturer.lower() == "unknown":
             return ""
-        return str(manufacturer)
+        return manufacturer
     except (AttributeError, KeyError, IndexError, TypeError):
         return ""
 
@@ -236,7 +259,11 @@ class NWBSlicer:
                     start_time = min(start_time, self._ts_off + table.start_time[0])
                     stop_time = max(stop_time, self._ts_off + table.stop_time[-1])
                     ch_labels = list(set(table.colnames) - {"start_time", "stop_time"})
-                    dset = np.array([list(map(str, table[_].data)) for _ in ch_labels]).T
+                    # ``as_text_array``, not ``map(str, ...)``: an ASCII-declared
+                    # column reads back as ``bytes``, and stringifying those gives
+                    # the repr -- an event payload of "b'{\"cause\": ...}'" that no
+                    # consumer can match or parse, with nothing raised to say so.
+                    dset = np.array([as_text_array(table[_].data) for _ in ch_labels]).T
                     self._streams[attr] = StreamInfo(
                         dset=dset,
                         template=AxisArray(
@@ -341,19 +368,31 @@ class NWBSlicer:
                 full_df = child.electrodes.table.to_dataframe()
                 el_df = full_df.iloc[region_idx]
                 if "label" in el_df.columns:
-                    ch_labels = el_df["label"].values.tolist()
+                    # Decoded here, at the read boundary: these labels become the
+                    # ch-axis coordinates every downstream name-based channel
+                    # selection matches against.
+                    ch_labels = as_text_array(el_df["label"].values)
                 else:
-                    ch_labels = [f"ch_{idx}" for idx in el_df.index.tolist()]
-                axes["ch"] = AxisArray.CoordinateAxis(data=np.array(ch_labels), dims=["ch"])
+                    ch_labels = np.array([f"ch_{idx}" for idx in el_df.index.tolist()])
+                axes["ch"] = AxisArray.CoordinateAxis(data=ch_labels, dims=["ch"])
 
             # ``matched_key`` is the user-facing key — equal to ``child.name``
             # when there's no stream_keys filter or an exact match, or the
             # bare ``<key>`` portion when the user requested an unprefixed
             # device name and the container is ``"<manufacturer>_<key>"``.
+            # A text series (markers, annotations) whose writer declared its
+            # strings ASCII reads back as ``bytes``. Decode it once here rather
+            # than at each slice: every caller then sees ``str`` regardless of
+            # writer, and the three places that index ``dset`` -- both slicer
+            # read paths and the iterator's -- can't each forget to. Safe to
+            # materialize because text series are markers: short and few, on the
+            # order of the interval tables already read whole just above.
+            dset = as_text_array(child.data[:]) if _is_bytes_text(child.data) else child.data
+
             self._streams[matched_key] = StreamInfo(
-                dset=child.data,
+                dset=dset,
                 template=AxisArray(
-                    data=np.zeros((0,) + child.data.shape[1:], dtype=child.data.dtype),
+                    data=np.zeros((0,) + dset.shape[1:], dtype=dset.dtype),
                     dims=(["time", "ch"] + [f"dim_{_}" for _ in range(2, child.data.ndim)])
                     if child.data.ndim > 1
                     else ["time"],
