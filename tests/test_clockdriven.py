@@ -482,8 +482,12 @@ def test_clockdriven_two_producers_stay_synced_across_gap(gappy_and_clean_nwb_pa
     def producer(key):
         return NWBClockDrivenProducer(
             settings=NWBClockDrivenSettings(
-                fs=0.0, n_time=10, filepath=gappy_and_clean_nwb_path, stream_key=key,
-                reference_clock=ReferenceClockType.UNKNOWN, start_offset=0.0,
+                fs=0.0,
+                n_time=10,
+                filepath=gappy_and_clean_nwb_path,
+                stream_key=key,
+                reference_clock=ReferenceClockType.UNKNOWN,
+                start_offset=0.0,
             )
         )
 
