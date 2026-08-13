@@ -56,6 +56,21 @@ class NWBIteratorSettings(ez.Settings):
     gap without splitting on jitter. Set very large to disable splitting. No
     effect on rate-only streams or event tables.
     """
+    dejitter: bool = True
+    """Reconstruct smoothed monotone timestamps for streams with a paired
+    ``*_device_ts`` sibling before chunking (forwarded to ``NWBSlicer``). Removes
+    the per-sample clock jitter that would otherwise gap-split such a stream into
+    thousands of tiny messages. Set False to chunk raw timestamps unchanged."""
+    clock_groups: typing.Optional[list[list[str]]] = None
+    """Override auto clock-group detection (forwarded to ``NWBSlicer``). ``None``
+    auto-detects PTP-shared groups; a list of key-lists forces them."""
+    dejitter_cache: bool = True
+    """Cache reconstructed timestamps on disk across opens (forwarded to
+    ``NWBSlicer``)."""
+    real_gap_threshold: typing.Optional[float] = None
+    """Real-gap guard threshold in seconds (forwarded to ``NWBSlicer``). ``None``
+    auto-derives per stream; genuine gaps are preserved so chunks still split at
+    them. ``float("inf")`` disables the guard."""
 
 
 @processor_state
@@ -278,6 +293,10 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
             stream_keys=self.settings.stream_keys,
             rdcc_nbytes=self.settings.rdcc_nbytes,
             rdcc_nslots=self.settings.rdcc_nslots,
+            dejitter=self.settings.dejitter,
+            clock_groups=self.settings.clock_groups,
+            dejitter_cache=self.settings.dejitter_cache,
+            real_gap_threshold=self.settings.real_gap_threshold,
         )
         self._state.slicer = slicer
 

@@ -44,6 +44,18 @@ class NWBClockDrivenSettings(ClockDrivenSettings):
     than a uniform ``LinearAxis`` that would misplace post-gap samples. Set very
     large to keep a single LinearAxis across gaps. No effect on event streams.
     """
+    dejitter: bool = True
+    """Reconstruct smoothed monotone timestamps for streams with a paired
+    ``*_device_ts`` sibling (forwarded to ``NWBSlicer``). Set False to read raw
+    timestamps unchanged."""
+    clock_groups: typing.Optional[list[list[str]]] = None
+    """Override auto clock-group detection (forwarded to ``NWBSlicer``)."""
+    dejitter_cache: bool = True
+    """Cache reconstructed timestamps on disk across opens (forwarded to
+    ``NWBSlicer``)."""
+    real_gap_threshold: typing.Optional[float] = None
+    """Real-gap guard threshold in seconds (forwarded to ``NWBSlicer``). ``None``
+    auto-derives per stream; ``float("inf")`` disables the guard."""
 
 
 @processor_state
@@ -126,11 +138,20 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
             self._state.fractional_samples = 0.0
             return
 
+        # Only ``stream_key`` is requested; when dejitter is on the slicer
+        # transparently pulls in this stream's ``*_device_ts`` partner for the
+        # reconstruction and hides it again, so a single-stream read is still
+        # dejittered (self-fit, since only this stream's group is loaded -- the
+        # iterator path gets the full cross-hub shared model).
         slicer = NWBSlicer(
             filepath=self.settings.filepath,
             reference_clock=self.settings.reference_clock,
             reref_now=self.settings.reref_now,
             stream_keys=[self.settings.stream_key],
+            dejitter=self.settings.dejitter,
+            clock_groups=self.settings.clock_groups,
+            dejitter_cache=self.settings.dejitter_cache,
+            real_gap_threshold=self.settings.real_gap_threshold,
         )
         self._state.slicer = slicer
 

@@ -236,6 +236,145 @@ def ascii_nwb_path(tmp_path_factory):
     return path
 
 
+# --- Dejitter fixture -------------------------------------------------------
+#
+# A jittery acquisition stream paired with a ``*_device_ts`` sibling, mirroring
+# the real Orion/CereLink layout: the same data is stored twice, once in
+# ``/acquisition`` with converted (session-relative) timestamps and once in
+# ``/processing/ecephys`` with device-clock (absolute-epoch) timestamps, the two
+# ``data`` datasets hard-linked to one object. The converted timestamps carry
+# per-sample jitter large enough to fragment the stream under the gap-splitter,
+# so the slicer's dejitter pass has something to fix. The ``rate`` attr is stored
+# float32 and the device timestamps are epoch-scale on purpose -- together they
+# reproduce the float32/epoch bound blow-up the recompute guards against.
+
+DEJITTER_RATE = 1000.0
+DEJITTER_N = 3000
+DEJITTER_EPOCH = 1704110400.0  # == session_start 2024-01-01 12:00:00 UTC
+
+
+def dejitter_timestamps():
+    """``(truth, converted, device)`` for the dejitter fixture.
+
+    ``truth`` is the clean session-relative time (gentle non-linear drift);
+    ``converted`` is ``truth`` plus per-sample jitter (~0.6 sample periods);
+    ``device`` is the shared epoch clock carrying the same jitter.
+    """
+    idx = np.arange(DEJITTER_N)
+    truth = idx / DEJITTER_RATE + 0.003 * np.sin(2 * np.pi * idx / DEJITTER_N)
+    jitter = np.random.default_rng(11).normal(scale=0.6 / DEJITTER_RATE, size=DEJITTER_N)
+    converted = truth + jitter
+    device = DEJITTER_EPOCH + idx / DEJITTER_RATE + jitter
+    return truth, converted, device
+
+
+DEJITTER_GAP_AT = 1500  # left-edge index of the injected real gap
+DEJITTER_GAP_S = 0.3  # real gap duration (dropped ~300 samples of data)
+
+
+def dejitter_gapped_timestamps():
+    """Like :func:`dejitter_timestamps` but with a genuine data gap: every sample
+    from ``DEJITTER_GAP_AT`` on is shifted later by ``DEJITTER_GAP_S`` on both the
+    converted and (shared) device clocks."""
+    truth, converted, device = dejitter_timestamps()
+    truth = truth.copy()
+    converted = converted.copy()
+    device = device.copy()
+    for arr in (truth, converted, device):
+        arr[DEJITTER_GAP_AT:] += DEJITTER_GAP_S
+    return truth, converted, device
+
+
+def _write_dejitter_nwb(path, converted, device, data):
+    import h5py
+    from create_test_nwb import _downgrade_electrodes_table
+    from pynwb import NWBHDF5IO, NWBFile, TimeSeries
+    from pynwb.ecephys import ElectricalSeries
+
+    nwbfile = NWBFile(
+        session_description="dejitter",
+        identifier="dejitter001",
+        session_start_time=datetime.datetime(2024, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc),
+    )
+    dev = nwbfile.create_device(name="TestArray")
+    group = nwbfile.create_electrode_group(name="G", description="g", location="M1", device=dev)
+    nwbfile.add_electrode_column(name="label", description="label")
+    for i in range(4):
+        nwbfile.add_electrode(location="M1", group=group, label=f"e{i}")
+    region = nwbfile.create_electrode_table_region(region=list(range(4)), description="all")
+
+    nwbfile.add_acquisition(
+        ElectricalSeries(name="HUB", data=data, timestamps=converted, electrodes=region, description="jittery")
+    )
+    ecephys = nwbfile.create_processing_module(name="ecephys", description="ecephys")
+    ecephys.add(TimeSeries(name="HUB_device_ts", data=data.copy(), unit="V", timestamps=device, description="device"))
+
+    with NWBHDF5IO(str(path), "w") as io:
+        io.write(nwbfile)
+
+    with h5py.File(str(path), "a") as f:
+        f["acquisition/HUB/timestamps"].attrs["rate"] = np.float32(DEJITTER_RATE)
+        del f["processing/ecephys/HUB_device_ts/data"]
+        f["processing/ecephys/HUB_device_ts/data"] = f["acquisition/HUB/data"]
+
+    _downgrade_electrodes_table(path)
+    return path
+
+
+@pytest.fixture(scope="session")
+def dejitter_gapped_nwb_path(tmp_path_factory):
+    """Dejitter fixture carrying one genuine data gap (see dejitter_gapped_timestamps)."""
+    path = tmp_path_factory.mktemp("dejitter_gap") / "dejitter_gap.nwb"
+    _truth, converted, device = dejitter_gapped_timestamps()
+    return _write_dejitter_nwb(path, converted, device, _index_data(DEJITTER_N, 4))
+
+
+@pytest.fixture(scope="session")
+def dejitter_nwb_path(tmp_path_factory):
+    """NWB file with one jittery acquisition stream + hard-linked device_ts partner."""
+    import h5py
+    from create_test_nwb import _downgrade_electrodes_table
+    from pynwb import NWBHDF5IO, NWBFile, TimeSeries
+    from pynwb.ecephys import ElectricalSeries
+
+    path = tmp_path_factory.mktemp("dejitter") / "dejitter.nwb"
+    _truth, converted, device = dejitter_timestamps()
+    data = _index_data(DEJITTER_N, 4)
+
+    nwbfile = NWBFile(
+        session_description="dejitter",
+        identifier="dejitter001",
+        session_start_time=datetime.datetime(2024, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc),
+    )
+    dev = nwbfile.create_device(name="TestArray")
+    group = nwbfile.create_electrode_group(name="G", description="g", location="M1", device=dev)
+    nwbfile.add_electrode_column(name="label", description="label")
+    for i in range(4):
+        nwbfile.add_electrode(location="M1", group=group, label=f"e{i}")
+    region = nwbfile.create_electrode_table_region(region=list(range(4)), description="all")
+
+    nwbfile.add_acquisition(
+        ElectricalSeries(name="HUB", data=data, timestamps=converted, electrodes=region, description="jittery")
+    )
+    ecephys = nwbfile.create_processing_module(name="ecephys", description="ecephys")
+    ecephys.add(TimeSeries(name="HUB_device_ts", data=data.copy(), unit="V", timestamps=device, description="device"))
+
+    with NWBHDF5IO(str(path), "w") as io:
+        io.write(nwbfile)
+
+    with h5py.File(str(path), "a") as f:
+        # float32 rate attr, like the real recordings (drives the float32 path).
+        f["acquisition/HUB/timestamps"].attrs["rate"] = np.float32(DEJITTER_RATE)
+        # Hard-link the device_ts data to the acquisition data so the slicer's
+        # object-identity pairing fires (the structural mark of a re-timestamped
+        # acquisition), not merely the name convention.
+        del f["processing/ecephys/HUB_device_ts/data"]
+        f["processing/ecephys/HUB_device_ts/data"] = f["acquisition/HUB/data"]
+
+    _downgrade_electrodes_table(path)
+    return path
+
+
 @pytest.fixture(scope="session")
 def irregular_nwb_path(tmp_path_factory):
     """Build an NWB file with one irregular (rate-0 → CoordinateAxis) stream."""
