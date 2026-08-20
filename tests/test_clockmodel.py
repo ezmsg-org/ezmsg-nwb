@@ -5,6 +5,7 @@ import pytest
 
 from ezmsg.nwb.clockmodel import (
     ClockModel,
+    _enforce_join_monotonicity,
     cache_lookup,
     cache_store,
     find_real_gaps,
@@ -227,6 +228,114 @@ def test_reconstruct_shared_preserves_gap_on_device_clock():
     big = np.flatnonzero(np.diff(recon) > 0.1)
     assert big.size == 1 and big[0] == 2999
     assert abs(np.diff(recon)[big[0]] - 0.3) < 0.02
+
+
+# --- segment joins ---
+
+
+def test_enforce_join_monotonicity_recuts_a_backward_join():
+    """A join that runs backwards is re-cut to the jump the raw stamps show."""
+    period = GAIN
+    raw = np.array([0.0, 0.001, 0.002, 0.012, 0.013])  # 10 ms real gap at index 3
+    out = np.array([0.0, 0.001, 0.002, 0.0015, 0.0025])  # segment 2 anchored 0.5 ms early
+    fixed = _enforce_join_monotonicity(out.copy(), [(0, 3), (3, 5)], period, raw)
+
+    assert np.all(np.diff(fixed) > 0)
+    # The gap is restored from the raw stamps, not collapsed to one period.
+    assert fixed[3] - fixed[2] == pytest.approx(0.010)
+    # The moved segment keeps its own shape.
+    assert np.allclose(np.diff(fixed[3:]), np.diff(out[3:]))
+
+
+def test_enforce_join_monotonicity_leaves_healthy_joins_alone():
+    period = GAIN
+    raw = np.array([0.0, 0.001, 0.002, 0.012, 0.013])
+    out = np.array([0.0, 0.001, 0.002, 0.012, 0.013])
+    fixed = _enforce_join_monotonicity(out.copy(), [(0, 3), (3, 5)], period, raw)
+    assert np.array_equal(fixed, out)
+
+
+def test_enforce_join_monotonicity_shifts_cumulatively():
+    """Two bad joins: the third segment carries both corrections."""
+    period = GAIN
+    raw = np.array([0.0, 0.001, 0.011, 0.012, 0.022, 0.023])
+    out = np.array([0.0, 0.001, 0.0005, 0.0015, 0.0010, 0.0020])
+    fixed = _enforce_join_monotonicity(out.copy(), [(0, 2), (2, 4), (4, 6)], period, raw)
+
+    assert np.all(np.diff(fixed) > 0)
+    assert fixed[2] - fixed[1] == pytest.approx(0.010)
+    assert fixed[4] - fixed[3] == pytest.approx(0.010)
+
+
+def test_reconstruct_shared_join_stays_monotone_when_anchors_disagree():
+    """Per-segment median anchors must not let a segment start before the last ended.
+
+    Regression from real data: each segment of the shared path re-anchors on its
+    own median, so a target whose latency shifts across a gap produced a 33
+    sample-period backward step in the reconstructed output -- which callers read
+    as monotone.
+    """
+    truth = _smooth_truth()
+    epoch = 1.7e9
+    clean_device = epoch + np.arange(N) / RATE
+    target_device = epoch + np.arange(N) / RATE
+    target_device[3000:] += 0.005  # small real gap: 5 ms
+
+    target_dataset = _jitter(truth, seed=5)
+    target_dataset[3000:] += 0.005
+    target_dataset[3000:] -= 0.010  # latency shift larger than the gap
+
+    recon = reconstruct_shared(target_device, clean_device, truth, target_dataset=target_dataset, gap_threshold_s=0.002)
+    assert np.all(np.diff(recon) >= 0), "reconstruction must not run backwards across segment joins"
+    # The device clock's jump survives the repair rather than collapsing to one
+    # period: 5 ms of missing data plus the sample period that spans it.
+    assert np.diff(recon)[2999] == pytest.approx(0.005 + GAIN, abs=5e-4)
+
+
+def test_reconstruct_self_stays_monotone_across_gaps():
+    truth = _smooth_truth()
+    gapped_truth = truth.copy()
+    gapped_truth[2500:] += 0.5
+    recon = reconstruct_self(_jitter(gapped_truth), gap_threshold_s=0.05)
+    assert np.all(np.diff(recon) >= 0)
+
+
+# --- shared-model gate ---
+
+
+def test_shared_model_rescues_when_the_clean_member_is_perfect():
+    """A flawless reference must not disable the rescue.
+
+    Regenerated timestamps (``i / fs``) self-fit to ~0, so a pure ratio test
+    against them either rescues everything or, guarded with ``> 0``, rescues
+    nothing -- exactly when the reference is most worth borrowing.
+    """
+    epoch = 1.7e9
+    device = epoch + np.arange(N) / RATE
+    perfect = np.arange(N) / RATE
+    members = [
+        {"key": "perfect", "device": device.copy(), "dataset": perfect},
+        {"key": "broken", "device": device.copy(), "dataset": _jitter(perfect, scale_periods=8.0, seed=4)},
+    ]
+    out = reconstruct_group(members)
+    # The broken member is pulled back onto the shared clock, far inside its own
+    # 8-period jitter.
+    assert np.abs(out["broken"] - perfect).max() < 2.0 * GAIN
+
+
+def test_shared_model_not_triggered_by_subsample_jitter_ratio():
+    """A big ratio between two sub-sample-clean streams is not corruption."""
+    truth = _smooth_truth()
+    epoch = 1.7e9
+    device = epoch + np.arange(N) / RATE
+    truth_b = np.arange(N) / (RATE * 1.0001) + 0.003 * np.sin(2 * np.pi * np.arange(N) / N)
+    members = [
+        {"key": "a", "device": device.copy(), "dataset": _jitter(truth, scale_periods=0.002, seed=2)},
+        {"key": "b", "device": device.copy(), "dataset": _jitter(truth_b, scale_periods=0.2, seed=3)},
+    ]  # ratio ~100x, but "b" is still well under one sample period of jitter
+    out = reconstruct_group(members)
+    # "b" self-fits: it tracks its OWN clock, not "a"'s slightly different rate.
+    assert np.abs(out["b"] - truth_b).max() < 5e-4
 
 
 # --- group_clocks ---
