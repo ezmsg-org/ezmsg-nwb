@@ -390,3 +390,41 @@ def irregular_nwb_path(tmp_path_factory):
     )
     # No rate attr -> slicer detects rate 0 -> CoordinateAxis template.
     return _write_nwb(path, [series], {})
+
+
+# --- Quantised-timestamp fixture --------------------------------------------
+#
+# A regular stream whose per-sample stamps are rounded to a grid coarser than
+# the true sample period is fine-grained, which is how real acquisition writes
+# them: the intervals then take only two values, straddling the truth. Any
+# median-based rate estimate snaps to one of those two and stays there for every
+# sample count, so this fixture is the one that catches the bias. No ``rate``
+# attr, so the slicer has to estimate.
+
+QUANTISED_N = 20_000
+QUANTISED_RATE = 30000.104
+"""Delivered rate. Deliberately not a round number and not on the stamp grid."""
+QUANTISED_STEP = 4e-8
+"""Timestamp quantum. Matches recordings from CereLink-class hardware, where the
+median interval reads 30012.005 Hz against this 30000.104 Hz stream."""
+
+
+def quantised_timestamps() -> np.ndarray:
+    """Regular timestamps at ``QUANTISED_RATE``, rounded onto a ``QUANTISED_STEP`` grid."""
+    return np.round(np.arange(QUANTISED_N) / QUANTISED_RATE / QUANTISED_STEP) * QUANTISED_STEP
+
+
+@pytest.fixture(scope="session")
+def quantised_nwb_path(tmp_path_factory):
+    """NWB file with one regular stream carrying coarsely-quantised timestamps."""
+    from pynwb import TimeSeries
+
+    path = tmp_path_factory.mktemp("quantised") / "quantised.nwb"
+    series = TimeSeries(
+        name="Quantised",
+        data=_index_data(QUANTISED_N),
+        unit="V",
+        timestamps=quantised_timestamps(),
+        description="regular stream, quantised timestamps, no rate attr",
+    )
+    return _write_nwb(path, [series], {})
