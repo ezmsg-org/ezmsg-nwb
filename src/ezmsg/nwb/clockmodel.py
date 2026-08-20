@@ -77,6 +77,15 @@ GAP_VERIFY_WIN = 16
 """Half-window (samples) for the net-displacement check that separates a real
 gap (a sustained level shift) from a lone jitter spike (self-cancelling)."""
 
+SHARED_MODEL_JITTER_RATIO = 5.0
+"""A group member is reconstructed via the shared clock model only when its own
+jitter exceeds the cleanest member's by at least this factor. Self-fitting an
+already-clean stream tracks its own timestamps to sub-sample accuracy, whereas
+the shared model imposes a sibling's device->dataset conversion whose slightly
+different effective rate compounds over the recording (measured ~6.6 ms of drift
+across 51 s on a clean stream that self-fit to 0.08 ms). So the sibling's clock
+is borrowed only when the target is genuinely too corrupted to trust its own."""
+
 CACHE_DIR = Path("~").expanduser() / ".ezmsg" / "nwb-cache" / "dejitter"
 """Where reconstructed timestamp vectors are cached across file opens, alongside
 remfile's ``nwb-cache``. Multi-pass workloads (e.g. training over many epochs of
@@ -363,10 +372,14 @@ def reconstruct_group(
 
     ``members`` is a list of ``{"key", "device", "dataset"}`` dicts (``device``
     may be ``None`` for a lone stream). The cleanest member -- least jitter about
-    its own self-fit -- is dejittered directly and supplies the clock model ``C``
-    for the rest. A single-member group falls back to a self-fit. Genuine data
-    gaps are preserved per member (``gap_threshold_s`` forwarded; ``None`` =
-    auto). Returns ``{key: reconstructed_dataset_times}``.
+    its own self-fit -- is dejittered directly and can supply the clock model
+    ``C`` for the rest. A member is reconstructed via that shared model only when
+    it is at least :data:`SHARED_MODEL_JITTER_RATIO` times jitterier than the
+    clean source (and carries device timestamps to map through); otherwise it is
+    self-fit, which never imposes a sibling's clock. A single-member group falls
+    back to a self-fit. Genuine data gaps are preserved per member
+    (``gap_threshold_s`` forwarded; ``None`` = auto). Returns
+    ``{key: reconstructed_dataset_times}``.
 
     This is the file-agnostic entry point shared by the read-time slicer and any
     offline NWB-correcting tool.
@@ -381,20 +394,32 @@ def reconstruct_group(
     clean_key = min(resids, key=resids.get)
     clean = next(m for m in members if m["key"] == clean_key)
     clean_recon = reconstruct_self(clean["dataset"], n_knots, method, gap_threshold_s)
+    clean_resid = resids[clean_key]
 
     out: dict[str, np.ndarray] = {clean_key: clean_recon}
     for m in members:
         if m["key"] == clean_key:
             continue
-        out[m["key"]] = reconstruct_shared(
-            target_device=m["device"],
-            clean_device=clean["device"],
-            clean_dataset=clean_recon,
-            target_dataset=m["dataset"],
-            n_knots=n_knots,
-            method=method,
-            gap_threshold_s=gap_threshold_s,
+        # Borrow the clean sibling's clock only for a genuinely corrupted target;
+        # an already-clean stream self-fits to sub-sample accuracy and the shared
+        # model would only inject the sibling's slightly-different rate.
+        rescue = (
+            m["device"] is not None
+            and clean_resid > 0.0
+            and resids[m["key"]] >= SHARED_MODEL_JITTER_RATIO * clean_resid
         )
+        if rescue:
+            out[m["key"]] = reconstruct_shared(
+                target_device=m["device"],
+                clean_device=clean["device"],
+                clean_dataset=clean_recon,
+                target_dataset=m["dataset"],
+                n_knots=n_knots,
+                method=method,
+                gap_threshold_s=gap_threshold_s,
+            )
+        else:
+            out[m["key"]] = reconstruct_self(m["dataset"], n_knots, method, gap_threshold_s)
     return out
 
 
