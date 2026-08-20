@@ -133,6 +133,31 @@ def test_reconstruct_group_single_member_is_self_fit():
     assert np.abs(out["A"] - truth).max() < 0.005
 
 
+def test_reconstruct_group_self_fits_similarly_clean_members():
+    """Two comparably-clean members on a shared clock both self-fit -- neither is
+    dragged onto the other's slightly-different rate.
+
+    Regression: forcing an already-clean member through a sibling's clock model
+    injected the sibling's effective-rate error, which compounds over the record
+    (~6.6 ms across a clean 51 s stream). With both members near the jitter
+    ratio, each must track its own timestamps to sub-sample accuracy end to end.
+    """
+    truth = _smooth_truth()
+    epoch = 1.7e9
+    device = epoch + np.arange(N) / RATE
+    # Two members, both clean; one carries a slightly different effective rate so
+    # a shared model would visibly drift it.
+    truth_b = np.arange(N) / (RATE * 1.0001) + 0.003 * np.sin(2 * np.pi * np.arange(N) / N)
+    members = [
+        {"key": "a", "device": device.copy(), "dataset": _jitter(truth, scale_periods=0.05, seed=2)},
+        {"key": "b", "device": device.copy(), "dataset": _jitter(truth_b, scale_periods=0.05, seed=3)},
+    ]
+    out = reconstruct_group(members)
+    # Each stays within jitter scale of ITS OWN truth (not the other's clock).
+    assert np.abs(out["a"] - truth).max() < 5e-4
+    assert np.abs(out["b"] - truth_b).max() < 5e-4
+
+
 def test_reconstruct_group_picks_cleanest_as_model_source():
     truth = _smooth_truth()
     epoch = 1.7e9
