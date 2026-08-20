@@ -2,9 +2,9 @@
 
 import numpy as np
 import pytest
-from conftest import gappy_timestamps
+from conftest import QUANTISED_RATE, gappy_timestamps, quantised_timestamps
 
-from ezmsg.nwb.slicer import NWBSlicer
+from ezmsg.nwb.slicer import NWBSlicer, infer_nominal_rate
 from ezmsg.nwb.util import ReferenceClockType
 
 
@@ -239,6 +239,59 @@ def test_stream_info_1d(slicer):
     assert info.has_timestamps is False
     assert info.is_event is False
     assert info.template.dims == ["time"]
+
+
+def test_infer_nominal_rate_is_unbiased_under_quantisation():
+    """The estimator must not inherit the timestamp grid's bias.
+
+    Intervals here take exactly two values straddling the true period, so the
+    median lands on one of them (30012.005 Hz) no matter how many samples are
+    averaged. The mean recovers the truth.
+    """
+    dts = np.diff(quantised_timestamps())
+    assert 1.0 / np.median(dts) == pytest.approx(30012.005, abs=0.01)  # what the median says
+    assert infer_nominal_rate(dts) == pytest.approx(QUANTISED_RATE, rel=1e-6)
+
+
+def test_infer_nominal_rate_ignores_gaps():
+    """A real gap must not drag the estimate: a raw mean would read ~29970 here."""
+    ts = quantised_timestamps().copy()
+    ts[len(ts) // 2 :] += 0.01  # 10 ms hole, ~300 samples at 30 kHz
+    dts = np.diff(ts)
+
+    assert 1.0 / dts.mean() < QUANTISED_RATE - 20.0  # untrimmed mean is dragged
+    assert infer_nominal_rate(dts) == pytest.approx(QUANTISED_RATE, rel=1e-6)
+
+
+def test_infer_nominal_rate_ignores_clock_backsteps():
+    """A backward clock step and the forward excursion pairing with it both drop out."""
+    ts = quantised_timestamps().copy()
+    ts[len(ts) // 2] += 20 / QUANTISED_RATE  # one stamp lands 20 periods early
+    dts = np.diff(ts)
+
+    assert dts.min() < 0.0  # the pair is present
+    assert infer_nominal_rate(dts) == pytest.approx(QUANTISED_RATE, rel=1e-6)
+
+
+@pytest.mark.parametrize("dts", [np.empty(0), np.zeros(5), np.full(5, -1.0)])
+def test_infer_nominal_rate_degenerate_input(dts):
+    """Nothing to estimate from reports 0.0, which callers read as 'irregular'."""
+    assert infer_nominal_rate(dts) == 0.0
+
+
+def test_stream_info_rate_from_quantised_timestamps(quantised_nwb_path):
+    """End to end: a stream with no ``rate`` attr gets the delivered rate.
+
+    The 0.04% the median would have cost here is ~0.8 ms of sample misplacement
+    by the end of a 2 s chunk -- small, systematic, and invisible without a test
+    that knows the true rate.
+    """
+    s = NWBSlicer(filepath=quantised_nwb_path, reference_clock=ReferenceClockType.UNKNOWN)
+    try:
+        info = s.get_stream_info("Quantised")
+        assert info.fs == pytest.approx(QUANTISED_RATE, rel=1e-6)
+    finally:
+        s.close()
 
 
 def test_stream_info_event(slicer):

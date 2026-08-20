@@ -1,8 +1,10 @@
 """Clock-jitter reconstruction for NWB timestamps.
 
 Some acquisition streams carry per-sample timestamps that are correct in the
-*aggregate* (their median interval gives the true sample rate) but jittery
-sample-to-sample: the recording pipeline stamps each sample at arrival time
+*aggregate* (averaged over enough samples they give the true sample rate -- note
+the median does not, when stamps are quantised; see
+:func:`~ezmsg.nwb.slicer.infer_nominal_rate`) but jittery sample-to-sample: the
+recording pipeline stamps each sample at arrival time
 rather than from the ADC clock, so neighbouring intervals swing by roughly a
 whole sample period and occasionally hop backwards. The iterator's gap-splitter
 then shatters such a stream into tens of thousands of tiny gap-free runs -- one

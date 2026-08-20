@@ -34,6 +34,46 @@ from .util import ReferenceClockType, as_text, as_text_array
 # default for the slicer, iterator, and clock-driven producer.
 DEFAULT_GAP_TOL = 0.5
 
+# Interval window for the nominal-rate estimate, as a fraction of the median
+# interval. Intervals outside it are gaps, backward clock steps, or the forward
+# excursion that pairs with one -- none of which describe the sample period.
+RATE_TRIM_LO = 0.5
+RATE_TRIM_HI = 1.5
+
+
+def infer_nominal_rate(dts: np.ndarray) -> float:
+    """Sample rate from per-sample intervals: the mean of the non-outlier ones.
+
+    Deliberately **not** ``1 / median(dt)``, which is biased whenever the
+    timestamps are quantised more coarsely than the jitter they carry. The
+    median snaps to whichever grid point holds the most intervals; the true
+    period generally falls *between* two grid points, so the estimate lands on
+    one of them and stays there no matter how many samples are averaged. On real
+    30 kHz recordings whose stamps step in 4e-8 s, intervals split between
+    3.332e-5 and 3.336e-5 and the median reports 30012.005 Hz for a stream
+    delivering 30000.104 -- 0.04%, which is ~0.8 ms of misplacement by the end of
+    a 2 s chunk. The mean averages across the grid and recovers the true period.
+
+    The trim is what makes the mean usable: a raw mean is dragged by real gaps
+    (one 10 ms hole in the example above pulls the estimate to 29970 Hz). Keeping
+    only intervals within ``[RATE_TRIM_LO, RATE_TRIM_HI] * median`` drops gaps,
+    backward steps from clock sync, and the forward excursions that pair with
+    them, leaving the intervals that actually describe the sample period.
+
+    Returns 0.0 for input from which no rate can be estimated; callers treat 0.0
+    as "irregular, use a CoordinateAxis".
+    """
+    if dts.size == 0:
+        return 0.0
+    median = float(np.median(dts))
+    if not np.isfinite(median) or median <= 0.0:
+        return 0.0
+    core = dts[(dts > RATE_TRIM_LO * median) & (dts < RATE_TRIM_HI * median)]
+    # Empty core means the intervals are not clustered around their own median
+    # (bimodal, or mostly outliers). Nothing better to say than the median.
+    period = float(core.mean()) if core.size else median
+    return 1.0 / period if period > 0.0 else 0.0
+
 
 def find_gaps(timestamps: np.ndarray, gain: float, gap_tol: float) -> np.ndarray:
     """Indices ``i`` where a gap separates sample ``i`` from sample ``i + 1``.
@@ -377,7 +417,7 @@ class NWBSlicer:
                 else:
                     dts = np.diff(child.timestamps[:])
                     if np.var(dts) < 1e-3 or np.var(dts) < 0.05 * np.median(dts):
-                        rate = 1 / np.median(dts)
+                        rate = infer_nominal_rate(dts)
                     else:
                         rate = 0.0
 
