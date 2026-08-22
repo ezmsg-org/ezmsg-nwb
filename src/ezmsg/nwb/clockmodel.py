@@ -86,6 +86,22 @@ different effective rate compounds over the recording (measured ~6.6 ms of drift
 across 51 s on a clean stream that self-fit to 0.08 ms). So the sibling's clock
 is borrowed only when the target is genuinely too corrupted to trust its own."""
 
+SHARED_MODEL_JITTER_FLOOR_PERIODS = 1.0
+"""Absolute jitter floor for the shared model, in sample periods: a target must
+also be jittier than this before a sibling's clock is borrowed.
+
+Serves two purposes. It keeps the ratio test meaningful when the cleanest member
+is *perfect* -- a stream whose stamps were regenerated as ``i / fs`` self-fits to
+~1e-14 s (or exactly zero), and a pure ratio test against that either rescues
+everything or, with a ``> 0`` guard, rescues nothing precisely when the reference
+is most trustworthy. And it stops a large *relative* difference between two
+already-clean streams from triggering a rescue that cannot help: sub-sample
+jitter is not corruption, whatever its ratio to a cleaner sibling.
+
+One period separates the observed populations with room to spare: clean
+recordings self-fit to 0.3-0.5 periods, while a stream whose stamps were written
+at the wrong intra-chunk rate lands at ~37."""
+
 CACHE_DIR = Path("~").expanduser() / ".ezmsg" / "nwb-cache" / "dejitter"
 """Where reconstructed timestamp vectors are cached across file opens, alongside
 remfile's ``nwb-cache``. Multi-pass workloads (e.g. training over many epochs of
@@ -265,6 +281,50 @@ def _smooth_eval(x: np.ndarray, y: np.ndarray, n_knots: int, method: str) -> np.
     return fit_map(x, y, n_knots, method)(x)
 
 
+def _enforce_join_monotonicity(
+    out: np.ndarray, segments: list[tuple[int, int]], period: float, raw: np.ndarray
+) -> np.ndarray:
+    """Shift whole segments forward so no segment boundary runs backwards.
+
+    Each segment is fit independently so a real gap survives, which leaves the
+    *joins* unconstrained: a segment's smoothed first sample is an estimate, and
+    in the shared-model path each segment also carries its own median anchor, so
+    segment ``k+1`` can begin before segment ``k`` ended. Observed on real data
+    at 33 sample periods (1.1 ms) of backward step -- far past rounding, and a
+    contract violation for callers (the gap-splitter and chunk anchoring both
+    read these timestamps as monotone).
+
+    A broken join is re-cut to the jump the *raw* timestamps show across it
+    (floored at one period), and the whole following segment is shifted to match,
+    cumulatively. Using the raw jump is what keeps a real gap intact: shifting by
+    just enough to restore order would collapse the gap to a single period, and
+    the raw stamps are the only remaining evidence of how long the recording
+    actually stopped. Healthy joins are left alone.
+
+    Shifting rather than clamping is what preserves the fit: a segment keeps its
+    internal shape and its duration. ``np.maximum.accumulate`` would instead
+    flatten the overlap into a plateau of duplicate stamps, discarding the
+    segment's own timing.
+
+    Shifts are cumulative, so a late sample can move by the sum of all earlier
+    corrections. That is the honest cost, and it is paid only where the
+    reconstruction had already gone wrong.
+    """
+    if len(segments) < 2:
+        return out
+    shift = 0.0
+    for a, b in segments[1:]:
+        if shift:
+            out[a:b] += shift
+        jump = out[a] - out[a - 1]
+        if jump < period:
+            want = max(float(raw[a] - raw[a - 1]), period)
+            extra = want - jump
+            out[a:b] += extra
+            shift += extra
+    return out
+
+
 # --- Reconstruction -------------------------------------------------------
 
 
@@ -292,12 +352,13 @@ def reconstruct_self(
     if gaps.size == 0:
         return base
     out = base.copy()
-    for a, b in _segments(n, gaps):
+    segs = _segments(n, gaps)
+    for a, b in segs:
         if b - a >= 2:
             out[a:b] = _smooth_eval(np.arange(b - a, dtype=float), ds[a:b], n_knots, method)
         else:
             out[a:b] = ds[a:b]
-    return out
+    return _enforce_join_monotonicity(out, segs, _nominal_period(ds), ds)
 
 
 def reconstruct_shared(
@@ -343,10 +404,14 @@ def reconstruct_shared(
     if gaps.size == 0:
         return through_c(dev_base, tgt)
     out = np.empty(n, dtype=float)
-    for a, b in _segments(n, gaps):
+    segs = _segments(n, gaps)
+    for a, b in segs:
         dev_clean = _smooth_eval(np.arange(b - a, dtype=float), dev[a:b], n_knots, method) if b - a >= 2 else dev[a:b]
         out[a:b] = through_c(dev_clean, None if tgt is None else tgt[a:b])
-    return out
+    # Each segment carries its own median anchor, so joins are doubly
+    # unconstrained here -- this is the path where the 33-period backward step
+    # was observed.
+    return _enforce_join_monotonicity(out, segs, _nominal_period(dev), dev)
 
 
 def _detect_gaps(times: np.ndarray, gap_threshold_s: float | None) -> np.ndarray:
@@ -374,11 +439,13 @@ def reconstruct_group(
     may be ``None`` for a lone stream). The cleanest member -- least jitter about
     its own self-fit -- is dejittered directly and can supply the clock model
     ``C`` for the rest. A member is reconstructed via that shared model only when
-    it is at least :data:`SHARED_MODEL_JITTER_RATIO` times jitterier than the
-    clean source (and carries device timestamps to map through); otherwise it is
+    it carries device timestamps and is jitterier than both
+    :data:`SHARED_MODEL_JITTER_RATIO` times the clean source and
+    :data:`SHARED_MODEL_JITTER_FLOOR_PERIODS` sample periods; otherwise it is
     self-fit, which never imposes a sibling's clock. A single-member group falls
     back to a self-fit. Genuine data gaps are preserved per member
-    (``gap_threshold_s`` forwarded; ``None`` = auto). Returns
+    (``gap_threshold_s`` forwarded; ``None`` = auto), and segment joins are kept
+    monotone (:func:`_enforce_join_monotonicity`). Returns
     ``{key: reconstructed_dataset_times}``.
 
     This is the file-agnostic entry point shared by the read-time slicer and any
@@ -402,12 +469,16 @@ def reconstruct_group(
             continue
         # Borrow the clean sibling's clock only for a genuinely corrupted target;
         # an already-clean stream self-fits to sub-sample accuracy and the shared
-        # model would only inject the sibling's slightly-different rate.
-        rescue = (
-            m["device"] is not None
-            and clean_resid > 0.0
-            and resids[m["key"]] >= SHARED_MODEL_JITTER_RATIO * clean_resid
+        # model would only inject the sibling's slightly-different rate. The
+        # target must clear both bars -- jitterier than the source by the ratio,
+        # AND jittery in absolute terms -- so a perfect source (ratio threshold
+        # 0) still rescues a corrupted sibling, while two clean streams never
+        # trigger each other however far apart their ratio happens to fall.
+        threshold = max(
+            SHARED_MODEL_JITTER_RATIO * clean_resid,
+            SHARED_MODEL_JITTER_FLOOR_PERIODS * _nominal_period(np.asarray(m["dataset"], dtype=float)),
         )
+        rescue = m["device"] is not None and resids[m["key"]] >= threshold
         if rescue:
             out[m["key"]] = reconstruct_shared(
                 target_device=m["device"],
