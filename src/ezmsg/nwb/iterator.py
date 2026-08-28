@@ -15,7 +15,7 @@ from ezmsg.baseproc.stateful import BaseStatefulProducer
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
 
-from .scaling import DEFAULT_CONVERSION_DTYPE
+from .scaling import DEFAULT_CONVERSION_DTYPE, VoltageUnit
 from .slicer import DEFAULT_GAP_TOL, NWBSlicer, find_gaps
 from .util import ReferenceClockType
 
@@ -85,6 +85,11 @@ class NWBIteratorSettings(ez.Settings):
     unit_override: typing.Union[str, dict[str, str], None] = None
     """Replace the declared unit string without changing the gain (forwarded to
     ``NWBSlicer``). Bare value or ``{stream_key: value}``."""
+    target_unit: typing.Union[str, VoltageUnit, dict[str, typing.Union[str, VoltageUnit]], None] = None
+    """Deliver electrical streams in this unit whatever the file works in
+    (forwarded to ``NWBSlicer``), so the graph downstream can be written against
+    one scale. ``None`` emits the file's own unit. Bare value or
+    ``{stream_key: value}``; requires ``apply_conversion``."""
 
 
 @processor_state
@@ -315,6 +320,7 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
             conversion_dtype=self.settings.conversion_dtype,
             scale_override=self.settings.scale_override,
             unit_override=self.settings.unit_override,
+            target_unit=self.settings.target_unit,
         )
         self._state.slicer = slicer
 

@@ -22,6 +22,8 @@ from ezmsg.nwb import (
     NWBSlicer,
     ReferenceClockType,
     ScaledDataset,
+    VoltageUnit,
+    parse_voltage_unit,
     read_stored_scaling,
     resolve_scaling,
 )
@@ -261,6 +263,108 @@ def test_unit_override_relabels_without_rescaling(scaled_nwb_path, counts):
         np.testing.assert_array_equal(info.dset[:], expected(counts))
     finally:
         slicer.close()
+
+
+# --- target_unit: what the pipeline wants, not what the file holds -----------
+
+
+def test_target_unit_converts_from_the_files_own_unit(scaled_nwb_path, counts):
+    """The fixture declares microvolts; asking for volts scales both the gain and
+    the offset by 1e-6, so the samples come out 1e6 times smaller."""
+    slicer = NWBSlicer(scaled_nwb_path, target_unit=VoltageUnit.VOLTS, dejitter=False)
+    try:
+        info = slicer.get_stream_info("Broadband")
+        assert info.unit == "volts"
+        assert info.template.attrs["unit"] == "volts"
+        np.testing.assert_allclose(info.dset[:], expected(counts) * 1e-6, rtol=1e-6)
+    finally:
+        slicer.close()
+
+
+def test_target_unit_matching_the_file_is_a_no_op(scaled_nwb_path, counts):
+    slicer = NWBSlicer(scaled_nwb_path, target_unit="microvolts", dejitter=False)
+    try:
+        np.testing.assert_array_equal(slicer.get_stream_info("Broadband").dset[:], expected(counts))
+    finally:
+        slicer.close()
+
+
+def test_target_unit_accepts_any_spelling(scaled_nwb_path):
+    """A caller writing a setting should not have to know which spelling this
+    module canonicalized on."""
+    assert parse_voltage_unit("uV") is parse_voltage_unit("µV") is VoltageUnit.MICROVOLTS
+    slicer = NWBSlicer(scaled_nwb_path, target_unit="nV", dejitter=False)
+    try:
+        assert slicer.get_stream_info("Broadband").unit == "nanovolts"
+    finally:
+        slicer.close()
+
+
+def test_target_unit_composes_with_the_overrides(scaled_nwb_path, counts):
+    """``unit_override`` says what the file really holds, ``target_unit`` says
+    what to deliver. Order matters: correct first, then convert, so a file that
+    lies about its unit can still be requested in any other one.
+
+    Here the file's numbers are relabelled volts, then converted to microvolts:
+    a net 1e6, not the 1.0 that believing the file's "microvolts" would give.
+    """
+    slicer = NWBSlicer(scaled_nwb_path, unit_override="volts", target_unit="microvolts", dejitter=False)
+    try:
+        info = slicer.get_stream_info("Broadband")
+        assert info.unit == "microvolts"
+        np.testing.assert_allclose(info.dset[:], expected(counts) * 1e6, rtol=1e-6)
+    finally:
+        slicer.close()
+
+
+def test_target_unit_leaves_non_electrical_streams_alone(scaled_nwb_path):
+    """The marker stream declares "n/a". It is not an ``ElectricalSeries``, so
+    the request does not reach it -- rather than erroring on a unit that was
+    never a voltage, or worse, scaling counts by 1e6."""
+    slicer = NWBSlicer(scaled_nwb_path, target_unit="volts", dejitter=False)
+    try:
+        info = slicer.get_stream_info("Marker")
+        assert info.unit == "n/a"
+        np.testing.assert_array_equal(info.dset[:], np.arange(MARKER_N, dtype=np.int16))
+    finally:
+        slicer.close()
+
+
+def test_target_unit_rejects_an_unplaceable_declared_unit(scaled_nwb_path):
+    """Converting needs a starting point. Passing the data through unconverted
+    while stamping it "volts" is the silently-wrong-units bug this module
+    exists to prevent, so this raises instead."""
+    with pytest.raises(ValueError, match="not a recognized voltage unit"):
+        NWBSlicer(scaled_nwb_path, unit_override="adc counts", target_unit="volts", dejitter=False).get_stream_info(
+            "Broadband"
+        )
+
+
+def test_target_unit_requires_apply_conversion(scaled_nwb_path):
+    """The two ask for opposite things; resolving that silently either way
+    would deliver a wrong scale under a confident label."""
+    with pytest.raises(ValueError, match="requires apply_conversion"):
+        NWBSlicer(scaled_nwb_path, apply_conversion=False, target_unit="volts", dejitter=False)
+
+
+def test_target_unit_flows_through_the_iterator(scaled_nwb_path, counts):
+    it = NWBAxisArrayIterator(
+        settings=NWBIteratorSettings(
+            filepath=str(scaled_nwb_path),
+            chunk_dur=0.2,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Broadband"],
+            dejitter=False,
+            target_unit=VoltageUnit.VOLTS,
+        )
+    )
+    try:
+        msgs = [msg for msg in it if msg.data.shape[0]]
+    finally:
+        it.close()
+    got = np.concatenate([m.data for m in msgs], axis=0)
+    assert msgs[0].attrs["unit"] == "volts"
+    np.testing.assert_allclose(got, expected(counts)[: got.shape[0]] * 1e-6, rtol=1e-6)
 
 
 # --- Through the iterator ---------------------------------------------------

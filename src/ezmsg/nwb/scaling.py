@@ -40,10 +40,18 @@ That is why the scaling resolved here is overridable per stream
 (``scale_override`` / ``unit_override``): honouring the file is the right
 default, but a caller who knows a particular writer lies needs to say so
 without patching the file.
+
+Separately from *what the file means*, a pipeline has an opinion about *what it
+wants on the wire*: ``target_unit`` converts a voltage stream to a requested
+:class:`VoltageUnit` on top of whatever the file (as corrected) turned out to
+be, so a graph can be written against microvolts and fed by files that disagree
+about their own scale. It applies only to electrical streams -- see
+:func:`convert_to_target_unit`.
 """
 
 from __future__ import annotations
 
+import enum
 import typing
 
 import h5py
@@ -51,12 +59,90 @@ import numpy as np
 
 from .util import as_text
 
-MICROVOLT_UNITS = frozenset({"microvolt", "microvolts", "uv", "µv", "μv"})
-"""Spellings of "microvolts" seen in the wild, lowercased.
+
+class VoltageUnit(str, enum.Enum):
+    """A unit a voltage stream can be delivered in.
+
+    Voltage only, and deliberately so: an ``ElectricalSeries`` is voltage by
+    definition (the NWB schema fixes its ``unit`` to ``volts``), so a prefix
+    change is the only conversion that is pure arithmetic on the samples.
+    Anything crossing a dimension -- volts to amperes, say -- needs a model of
+    the circuit, which belongs in a processing stage that can be told about it,
+    not in a file reader guessing from a label.
+
+    Subclasses ``str`` so settings can be given as plain strings and survive a
+    YAML round trip: ``VoltageUnit("microvolts") == "microvolts"``.
+    """
+
+    VOLTS = "volts"
+    MILLIVOLTS = "millivolts"
+    MICROVOLTS = "microvolts"
+    NANOVOLTS = "nanovolts"
+
+
+VOLTS_PER_UNIT: dict[VoltageUnit, float] = {
+    VoltageUnit.VOLTS: 1.0,
+    VoltageUnit.MILLIVOLTS: 1e-3,
+    VoltageUnit.MICROVOLTS: 1e-6,
+    VoltageUnit.NANOVOLTS: 1e-9,
+}
+"""How many volts one of each unit is. Ratios of these are the conversions."""
+
+VOLTAGE_UNIT_SPELLINGS: dict[str, VoltageUnit] = {
+    "v": VoltageUnit.VOLTS,
+    "volt": VoltageUnit.VOLTS,
+    "volts": VoltageUnit.VOLTS,
+    "mv": VoltageUnit.MILLIVOLTS,
+    "millivolt": VoltageUnit.MILLIVOLTS,
+    "millivolts": VoltageUnit.MILLIVOLTS,
+    "uv": VoltageUnit.MICROVOLTS,
+    "µv": VoltageUnit.MICROVOLTS,
+    "μv": VoltageUnit.MICROVOLTS,
+    "microvolt": VoltageUnit.MICROVOLTS,
+    "microvolts": VoltageUnit.MICROVOLTS,
+    "nv": VoltageUnit.NANOVOLTS,
+    "nanovolt": VoltageUnit.NANOVOLTS,
+    "nanovolts": VoltageUnit.NANOVOLTS,
+}
+"""Unit strings seen in the wild, lowercased, mapped to what they mean.
 
 Both micro signs are here on purpose: U+00B5 MICRO SIGN and U+03BC GREEK SMALL
 LETTER MU render identically and writers use both.
 """
+
+MICROVOLT_UNITS = frozenset(
+    spelling for spelling, unit in VOLTAGE_UNIT_SPELLINGS.items() if unit is VoltageUnit.MICROVOLTS
+)
+"""Spellings of "microvolts", lowercased."""
+
+
+def parse_voltage_unit(unit: str) -> typing.Optional[VoltageUnit]:
+    """The :class:`VoltageUnit` a declared unit string names, or None.
+
+    None for a string this module does not recognize *and* for the empty string,
+    which are different problems for the caller: see
+    :func:`convert_to_target_unit`.
+    """
+    return VOLTAGE_UNIT_SPELLINGS.get(unit.strip().lower())
+
+
+def coerce_voltage_unit(value: typing.Any) -> VoltageUnit:
+    """A :class:`VoltageUnit` from an enum member or any spelling of one.
+
+    So ``target_unit="uV"`` works as well as ``VoltageUnit.MICROVOLTS`` -- the
+    caller writing the setting should not have to know which spelling this
+    module canonicalized on.
+    """
+    if isinstance(value, VoltageUnit):
+        return value
+    parsed = parse_voltage_unit(str(value))
+    if parsed is None:
+        raise ValueError(
+            f"{value!r} does not name a voltage unit. Expected one of "
+            f"{[u.value for u in VoltageUnit]} (or an abbreviation: V, mV, uV, nV)."
+        )
+    return parsed
+
 
 DEFAULT_CONVERSION_DTYPE = "float32"
 """Output dtype once a gain has been applied.
@@ -156,6 +242,49 @@ def _override_for(override: typing.Any, key: str) -> typing.Any:
     return override
 
 
+def convert_to_target_unit(
+    gain: typing.Union[float, np.ndarray],
+    offset: float,
+    unit: str,
+    target: VoltageUnit,
+    *,
+    stream_key: str = "",
+) -> tuple[typing.Union[float, np.ndarray], float, str]:
+    """Fold a unit change into an already-resolved ``(gain, offset, unit)``.
+
+    The samples are ``data * gain + offset`` in *unit*; scaling both by the
+    ratio between the units leaves them in *target*. Offset included -- it is an
+    additive constant in the same unit as the values, so a conversion that
+    scaled only the gain would leave a stream with a non-zero offset wrong by a
+    power of ten, which is worse than not converting at all.
+
+    Applied after the overrides, on purpose: ``scale_override`` and
+    ``unit_override`` establish what the file *actually* holds, and this
+    converts from that to what the caller asked for. So a file that lies about
+    both can still be corrected once and then requested in any unit.
+
+    Raises ``ValueError`` when *unit* is a string this module cannot place --
+    the conversion needs a starting point, and passing the data through
+    unconverted while relabelling it *target* would manufacture exactly the
+    silently-wrong units the rest of this module exists to prevent. An empty
+    *unit* is the one exception: the NWB schema fixes ``ElectricalSeries.unit``
+    to ``volts``, so a writer that stamped nothing has told us volts by
+    omission.
+    """
+    declared = VoltageUnit.VOLTS if not unit.strip() else parse_voltage_unit(unit)
+    if declared is None:
+        where = f" on stream {stream_key!r}" if stream_key else ""
+        raise ValueError(
+            f"Cannot convert to {target.value}{where}: the file declares its unit as {unit!r}, "
+            f"which is not a recognized voltage unit. Pass unit_override to say what it really is, "
+            f"or leave target_unit unset to take the file's own scaling as-is."
+        )
+    ratio = VOLTS_PER_UNIT[declared] / VOLTS_PER_UNIT[target]
+    if ratio == 1.0:
+        return gain, offset, target.value
+    return gain * ratio, offset * ratio, target.value
+
+
 def read_stored_scaling(dset: typing.Any) -> tuple[float, float, str]:
     """``(conversion, offset, unit)`` as literally stored on a data dataset.
 
@@ -184,6 +313,8 @@ def resolve_scaling(
     *,
     scale_override: typing.Any = None,
     unit_override: typing.Any = None,
+    target_unit: typing.Any = None,
+    is_electrical: bool = False,
     stream_key: str = "",
 ) -> tuple[typing.Union[float, np.ndarray], float, str]:
     """Collapse a stream's stored scaling into one ``(gain, offset, unit)``.
@@ -195,9 +326,11 @@ def resolve_scaling(
 
     ``scale_override`` replaces the resolved gain outright, for a file whose
     recorded factors are known to be wrong; ``unit_override`` replaces only the
-    declared unit, for one whose number is right and whose label is not. Either
-    may be a bare value (applies to every stream) or a ``{stream_key: value}``
-    mapping.
+    declared unit, for one whose number is right and whose label is not.
+    ``target_unit`` then converts the result into the unit the caller wants,
+    and is honoured only when *is_electrical* -- a voltage stream is the only
+    one whose unit this module can reason about. Any of the three may be a bare
+    value (applies to every stream) or a ``{stream_key: value}`` mapping.
     """
     conversion, offset, unit = read_stored_scaling(dset)
 
@@ -220,6 +353,12 @@ def resolve_scaling(
     if forced_unit is not None:
         unit = str(forced_unit)
 
+    target = _override_for(target_unit, stream_key)
+    if target is not None and is_electrical:
+        gain, offset, unit = convert_to_target_unit(
+            gain, offset, unit, coerce_voltage_unit(target), stream_key=stream_key
+        )
+
     return gain, offset, unit
 
 
@@ -241,9 +380,11 @@ def maybe_scale(
     dtype: typing.Any = DEFAULT_CONVERSION_DTYPE,
     scale_override: typing.Any = None,
     unit_override: typing.Any = None,
+    target_unit: typing.Any = None,
+    is_electrical: bool = False,
     stream_key: str = "",
 ) -> tuple[typing.Any, str]:
-    """``(dataset, declared_unit)`` with the stored scaling applied on read.
+    """``(dataset, unit)`` with the stored scaling applied on read.
 
     Returns *dset* unwrapped and unchanged when the resolved scaling is the
     identity, or when *dset* is not an h5py dataset (a materialized text column
@@ -256,6 +397,8 @@ def maybe_scale(
         channel_conversion,
         scale_override=scale_override,
         unit_override=unit_override,
+        target_unit=target_unit,
+        is_electrical=is_electrical,
         stream_key=stream_key,
     )
     if is_identity_scaling(gain, offset):

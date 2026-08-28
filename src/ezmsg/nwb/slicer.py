@@ -26,7 +26,7 @@ from .clockmodel import (
     group_clocks,
     reconstruct_group,
 )
-from .scaling import DEFAULT_CONVERSION_DTYPE, maybe_scale, unwrap_dataset
+from .scaling import DEFAULT_CONVERSION_DTYPE, VoltageUnit, maybe_scale, unwrap_dataset
 from .util import ReferenceClockType, as_text, as_text_array
 
 # Default gap threshold as a fraction of the nominal sample period (1.5x period).
@@ -123,11 +123,13 @@ class StreamInfo:
     """Reference to the interval table (events only)."""
 
     unit: str = ""
-    """Unit this stream declares on disk, verbatim (``""`` when it declares none).
+    """Unit the data read from this stream is in (``""`` when unknown).
 
-    Verbatim because it is frequently wrong -- see :mod:`~ezmsg.nwb.scaling`.
-    Reported rather than interpreted, so a caller can decide what to trust; it
-    is also copied onto each message's ``attrs["unit"]``.
+    The file's own string verbatim by default, because it is frequently wrong
+    and interpreting it would hide that -- see :mod:`~ezmsg.nwb.scaling`. It is
+    the requested unit instead when ``target_unit`` converted the stream, since
+    then it describes the numbers rather than the file. Either way it is copied
+    onto each message's ``attrs["unit"]``.
     """
 
 
@@ -288,6 +290,15 @@ class NWBSlicer:
         unit_override: Replace the declared unit string without touching the
             gain, for a file whose number is right and whose label is not. Same
             bare-value-or-mapping form as ``scale_override``.
+        target_unit: Deliver electrical streams in this
+            :class:`~ezmsg.nwb.scaling.VoltageUnit` (accepts any spelling of
+            one) regardless of the unit the file works in, so a graph written
+            against, say, microvolts is fed the same numbers by files that
+            disagree about their own scale. Applied *after* the two overrides,
+            so a file that lies can be corrected and converted in one pass.
+            Ignored for non-electrical streams, whose units this reader has no
+            basis to reason about. ``None`` (default) delivers the file's own
+            unit. Requires ``apply_conversion``.
     """
 
     disk_cache = remfile.DiskCache(str(Path("~").expanduser() / ".ezmsg" / "nwb-cache"))
@@ -311,6 +322,7 @@ class NWBSlicer:
         conversion_dtype: str = DEFAULT_CONVERSION_DTYPE,
         scale_override: typing.Union[float, dict[str, float], None] = None,
         unit_override: typing.Union[str, dict[str, str], None] = None,
+        target_unit: typing.Union[str, VoltageUnit, dict[str, typing.Union[str, VoltageUnit]], None] = None,
     ):
         self._filepath = filepath
         self._reference_clock = reference_clock
@@ -326,6 +338,15 @@ class NWBSlicer:
         self._conversion_dtype = conversion_dtype
         self._scale_override = scale_override
         self._unit_override = unit_override
+        if target_unit is not None and not apply_conversion:
+            # Raise rather than pick one: the two say opposite things about what
+            # should come out, and either silent resolution is a wrong-units bug
+            # of the kind this whole path exists to make impossible.
+            raise ValueError(
+                "target_unit requires apply_conversion=True: raw stored samples are counts, "
+                "which cannot be converted to a voltage unit."
+            )
+        self._target_unit = target_unit
 
         self._io: pynwb.NWBHDF5IO | None = None
         self._ts_off: float = 0.0
@@ -526,6 +547,11 @@ class NWBSlicer:
                     dtype=self._conversion_dtype,
                     scale_override=self._scale_override,
                     unit_override=self._unit_override,
+                    target_unit=self._target_unit,
+                    # Asked of the object, not of the declared unit: the unit
+                    # string is the thing we don't trust, whereas being an
+                    # ElectricalSeries is a structural fact about the file.
+                    is_electrical=isinstance(child, pynwb.ecephys.ElectricalSeries),
                     stream_key=matched_key,
                 )
 
@@ -928,9 +954,17 @@ class NWBSlicer:
     # --- Lifecycle ---
 
     def close(self) -> None:
-        """Close the underlying HDF5 file."""
-        if self._io is not None:
-            self._io.close()
+        """Close the underlying HDF5 file.
+
+        ``getattr`` rather than ``self._io``: ``__del__`` also runs on an object
+        whose ``__init__`` raised (an unusable argument combination, say), and
+        that object never reached the assignment. Reading the attribute directly
+        turns the real error into an ``AttributeError`` raised from a destructor,
+        where it surfaces as an unrelated warning at an unrelated time.
+        """
+        io = getattr(self, "_io", None)
+        if io is not None:
+            io.close()
             self._io = None
 
     def __del__(self) -> None:

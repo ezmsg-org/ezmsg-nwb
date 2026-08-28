@@ -12,7 +12,7 @@ from ezmsg.baseproc.protocols import processor_state
 from ezmsg.baseproc.units import BaseClockDrivenUnit
 from ezmsg.util.messages.axisarray import AxisArray, LinearAxis
 
-from .scaling import DEFAULT_CONVERSION_DTYPE
+from .scaling import DEFAULT_CONVERSION_DTYPE, VoltageUnit
 from .slicer import DEFAULT_GAP_TOL, NWBSlicer
 from .util import ReferenceClockType
 
@@ -70,6 +70,11 @@ class NWBClockDrivenSettings(ClockDrivenSettings):
     unit_override: typing.Union[str, dict[str, str], None] = None
     """Replace the declared unit string without changing the gain (forwarded to
     ``NWBSlicer``). Bare value or ``{stream_key: value}``."""
+    target_unit: typing.Union[str, VoltageUnit, dict[str, typing.Union[str, VoltageUnit]], None] = None
+    """Deliver electrical streams in this unit whatever the file works in
+    (forwarded to ``NWBSlicer``), so replayed messages match the scale a live
+    acquisition source emits. ``None`` emits the file's own unit. Bare value or
+    ``{stream_key: value}``; requires ``apply_conversion``."""
 
 
 @processor_state
@@ -170,6 +175,7 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
             conversion_dtype=self.settings.conversion_dtype,
             scale_override=self.settings.scale_override,
             unit_override=self.settings.unit_override,
+            target_unit=self.settings.target_unit,
         )
         self._state.slicer = slicer
 
