@@ -15,6 +15,7 @@ from ezmsg.baseproc.clock import Clock, ClockSettings
 from ezmsg.util.messagecodec import message_log
 from ezmsg.util.messagelogger import MessageLogger, MessageLoggerSettings
 from ezmsg.util.messages.axisarray import AxisArray
+from ezmsg.util.messages.util import replace
 from ezmsg.util.terminate import (
     TerminateOnTimeout,
     TerminateOnTimeoutSettings,
@@ -195,17 +196,27 @@ def test_writer_roundtrip_continuous(test_nwb_path):
     it2 = NWBAxisArrayIterator(read_settings)
     read_msgs = list(it2)
 
-    outpath.unlink(missing_ok=True)
-
     total_written = sum(m.data.shape[0] for m in src_msgs)
     total_read = sum(m.data.shape[0] for m in read_msgs)
     assert total_read == total_written
     assert read_msgs[0].data.shape[1] == 8
 
-    # Verify data content matches
+    # Verify data content matches. NWBSink declares ``conversion=1e-6`` on every
+    # series it writes -- "the values handed to me are microvolts, multiply by
+    # this for volts" -- and the reader now honours that, so a round trip returns
+    # volts, not the microvolts that went in. Asserting the factor rather than
+    # equality is what makes the sink's declaration part of the contract instead
+    # of a comment nobody reads.
     src_data = np.concatenate([m.data for m in src_msgs], axis=0)
     read_data = np.concatenate([m.data for m in read_msgs], axis=0)
-    np.testing.assert_array_almost_equal(src_data, read_data)
+    np.testing.assert_allclose(read_data, src_data * 1e-6, rtol=1e-6)
+
+    # Same file read as stored: the samples themselves are untouched on disk.
+    it3 = NWBAxisArrayIterator(replace(read_settings, apply_conversion=False))
+    stored = np.concatenate([m.data for m in it3], axis=0)
+    np.testing.assert_array_almost_equal(stored, src_data)
+
+    outpath.unlink(missing_ok=True)
 
 
 def test_writer_empty_file_deleted():

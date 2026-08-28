@@ -21,6 +21,11 @@ from .pipeline_settings import (
     PipelineSettingsTableCollectionSettings as PipelineSettingsTableCollectionSettings,
 )
 from .reader import NWBIteratorUnit as NWBIteratorUnit
+from .scaling import DEFAULT_CONVERSION_DTYPE as DEFAULT_CONVERSION_DTYPE
+from .scaling import MICROVOLT_UNITS as MICROVOLT_UNITS
+from .scaling import ScaledDataset as ScaledDataset
+from .scaling import read_stored_scaling as read_stored_scaling
+from .scaling import resolve_scaling as resolve_scaling
 from .slicer import NWBSlicer as NWBSlicer
 from .util import ReferenceClockType as ReferenceClockType
 from .util import as_text as as_text

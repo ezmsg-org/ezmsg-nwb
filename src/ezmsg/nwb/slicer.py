@@ -26,6 +26,7 @@ from .clockmodel import (
     group_clocks,
     reconstruct_group,
 )
+from .scaling import DEFAULT_CONVERSION_DTYPE, maybe_scale, unwrap_dataset
 from .util import ReferenceClockType, as_text, as_text_array
 
 # Default gap threshold as a fraction of the nominal sample period (1.5x period).
@@ -120,6 +121,14 @@ class StreamInfo:
 
     table_ref: typing.Any = None
     """Reference to the interval table (events only)."""
+
+    unit: str = ""
+    """Unit this stream declares on disk, verbatim (``""`` when it declares none).
+
+    Verbatim because it is frequently wrong -- see :mod:`~ezmsg.nwb.scaling`.
+    Reported rather than interpreted, so a caller can decide what to trust; it
+    is also copied onto each message's ``attrs["unit"]``.
+    """
 
 
 def _extract_timeseries_from_container(container, address: str | None = None) -> list[tuple[str, pynwb.TimeSeries]]:
@@ -261,6 +270,24 @@ class NWBSlicer:
             segment is reconstructed independently) so the iterator still splits a
             chunk there. Pass ``float("inf")`` to disable the guard and smooth
             everything. Ignored when ``dejitter`` is False.
+        apply_conversion: Apply each stream's stored ``conversion`` /
+            ``channel_conversion`` / ``offset`` on read (default True), so the
+            data comes out in the unit the file declares rather than as raw ADC
+            counts. See :mod:`~ezmsg.nwb.scaling`. Set False to read the stored
+            integers unchanged -- the pre-1.9 behaviour, and the only way to
+            reproduce a result computed under it.
+        conversion_dtype: Output dtype for streams that get scaled
+            (default ``float32``). Ignored when ``apply_conversion`` is False,
+            and for any stream whose scaling is the identity: those keep their
+            stored dtype, since there is nothing to compute.
+        scale_override: Replace the resolved gain for a file whose recorded
+            conversion factors are wrong (they occur; see
+            :mod:`~ezmsg.nwb.scaling`). A float applies to every stream, a
+            ``{stream_key: float}`` mapping to the named ones. ``None`` (default)
+            honours the file.
+        unit_override: Replace the declared unit string without touching the
+            gain, for a file whose number is right and whose label is not. Same
+            bare-value-or-mapping form as ``scale_override``.
     """
 
     disk_cache = remfile.DiskCache(str(Path("~").expanduser() / ".ezmsg" / "nwb-cache"))
@@ -280,6 +307,10 @@ class NWBSlicer:
         clock_groups: typing.Optional[list[list[str]]] = None,
         dejitter_cache: bool = True,
         real_gap_threshold: typing.Optional[float] = None,
+        apply_conversion: bool = True,
+        conversion_dtype: str = DEFAULT_CONVERSION_DTYPE,
+        scale_override: typing.Union[float, dict[str, float], None] = None,
+        unit_override: typing.Union[str, dict[str, str], None] = None,
     ):
         self._filepath = filepath
         self._reference_clock = reference_clock
@@ -291,6 +322,10 @@ class NWBSlicer:
         self._clock_groups = clock_groups
         self._dejitter_cache = dejitter_cache
         self._real_gap_threshold = real_gap_threshold
+        self._apply_conversion = apply_conversion
+        self._conversion_dtype = conversion_dtype
+        self._scale_override = scale_override
+        self._unit_override = unit_override
 
         self._io: pynwb.NWBHDF5IO | None = None
         self._ts_off: float = 0.0
@@ -480,6 +515,20 @@ class NWBSlicer:
             # order of the interval tables already read whole just above.
             dset = as_text_array(child.data[:]) if _is_bytes_text(child.data) else child.data
 
+            # Wrap the dataset rather than converting at each call site: every
+            # read path here and in the iterator goes through ``info.dset``, so
+            # one wrapper covers all of them and none can forget.
+            unit = ""
+            if self._apply_conversion:
+                dset, unit = maybe_scale(
+                    dset,
+                    getattr(child, "channel_conversion", None),
+                    dtype=self._conversion_dtype,
+                    scale_override=self._scale_override,
+                    unit_override=self._unit_override,
+                    stream_key=matched_key,
+                )
+
             self._streams[matched_key] = StreamInfo(
                 dset=dset,
                 template=AxisArray(
@@ -488,6 +537,10 @@ class NWBSlicer:
                     if child.data.ndim > 1
                     else ["time"],
                     axes=axes,
+                    # The unit each message is in, as the file declares it. Only
+                    # meaningful once the conversion has been applied, so it is
+                    # absent (not "counts") when it has not.
+                    attrs={"unit": unit} if unit else {},
                     key=matched_key,
                 ),
                 fs=rate,
@@ -501,6 +554,7 @@ class NWBSlicer:
                 has_timestamps=has_timestamps,
                 is_event=False,
                 table_ref=None,
+                unit=unit,
             )
 
         self._start_time = start_time
@@ -521,7 +575,13 @@ class NWBSlicer:
         a re-timestamped fixed-rate acquisition. Non-datasets (materialized text
         arrays) and any error yield None, so the caller falls back to the name
         convention rather than crashing.
+
+        Unwrapped first: a scaled stream's ``dset`` is a wrapper, and taking one
+        at face value would report None for both members of every pair, quietly
+        demoting this structural check to the name convention it exists to back
+        up.
         """
+        dset = unwrap_dataset(dset)
         try:
             if isinstance(dset, h5py.Dataset):
                 return int(h5py.h5o.get_info(dset.id).addr)

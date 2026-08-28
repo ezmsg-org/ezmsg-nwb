@@ -12,6 +12,7 @@ from ezmsg.baseproc.protocols import processor_state
 from ezmsg.baseproc.units import BaseClockDrivenUnit
 from ezmsg.util.messages.axisarray import AxisArray, LinearAxis
 
+from .scaling import DEFAULT_CONVERSION_DTYPE
 from .slicer import DEFAULT_GAP_TOL, NWBSlicer
 from .util import ReferenceClockType
 
@@ -56,6 +57,19 @@ class NWBClockDrivenSettings(ClockDrivenSettings):
     real_gap_threshold: typing.Optional[float] = None
     """Real-gap guard threshold in seconds (forwarded to ``NWBSlicer``). ``None``
     auto-derives per stream; ``float("inf")`` disables the guard."""
+    apply_conversion: bool = True
+    """Apply the stream's stored ``conversion``/``channel_conversion``/``offset``
+    on read (forwarded to ``NWBSlicer``), so replayed messages carry the unit the
+    file declares -- the same unit a live acquisition source would emit -- instead
+    of raw ADC counts. See :mod:`~ezmsg.nwb.scaling`."""
+    conversion_dtype: str = DEFAULT_CONVERSION_DTYPE
+    """Output dtype for a scaled stream (forwarded to ``NWBSlicer``)."""
+    scale_override: typing.Union[float, dict[str, float], None] = None
+    """Replace the resolved gain for a file whose recorded conversion factors are
+    wrong (forwarded to ``NWBSlicer``). Bare value or ``{stream_key: value}``."""
+    unit_override: typing.Union[str, dict[str, str], None] = None
+    """Replace the declared unit string without changing the gain (forwarded to
+    ``NWBSlicer``). Bare value or ``{stream_key: value}``."""
 
 
 @processor_state
@@ -152,6 +166,10 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
             clock_groups=self.settings.clock_groups,
             dejitter_cache=self.settings.dejitter_cache,
             real_gap_threshold=self.settings.real_gap_threshold,
+            apply_conversion=self.settings.apply_conversion,
+            conversion_dtype=self.settings.conversion_dtype,
+            scale_override=self.settings.scale_override,
+            unit_override=self.settings.unit_override,
         )
         self._state.slicer = slicer
 
