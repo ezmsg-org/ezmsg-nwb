@@ -27,7 +27,7 @@ from .clockmodel import (
     reconstruct_group,
 )
 from .scaling import SCALING_ATTR, StreamScaling, describe_stream_scaling
-from .util import ReferenceClockType, as_text, as_text_array
+from .util import ReferenceClockType, as_text, as_text_array, interval_median
 
 # Default gap threshold as a fraction of the nominal sample period (1.5x period).
 # Sits between neural-data jitter (<~1.05x) and the smallest real gap (one dropped
@@ -40,34 +40,6 @@ DEFAULT_GAP_TOL = 0.5
 # excursion that pairs with one -- none of which describe the sample period.
 RATE_TRIM_LO = 0.5
 RATE_TRIM_HI = 1.5
-
-
-MEDIAN_SUBSAMPLE_MAX = 100_000
-"""Above this many intervals, estimate the median from a strided subsample.
-
-``np.median`` partitions the whole array: 45 ms on a recording-hour of 30 kHz
-timestamps, and it runs once per stream at open. The median here is only ever a
-*centre* for a trim window or a scale for a variance comparison -- never the
-returned estimate, which is a mean over the surviving intervals -- so it needs
-to be in the right place, not exact.
-
-And it lands in exactly the same place. Timestamps arrive on a quantisation
-grid, so the median snaps to a grid point that a stride cannot move: on a real
-7.09M-interval stream, strides of 16 through 1024 all give 3.3301000002e-05,
-and :func:`infer_nominal_rate` returns 30147.9172 from every one of them.
-"""
-
-
-def _fast_median(values: np.ndarray) -> float:
-    """``np.median``, on a strided subsample once the array is large enough.
-
-    Strided rather than random or head-of-array: a stride samples the whole
-    recording, so a stream whose intervals differ between its start and its end
-    is represented across the estimate rather than by whichever part was read.
-    """
-    if values.size > MEDIAN_SUBSAMPLE_MAX:
-        values = values[:: -(-values.size // MEDIAN_SUBSAMPLE_MAX)]
-    return float(np.median(values))
 
 
 def infer_nominal_rate(dts: np.ndarray) -> float:
@@ -94,7 +66,7 @@ def infer_nominal_rate(dts: np.ndarray) -> float:
     """
     if dts.size == 0:
         return 0.0
-    median = _fast_median(dts)
+    median = interval_median(dts)
     if not np.isfinite(median) or median <= 0.0:
         return 0.0
     core = dts[(dts > RATE_TRIM_LO * median) & (dts < RATE_TRIM_HI * median)]
@@ -468,7 +440,7 @@ class NWBSlicer:
                     # ``np.var`` twice was two full passes to evaluate one
                     # ``or``; the second only ran when the first failed, but it
                     # ran on every irregular stream, which is the slow case.
-                    if variance < 1e-3 or variance < 0.05 * _fast_median(dts):
+                    if variance < 1e-3 or variance < 0.05 * interval_median(dts):
                         rate = infer_nominal_rate(dts)
                     else:
                         rate = 0.0
