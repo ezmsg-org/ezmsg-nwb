@@ -43,3 +43,33 @@ def build_nwb_fname(metadata: DeepDict) -> str:
     ses = metadata["NWBFile"].get("session_id", metadata["NWBFile"]["session_start_time"].strftime("%Y%m%dT%H%M%S"))
     fname_str += f"_ses-{ses}"
     return f"{fname_str}_ephys.nwb"
+
+
+MEDIAN_SUBSAMPLE_MAX = 100_000
+"""Above this many values, :func:`interval_median` uses a strided subsample.
+
+``np.median`` partitions the whole array -- 45 ms on a recording-hour of 30 kHz
+inter-sample intervals -- and the open path does it several times per stream:
+once to infer a nominal rate, once per stream to derive a real-gap threshold.
+"""
+
+
+def interval_median(values: np.ndarray) -> float:
+    """Median of a set of *inter-sample intervals*, cheaply.
+
+    For intervals specifically, and not for residuals or other continuous
+    quantities: timestamps arrive on a device's quantisation grid, so their
+    differences cluster onto that grid and the median snaps to a grid point a
+    stride cannot move. On a real 7.09M-interval stream, strides of 16 through
+    1024 all return 3.3301000002e-05. That is what makes the shortcut exact here
+    and not elsewhere -- a median of fit residuals, say, is a continuous
+    quantity with no grid to snap to, and subsampling it would genuinely change
+    the answer.
+
+    Strided rather than random or head-of-array: a stride samples the whole
+    recording, so a stream whose intervals differ between its start and its end
+    is represented across the estimate rather than by whichever part was read.
+    """
+    if values.size > MEDIAN_SUBSAMPLE_MAX:
+        values = values[:: -(-values.size // MEDIAN_SUBSAMPLE_MAX)]
+    return float(np.median(values))

@@ -43,6 +43,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .util import interval_median
+
 DEFAULT_DEJITTER_KNOTS = 40
 """Number of knots for the piecewise-linear fit. ~40 over a multi-million-sample
 stream puts a knot every few seconds -- fine enough to track sub-millisecond
@@ -214,7 +216,7 @@ def _nominal_period(times: np.ndarray) -> float:
     the median is unmoved by them)."""
     if times.shape[0] < 2:
         return 0.0
-    return float(np.median(np.diff(times)))
+    return interval_median(np.diff(times))
 
 
 def _auto_gap_threshold(times: np.ndarray) -> float:
@@ -230,7 +232,13 @@ def _auto_gap_threshold(times: np.ndarray) -> float:
     dt = np.diff(np.asarray(times, dtype=float))
     if dt.size == 0:
         return np.inf
-    period = float(np.median(dt))
+    period = interval_median(dt)
+    # The percentile stays on the full array. It is the one statistic here that a
+    # subsample genuinely moves: the 99.9th percentile of 200k values rests on
+    # their top 200 rather than on 7000, which shifted this threshold by 1.4% on
+    # a real stream. The threshold decides which jumps count as real gaps, so a
+    # shift there re-segments the stream and re-times its samples -- a behaviour
+    # change, not a speedup.
     envelope = float(np.percentile(np.abs(dt - period), GAP_ENVELOPE_PCT))
     return period + max(GAP_MIN_S, GAP_ENVELOPE_MULT * envelope)
 

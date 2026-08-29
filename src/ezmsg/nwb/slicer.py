@@ -26,7 +26,8 @@ from .clockmodel import (
     group_clocks,
     reconstruct_group,
 )
-from .util import ReferenceClockType, as_text, as_text_array
+from .scaling import SCALING_ATTR, StreamScaling, describe_stream_scaling
+from .util import ReferenceClockType, as_text, as_text_array, interval_median
 
 # Default gap threshold as a fraction of the nominal sample period (1.5x period).
 # Sits between neural-data jitter (<~1.05x) and the smallest real gap (one dropped
@@ -65,7 +66,7 @@ def infer_nominal_rate(dts: np.ndarray) -> float:
     """
     if dts.size == 0:
         return 0.0
-    median = float(np.median(dts))
+    median = interval_median(dts)
     if not np.isfinite(median) or median <= 0.0:
         return 0.0
     core = dts[(dts > RATE_TRIM_LO * median) & (dts < RATE_TRIM_HI * median)]
@@ -120,6 +121,17 @@ class StreamInfo:
 
     table_ref: typing.Any = None
     """Reference to the interval table (events only)."""
+
+    scaling: typing.Optional[StreamScaling] = None
+    """What this stream's stored samples mean -- gain, offset, and the unit they
+    would be in once those are applied.
+
+    The file's own numbers verbatim, including its unit string, which is
+    frequently wrong; interpreting it here would hide that. Correcting and
+    applying it is :mod:`~ezmsg.nwb.convert`'s job. Copied onto every message's
+    ``attrs[SCALING_ATTR]``. None only for text streams, which have no scaling
+    to describe.
+    """
 
 
 def _extract_timeseries_from_container(container, address: str | None = None) -> list[tuple[str, pynwb.TimeSeries]]:
@@ -261,6 +273,14 @@ class NWBSlicer:
             segment is reconstructed independently) so the iterator still splits a
             chunk there. Pass ``float("inf")`` to disable the guard and smooth
             everything. Ignored when ``dejitter`` is False.
+    Note:
+        Data comes back as the file stores it -- integer ADC counts, typically,
+        not the unit the file declares. Every message carries what it takes to
+        convert under ``attrs[SCALING_ATTR]``; put a
+        :class:`~ezmsg.nwb.convert.NWBScalingUnit` in the graph (or call
+        :class:`~ezmsg.nwb.convert.NWBScalingTransformer` directly) to apply it.
+        Doing it there rather than here is both cleaner and marginally faster --
+        see :mod:`~ezmsg.nwb.scaling`.
     """
 
     disk_cache = remfile.DiskCache(str(Path("~").expanduser() / ".ezmsg" / "nwb-cache"))
@@ -416,7 +436,11 @@ class NWBSlicer:
                     rate = child.timestamps.attrs["rate"]
                 else:
                     dts = np.diff(child.timestamps[:])
-                    if np.var(dts) < 1e-3 or np.var(dts) < 0.05 * np.median(dts):
+                    variance = float(np.var(dts))
+                    # ``np.var`` twice was two full passes to evaluate one
+                    # ``or``; the second only ran when the first failed, but it
+                    # ran on every irregular stream, which is the slow case.
+                    if variance < 1e-3 or variance < 0.05 * interval_median(dts):
                         rate = infer_nominal_rate(dts)
                     else:
                         rate = 0.0
@@ -455,16 +479,25 @@ class NWBSlicer:
                 # otherwise an ElectricalSeries that references a
                 # strict subset of the electrodes table produces a
                 # ch-axis whose length does not match data.shape[1].
+                # One column, not the whole table. ``to_dataframe()`` materializes
+                # every electrode column into pandas -- position, group, filtering,
+                # whatever the writer stored -- to read one of them, and it costs
+                # ~12 ms per electrical series at open. Indexing the column
+                # directly is the same values for a thirtieth of the work.
                 region_idx = np.asarray(child.electrodes.data)
-                full_df = child.electrodes.table.to_dataframe()
-                el_df = full_df.iloc[region_idx]
-                if "label" in el_df.columns:
+                table = child.electrodes.table
+                if "label" in table.colnames:
                     # Decoded here, at the read boundary: these labels become the
                     # ch-axis coordinates every downstream name-based channel
                     # selection matches against.
-                    ch_labels = as_text_array(el_df["label"].values)
+                    ch_labels = as_text_array(np.asarray(table["label"].data[:])[region_idx])
                 else:
-                    ch_labels = np.array([f"ch_{idx}" for idx in el_df.index.tolist()])
+                    # ``to_dataframe`` indexes by the table's ``id`` column, so the
+                    # fallback names must come from ``id`` too -- not from the
+                    # positional indices, which coincide with it only when the
+                    # series references the whole table in order.
+                    ids = np.asarray(table.id.data[:])[region_idx]
+                    ch_labels = np.array([f"ch_{idx}" for idx in ids.tolist()])
                 axes["ch"] = AxisArray.CoordinateAxis(data=ch_labels, dims=["ch"])
 
             # ``matched_key`` is the user-facing key — equal to ``child.name``
@@ -480,6 +513,17 @@ class NWBSlicer:
             # order of the interval tables already read whole just above.
             dset = as_text_array(child.data[:]) if _is_bytes_text(child.data) else child.data
 
+            # Described, not applied: the reader's job is to say what the
+            # stored samples mean, and ``NWBScalingUnit``'s is to act on it.
+            scaling = describe_stream_scaling(
+                dset,
+                getattr(child, "channel_conversion", None),
+                # One of the two things that make a stream convertible; the
+                # other is its declared unit, which is what covers voltage
+                # written as a plain TimeSeries. See ``is_voltage_stream``.
+                is_electrical=isinstance(child, pynwb.ecephys.ElectricalSeries),
+            )
+
             self._streams[matched_key] = StreamInfo(
                 dset=dset,
                 template=AxisArray(
@@ -488,6 +532,11 @@ class NWBSlicer:
                     if child.data.ndim > 1
                     else ["time"],
                     axes=axes,
+                    # No ``unit``: the data is stored counts, and calling counts
+                    # volts is the whole bug. ``nwb_scaling`` says what they
+                    # would become, and the transformer stamps ``unit`` once it
+                    # has actually made them that.
+                    attrs={SCALING_ATTR: scaling.as_attr()} if scaling is not None else {},
                     key=matched_key,
                 ),
                 fs=rate,
@@ -501,6 +550,7 @@ class NWBSlicer:
                 has_timestamps=has_timestamps,
                 is_event=False,
                 table_ref=None,
+                scaling=scaling,
             )
 
         self._start_time = start_time
@@ -868,9 +918,17 @@ class NWBSlicer:
     # --- Lifecycle ---
 
     def close(self) -> None:
-        """Close the underlying HDF5 file."""
-        if self._io is not None:
-            self._io.close()
+        """Close the underlying HDF5 file.
+
+        ``getattr`` rather than ``self._io``: ``__del__`` also runs on an object
+        whose ``__init__`` raised (an unusable argument combination, say), and
+        that object never reached the assignment. Reading the attribute directly
+        turns the real error into an ``AttributeError`` raised from a destructor,
+        where it surfaces as an unrelated warning at an unrelated time.
+        """
+        io = getattr(self, "_io", None)
+        if io is not None:
+            io.close()
             self._io = None
 
     def __del__(self) -> None:
