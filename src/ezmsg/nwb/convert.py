@@ -1,10 +1,10 @@
 """Apply an NWB stream's scaling downstream, instead of at the reader.
 
-:class:`~ezmsg.nwb.slicer.NWBSlicer` applies a file's conversion on read by
-default. Passing ``apply_conversion=False`` defers it, and this is what picks it
-up later in the graph: every message carries the factors under
-``nwb_scaling_*`` attrs (see :mod:`~ezmsg.nwb.scaling`), so a stage far from the
-file can still do exactly what the reader would have.
+:class:`~ezmsg.nwb.slicer.NWBSlicer` never applies a file's conversion -- it
+hands back the stored integers and describes them, carrying the factors under
+``nwb_scaling_*`` attrs (see :mod:`~ezmsg.nwb.scaling`). This is what picks them
+up later in the graph, so a stage far from the file can do exactly what the
+reader would have.
 
 Why defer at all? Reading raw is the only way to keep a broadband stream int16
 through the parts of a graph that do not care about units. Scaling at the reader
@@ -39,11 +39,13 @@ from ezmsg.util.messages.util import replace
 
 from .scaling import (
     DEFAULT_CONVERSION_DTYPE,
+    SCALING_ATTRS,
     StreamScaling,
     VoltageUnit,
     coerce_voltage_unit,
     convert_to_target_unit,
     is_identity_scaling,
+    is_voltage_stream,
     override_for,
     scaling_fingerprint,
     unit_ratio,
@@ -67,9 +69,30 @@ class NWBScalingSettings(ez.Settings):
     unit_override: typing.Union[str, dict[str, str], None] = None
     """Replace the reported unit without changing the gain. Same form."""
     target_unit: typing.Union[str, VoltageUnit, dict[str, typing.Union[str, VoltageUnit]], None] = None
-    """Deliver voltage streams in this unit. Same form. Unlike the other two
-    this also applies to messages the reader already scaled, since a prefix
-    change on top of a known unit is well defined."""
+    """Deliver voltage streams in this unit. Same form. Unlike the other two this
+    also applies to a message that was already scaled and carries only its
+    ``unit``, since a prefix change on top of a known unit is well defined."""
+
+
+def _scaling_from_unit(attrs: typing.Mapping[str, typing.Any]) -> typing.Optional[StreamScaling]:
+    """Treat a message that declares only a ``unit`` as already-scaled.
+
+    Once this transformer has run it strips the ``nwb_scaling_*`` keys and leaves
+    ``unit`` behind, so a second one downstream has nothing else to go on. That is
+    enough for the only operation still meaningful at that point: ``target_unit``
+    is a prefix change on top of a known unit, which needs the unit and nothing
+    else. The gain and offset it would have read are the *file's*, describing
+    stored counts that no longer exist -- which is exactly why they are dropped.
+
+    Returns None for a unit that is not a voltage, so a ``pixels`` stream is left
+    alone rather than reinterpreted.
+    """
+    unit = attrs.get("unit")
+    if not unit or not is_voltage_stream(str(unit), is_electrical=False):
+        return None
+    # gain/offset are the identity: the values are already in ``unit``, and a
+    # retarget scales them from there. Nothing here claims to describe counts.
+    return StreamScaling(gain=1.0, offset=0.0, unit=str(unit), applied=True, voltage=True)
 
 
 @dataclass
@@ -121,16 +144,24 @@ class NWBScalingState:
 class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArray, AxisArray, NWBScalingState]):
     """Apply the scaling a message reports, and update what it reports.
 
-    Idempotent: it acts on the message's ``applied`` flag rather than on its
-    dtype, so two of these in a chain, or one behind a reader that already
-    converted, cannot double-scale. That property is the reason the flag exists
-    -- without it, "has this been scaled?" would have to be guessed from whether
-    the data looks like integers, which is exactly the kind of inference that
-    makes wrong units silent.
+    Idempotent, and structurally so: applying a scaling *consumes* it. The
+    output carries no ``nwb_scaling_*`` keys, so a second of these in a chain
+    finds nothing pending and has nothing to double-apply. Never inferred from
+    the dtype -- "does this look like integers?" is exactly the kind of guess
+    that makes wrong units silent.
 
-    A message with no ``nwb_scaling_*`` attrs passes through untouched: it did
-    not come from an NWB reader, and inventing a scaling for it would be worse
-    than doing nothing.
+    What it emits is ``unit`` and nothing else from this module. ``gain`` and
+    ``offset`` described stored counts, and the multiply consumed them; a filter
+    or a decimation downstream makes them less true still, so carrying them
+    would hand a later stage a factor that looks authoritative and reconstructs
+    nothing. Re-digitizing is a genuine need, but it happens after
+    transformations those numbers never saw and so takes its range and
+    resolution from the caller.
+
+    A message with no ``nwb_scaling_*`` attrs and no ``unit`` passes through
+    untouched: it did not come from an NWB reader, and inventing a scaling for
+    it would be worse than doing nothing. One that kept its ``unit`` is still
+    retargetable -- see :func:`_scaling_from_unit`.
 
     State is a plan per stream key, not a single current plan, because one
     reader publishes every stream on one output: with a single plan, two
@@ -174,7 +205,7 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
         plans[message.key] = self._build_plan(message, fingerprint)
 
     def _build_plan(self, message: AxisArray, fingerprint: typing.Optional[tuple]) -> _Plan:
-        scaling = StreamScaling.from_attrs(message.attrs)
+        scaling = StreamScaling.from_attrs(message.attrs) or _scaling_from_unit(message.attrs)
         if scaling is None:
             return _Plan(source=None, attrs_ref=message.attrs, out_attrs=message.attrs, passthrough=True)
         requested = override_for(self.settings.target_unit, message.key)
@@ -188,7 +219,21 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
             return _Plan(source=fingerprint, attrs_ref=message.attrs, out_attrs=message.attrs, passthrough=True)
 
         gain, offset, final = resolved
-        out_attrs = {**message.attrs, "unit": final.unit, **final.as_attrs()}
+        # The scaling is spent: drop it and keep only what the data now is.
+        #
+        # ``gain`` and ``offset`` describe stored counts -> values. Once the
+        # multiply has happened those counts are gone, and every later stage --
+        # a filter, a decimation, a re-reference -- makes them less true still.
+        # Carrying them would offer a downstream consumer a factor that looks
+        # authoritative and reconstructs nothing. Re-digitizing is a real need,
+        # but it happens after transformations these numbers never saw, so it
+        # takes its range and resolution from the caller instead.
+        #
+        # ``unit`` is the exception, and the whole point: it describes the data
+        # in hand rather than its history, and it is what a downstream
+        # ``target_unit`` needs (see :func:`_scaling_from_unit`).
+        out_attrs = {k: v for k, v in message.attrs.items() if k not in SCALING_ATTRS}
+        out_attrs["unit"] = final.unit
         if is_identity_scaling(gain, offset):
             # Arithmetically a no-op: record the unit, keep the stored dtype.
             return _Plan(source=fingerprint, attrs_ref=message.attrs, out_attrs=out_attrs, identity=True)
@@ -230,9 +275,9 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
                 # accumulated to fix something the reader was better placed to
                 # fix. Say so rather than half-doing it.
                 raise ValueError(
-                    f"{name} cannot be applied to {message.key!r}: its scaling was already applied upstream. "
-                    f"Set {name} on the reader (NWBSlicer / NWBIteratorSettings), or read with "
-                    f"apply_conversion=False and correct it here."
+                    f"{name} cannot be applied to {message.key!r}: its scaling was already applied upstream, "
+                    f"and the factors it was applied with are gone. Move this transformer (or set {name} on "
+                    f"it) ahead of whatever already converted the stream."
                 )
         if target is None:
             return None

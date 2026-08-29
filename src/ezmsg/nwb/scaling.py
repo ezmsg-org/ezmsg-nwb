@@ -377,7 +377,12 @@ def scaling_fingerprint(attrs: typing.Mapping[str, typing.Any]) -> typing.Option
     and it avoids having to pin the array alive to keep its address unique.
     """
     if GAIN_ATTR not in attrs:
-        return None
+        # No pending scaling. A message that still declares a ``unit`` is not
+        # nothing, though: it is convertible on that alone, so the two cases have
+        # to be told apart or a stream whose unit changes mid-run would keep a
+        # plan built for the old one.
+        unit = attrs.get("unit")
+        return None if unit is None else ("unit", unit)
     gain = attrs[GAIN_ATTR]
     return (
         gain.tobytes() if isinstance(gain, np.ndarray) else gain,

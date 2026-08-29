@@ -14,11 +14,8 @@ from conftest import CHANNEL_CONVERSION, CONVERSION, DECLARED_UNIT, MARKER_N, OF
 from ezmsg.util.messages.axisarray import AxisArray
 
 from ezmsg.nwb import (
-    APPLIED_ATTR,
     GAIN_ATTR,
-    OFFSET_ATTR,
-    UNIT_ATTR,
-    VOLTAGE_ATTR,
+    SCALING_ATTRS,
     NWBScalingSettings,
     NWBScalingTransformer,
     NWBSlicer,
@@ -37,16 +34,6 @@ def message(data: np.ndarray, scaling: StreamScaling | None, key: str = "Broadba
         attrs=attrs,
         key=key,
     )
-
-
-def assert_same_scaling(got: AxisArray, want: AxisArray) -> None:
-    """Compare two messages' reported scaling; ``gain`` may be an array, so
-    ``==`` on the values is ambiguous rather than False."""
-    np.testing.assert_allclose(got.attrs[GAIN_ATTR], want.attrs[GAIN_ATTR], rtol=1e-9)
-    assert got.attrs[OFFSET_ATTR] == pytest.approx(want.attrs[OFFSET_ATTR])
-    assert [got.attrs[k] for k in (UNIT_ATTR, APPLIED_ATTR, VOLTAGE_ATTR)] == [
-        want.attrs[k] for k in (UNIT_ATTR, APPLIED_ATTR, VOLTAGE_ATTR)
-    ]
 
 
 def read(path, key: str = "Broadband", stop: int = 20) -> AxisArray:
@@ -76,7 +63,8 @@ def test_it_applies_what_the_message_reports(scaled_nwb_path):
     assert raw.data.dtype == np.int16 and "unit" not in raw.attrs
     np.testing.assert_array_equal(out.data, expected(raw.data))
     assert out.attrs["unit"] == DECLARED_UNIT
-    assert out.attrs[APPLIED_ATTR] is True
+    # Spent: the factors described counts that no longer exist.
+    assert not [k for k in out.attrs if k in SCALING_ATTRS]
 
 
 def test_target_unit_converts_on_top_of_the_files_own(scaled_nwb_path):
@@ -85,7 +73,7 @@ def test_target_unit_converts_on_top_of_the_files_own(scaled_nwb_path):
     raw = read(scaled_nwb_path)
     out = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))(raw)
     np.testing.assert_allclose(out.data, expected(raw.data) * 1e-6, rtol=1e-6)
-    assert out.attrs["unit"] == out.attrs[UNIT_ATTR] == "volts"
+    assert out.attrs["unit"] == "volts"
 
 
 def test_overrides_correct_the_file_then_target_converts(scaled_nwb_path):
@@ -117,7 +105,7 @@ def test_two_in_a_chain_scale_once(scaled_nwb_path):
     once = tx(raw)
     twice = tx(once)
     np.testing.assert_array_equal(twice.data, once.data)
-    assert_same_scaling(twice, once)
+    assert twice.attrs == once.attrs
 
 
 def test_a_message_with_no_scaling_passes_through(scaled_nwb_path):
@@ -138,9 +126,10 @@ def test_target_unit_retargets_an_already_scaled_message(scaled_nwb_path):
     out = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))(at_reader)
     np.testing.assert_allclose(out.data, at_reader.data * 1e-6, rtol=1e-6)
     assert out.attrs["unit"] == "volts"
-    # The reported scaling stays cumulative: stored -> now, not previous -> now.
-    np.testing.assert_allclose(out.attrs[GAIN_ATTR], np.asarray(CONVERSION * CHANNEL_CONVERSION) * 1e-6, rtol=1e-6)
-    assert out.attrs[OFFSET_ATTR] == pytest.approx(OFFSET * 1e-6)
+    # Driven by ``unit`` alone -- the first pass stripped everything else, and a
+    # prefix change on top of a known unit needs nothing more.
+    assert at_reader.attrs == {"unit": DECLARED_UNIT}
+    assert out.attrs == {"unit": "volts"}
 
 
 def test_retargeting_matches_asking_the_reader_directly(scaled_nwb_path):
@@ -187,7 +176,7 @@ def test_identity_scaling_keeps_the_stored_dtype(scaled_nwb_path):
     out = NWBScalingTransformer(settings=NWBScalingSettings())(raw)
     assert out.data.dtype == np.int16
     assert out.attrs["unit"] == "n/a"
-    assert out.attrs[APPLIED_ATTR] is True
+    assert not [k for k in out.attrs if k in SCALING_ATTRS]
 
 
 def test_a_stale_per_channel_gain_raises_rather_than_broadcasting(scaled_nwb_path):
@@ -307,3 +296,108 @@ def test_a_genuinely_changed_scaling_still_rebuilds_the_plan():
     tx(message(np.ones((4, 2), dtype=np.int16), StreamScaling(0.50, 0.0, "volts", False, True)))
 
     assert tx.state.plans["Broadband"] is not plan
+
+
+# --- What survives the conversion --------------------------------------------
+
+
+class TestSpentScalingIsDropped:
+    """After the multiply, ``gain``/``offset`` describe counts that no longer
+    exist, and every later stage makes them less true. Only ``unit`` describes
+    the data in hand, so only ``unit`` survives.
+    """
+
+    def test_only_unit_remains(self, scaled_nwb_path):
+        raw = read(scaled_nwb_path)
+        assert set(raw.attrs) == set(SCALING_ATTRS)
+
+        out = NWBScalingTransformer(settings=NWBScalingSettings())(raw)
+
+        assert out.attrs == {"unit": DECLARED_UNIT}
+
+    def test_unrelated_attrs_are_left_alone(self):
+        """Only the keys this module owns are dropped."""
+        scaling = StreamScaling(gain=0.25, offset=0.0, unit="volts", applied=False, voltage=True)
+        msg = message(np.ones((4, 2), dtype=np.int16), scaling)
+        msg.attrs["something_else"] = "kept"
+
+        out = NWBScalingTransformer(settings=NWBScalingSettings())(msg)
+
+        assert out.attrs["something_else"] == "kept"
+        assert not [k for k in out.attrs if k in SCALING_ATTRS]
+
+    def test_a_second_pass_cannot_double_scale(self, scaled_nwb_path):
+        """Idempotency no longer rests on the ``applied`` flag -- there is no
+        flag left. A message with nothing pending simply has nothing to apply."""
+        once = scaled(scaled_nwb_path)
+        twice = NWBScalingTransformer(settings=NWBScalingSettings())(once)
+
+        assert twice is once
+
+    def test_a_non_voltage_stream_still_gets_its_file_conversion(self):
+        """``target_unit`` does not reach a pixels stream, but the file's own
+        gain still does -- and is just as spent afterwards."""
+        scaling = StreamScaling(gain=0.25, offset=0.0, unit="pixels", applied=False, voltage=False)
+        msg = message(np.ones((4, 2), dtype=np.int16), scaling)
+
+        out = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))(msg)
+
+        np.testing.assert_allclose(out.data, np.ones((4, 2)) * 0.25)
+        assert out.attrs == {"unit": "pixels"}
+
+
+class TestRetargetOnUnitAlone:
+    """``target_unit`` still works on a message this transformer already
+    converted, which is the case that used to ride on ``applied=True``. A prefix
+    change on top of a known unit needs the unit and nothing else.
+    """
+
+    def test_a_unit_only_message_can_be_retargeted(self):
+        msg = AxisArray(
+            data=np.ones((4, 2), dtype=np.float32),
+            dims=["time", "ch"],
+            axes={"time": AxisArray.LinearAxis.create_time_axis(fs=500.0)},
+            attrs={"unit": "microvolts"},
+            key="Broadband",
+        )
+
+        out = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))(msg)
+
+        np.testing.assert_allclose(out.data, np.ones((4, 2)) * 1e-6, rtol=1e-6)
+        assert out.attrs == {"unit": "volts"}
+
+    def test_a_non_voltage_unit_is_left_alone(self):
+        """A cursor stream in pixels is not a voltage, and reinterpreting it as
+        one would invent a dimension it never had."""
+        msg = AxisArray(
+            data=np.ones((4, 2), dtype=np.float32),
+            dims=["time", "ch"],
+            axes={"time": AxisArray.LinearAxis.create_time_axis(fs=500.0)},
+            attrs={"unit": "pixels"},
+            key="Cursor",
+        )
+
+        out = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))(msg)
+
+        assert out is msg
+
+    def test_a_changed_unit_rebuilds_the_plan(self):
+        """The per-stream plan is keyed on the reported scaling; with only a unit
+        left, the unit has to be part of that key or a stream whose unit changes
+        would keep converting with the old ratio."""
+        tx = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))
+
+        def unit_msg(unit):
+            return AxisArray(
+                data=np.ones((4, 2), dtype=np.float32),
+                dims=["time", "ch"],
+                axes={"time": AxisArray.LinearAxis.create_time_axis(fs=500.0)},
+                attrs={"unit": unit},
+                key="Broadband",
+            )
+
+        from_micro = tx(unit_msg("microvolts"))
+        from_nano = tx(unit_msg("nanovolts"))
+
+        np.testing.assert_allclose(from_micro.data, np.ones((4, 2)) * 1e-6, rtol=1e-6)
+        np.testing.assert_allclose(from_nano.data, np.ones((4, 2)) * 1e-9, rtol=1e-6)
