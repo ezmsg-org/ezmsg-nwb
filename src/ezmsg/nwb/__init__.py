@@ -2,6 +2,9 @@ from .__version__ import __version__ as __version__
 from .clockdriven import NWBClockDrivenProducer as NWBClockDrivenProducer
 from .clockdriven import NWBClockDrivenSettings as NWBClockDrivenSettings
 from .clockdriven import NWBClockDrivenUnit as NWBClockDrivenUnit
+from .convert import NWBScalingSettings as NWBScalingSettings
+from .convert import NWBScalingTransformer as NWBScalingTransformer
+from .convert import NWBScalingUnit as NWBScalingUnit
 from .iterator import NWBAxisArrayIterator as NWBAxisArrayIterator
 from .iterator import NWBIteratorSettings as NWBIteratorSettings
 from .iterator import NWBIteratorState as NWBIteratorState

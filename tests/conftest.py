@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 from create_test_nwb import create_test_nwb
 from filelock import FileLock
+from pynwb import NWBHDF5IO, NWBFile, TimeSeries
+from pynwb.ecephys import ElectricalSeries
 
 
 @pytest.fixture(scope="session")
@@ -428,3 +430,126 @@ def quantised_nwb_path(tmp_path_factory):
         description="regular stream, quantised timestamps, no rate attr",
     )
     return _write_nwb(path, [series], {})
+
+
+# --- Scaling: a file whose conversion factors are all non-trivial ------------
+#
+# All three factors are deliberately non-trivial -- a non-unit ``conversion``, a
+# non-zero ``offset``, and a ``channel_conversion`` whose entries differ --
+# because each is separately easy to drop, and a file where any of them is
+# 1.0/0.0 cannot tell you whether it was applied.
+
+N_SAMPLES = 500
+N_CH = 4
+RATE = 500.0
+
+CONVERSION = 0.25
+OFFSET = 3.5
+CHANNEL_CONVERSION = np.array([1.0, 2.0, 0.5, 4.0], dtype=np.float32)
+DECLARED_UNIT = "microvolts"
+
+# Marker stream: conversion 1.0 / offset 0.0, i.e. the values are already in the
+# unit declared. Present to pin that such a stream is left alone rather than
+# copied into float -- see ``is_identity_scaling``.
+MARKER_N = 50
+
+
+@pytest.fixture(scope="module")
+def scaled_nwb_path(tmp_path_factory):
+    """An NWB whose broadband declares all three scaling factors non-trivially."""
+    path = tmp_path_factory.mktemp("scaling") / "scaled.nwb"
+    rng = np.random.default_rng(7)
+
+    nwbfile = NWBFile(
+        session_description="scaling fixture",
+        identifier="scaling001",
+        session_start_time=datetime.datetime(2024, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc),
+    )
+    device = nwbfile.create_device(name="Array", description="fixture")
+    group = nwbfile.create_electrode_group(name="Group", description="fixture", location="cortex", device=device)
+    nwbfile.add_electrode_column(name="label", description="Electrode label")
+    for i in range(N_CH):
+        nwbfile.add_electrode(x=float(i), y=0.0, z=0.0, location="cortex", group=group, label=f"elec{i}")
+    region = nwbfile.create_electrode_table_region(region=list(range(N_CH)), description="all")
+
+    # int16 spanning a good part of the range, so a dropped conversion shows up
+    # as a large error rather than a rounding one.
+    counts = rng.integers(-30000, 30000, size=(N_SAMPLES, N_CH), dtype=np.int16)
+    nwbfile.add_acquisition(
+        ElectricalSeries(
+            name="Broadband",
+            data=counts,
+            rate=RATE,
+            starting_time=0.0,
+            electrodes=region,
+            conversion=CONVERSION,
+            offset=OFFSET,
+            channel_conversion=CHANNEL_CONVERSION,
+            description="fixture broadband",
+        )
+    )
+    nwbfile.add_acquisition(
+        TimeSeries(
+            name="Marker",
+            data=np.arange(MARKER_N, dtype=np.int16),
+            unit="n/a",
+            rate=RATE,
+            starting_time=0.0,
+            description="already in its declared unit",
+        )
+    )
+    # Voltage that is *not* an ElectricalSeries. Writers do this routinely -- a
+    # re-timestamped companion of an acquisition stream, pointing at the same
+    # samples, comes out as a plain TimeSeries -- and its declared unit is then
+    # the only evidence that it is voltage at all.
+    nwbfile.add_acquisition(
+        TimeSeries(
+            name="AuxVoltage",
+            data=counts,
+            unit="volts",
+            conversion=CONVERSION,
+            offset=OFFSET,
+            rate=RATE,
+            starting_time=0.0,
+            description="voltage written as a plain TimeSeries",
+        )
+    )
+    # Non-voltage with a real (non-identity) scaling, so "left alone" is a
+    # decision about its unit and not a side effect of having nothing to apply.
+    nwbfile.add_acquisition(
+        TimeSeries(
+            name="Cursor",
+            data=np.arange(MARKER_N, dtype=np.int16),
+            unit="pixels",
+            conversion=CONVERSION,
+            rate=RATE,
+            starting_time=0.0,
+            description="not a voltage at all",
+        )
+    )
+    with NWBHDF5IO(str(path), "w") as io:
+        io.write(nwbfile)
+
+    # pynwb pins ElectricalSeries.unit to the schema's "volts" and will not write
+    # another value, so stamp the declared unit the way a real acquisition writer
+    # does: straight onto the data dataset's attribute.
+    import h5py
+
+    with h5py.File(str(path), "a") as f:
+        f["acquisition/Broadband/data"].attrs["unit"] = DECLARED_UNIT
+    return path
+
+
+@pytest.fixture(scope="module")
+def counts(scaled_nwb_path) -> np.ndarray:
+    import h5py
+
+    with h5py.File(str(scaled_nwb_path), "r") as f:
+        return np.asarray(f["acquisition/Broadband/data"][:])
+
+
+def expected(counts: np.ndarray) -> np.ndarray:
+    """``data * conversion * channel_conversion + offset``, the NWB definition."""
+    return counts.astype(np.float32) * np.float32(CONVERSION) * CHANNEL_CONVERSION.astype(np.float32) + np.float32(
+        OFFSET
+    )

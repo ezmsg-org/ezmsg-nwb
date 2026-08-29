@@ -228,7 +228,7 @@ def unwrap_dataset(dset: typing.Any) -> typing.Any:
     return dset.base if isinstance(dset, ScaledDataset) else dset
 
 
-def _override_for(override: typing.Any, key: str) -> typing.Any:
+def override_for(override: typing.Any, key: str) -> typing.Any:
     """Resolve a bare-value-or-per-stream-mapping override for one stream.
 
     Both spellings are accepted because both are natural: a single value when
@@ -296,18 +296,30 @@ def convert_to_target_unit(
     to ``volts``, so a writer that stamped nothing has told us volts by
     omission.
     """
+    ratio = unit_ratio(unit, target, stream_key=stream_key)
+    if ratio == 1.0:
+        return gain, offset, target.value
+    return gain * ratio, offset * ratio, target.value
+
+
+def unit_ratio(unit: str, target: VoltageUnit, *, stream_key: str = "") -> float:
+    """The factor taking a value in *unit* to the same value in *target*.
+
+    Split out from :func:`convert_to_target_unit` because a consumer holding
+    values that were *already* scaled needs the factor alone: for data that is
+    ``stored * gain + offset``, multiplying the values by this ratio is the whole
+    conversion, since it carries the offset along with them. Recomputing a gain
+    and an offset for that case would mean unwinding what was applied.
+    """
     declared = VoltageUnit.VOLTS if not unit.strip() else parse_voltage_unit(unit)
     if declared is None:
         where = f" on stream {stream_key!r}" if stream_key else ""
         raise ValueError(
-            f"Cannot convert to {target.value}{where}: the file declares its unit as {unit!r}, "
+            f"Cannot convert to {target.value}{where}: the unit is {unit!r}, "
             f"which is not a recognized voltage unit. Pass unit_override to say what it really is, "
             f"or leave target_unit unset to take the file's own scaling as-is."
         )
-    ratio = VOLTS_PER_UNIT[declared] / VOLTS_PER_UNIT[target]
-    if ratio == 1.0:
-        return gain, offset, target.value
-    return gain * ratio, offset * ratio, target.value
+    return VOLTS_PER_UNIT[declared] / VOLTS_PER_UNIT[target]
 
 
 def read_stored_scaling(dset: typing.Any) -> tuple[float, float, str]:
@@ -371,14 +383,14 @@ def resolve_scaling(
             else:
                 gain = conversion * per_channel
 
-    scale = _override_for(scale_override, stream_key)
+    scale = override_for(scale_override, stream_key)
     if scale is not None:
         gain = scale
-    forced_unit = _override_for(unit_override, stream_key)
+    forced_unit = override_for(unit_override, stream_key)
     if forced_unit is not None:
         unit = str(forced_unit)
 
-    target = _override_for(target_unit, stream_key)
+    target = override_for(target_unit, stream_key)
     if target is not None and is_voltage_stream(unit, is_electrical):
         gain, offset, unit = convert_to_target_unit(
             gain, offset, unit, coerce_voltage_unit(target), stream_key=stream_key
@@ -425,11 +437,38 @@ class StreamScaling(typing.NamedTuple):
     applied: bool
     """False when the caller asked for the stored samples (``apply_conversion``
     off), in which case the data is raw and this is what to do about it."""
+    voltage: bool = False
+    """Whether ``target_unit`` may convert this stream -- :func:`is_voltage_stream`
+    decided, at read time.
+
+    Carried rather than re-derived downstream because one of its two inputs does
+    not survive the trip: an ``ElectricalSeries`` that stamped no unit is voltage
+    by schema, but off the file all a consumer sees is an empty string. Deciding
+    once, where both the type and the label are in hand, is what lets a later
+    stage convert exactly the streams the reader would have.
+    """
 
     def as_attr(self) -> dict[str, typing.Any]:
         """The ``attrs[SCALING_ATTR]`` payload -- a plain dict, so it survives
         the message codec and anything else that walks attrs generically."""
-        return {"gain": self.gain, "offset": self.offset, "unit": self.unit, "applied": self.applied}
+        return {
+            "gain": self.gain,
+            "offset": self.offset,
+            "unit": self.unit,
+            "applied": self.applied,
+            "voltage": self.voltage,
+        }
+
+    @classmethod
+    def from_attr(cls, payload: typing.Mapping[str, typing.Any]) -> StreamScaling:
+        """Rebuild from an ``attrs[SCALING_ATTR]`` payload."""
+        return cls(
+            gain=payload["gain"],
+            offset=float(payload["offset"]),
+            unit=str(payload["unit"]),
+            applied=bool(payload["applied"]),
+            voltage=bool(payload.get("voltage", False)),
+        )
 
 
 class ScalingResult(typing.NamedTuple):
@@ -483,10 +522,11 @@ def resolve_stream_scaling(
         stream_key=stream_key,
     )
     gain = gain if isinstance(gain, np.ndarray) else float(gain)
+    voltage = is_voltage_stream(unit, is_electrical)
 
     if not apply:
-        return ScalingResult(dset, "", StreamScaling(gain, offset, unit, applied=False))
-    scaling = StreamScaling(gain, offset, unit, applied=True)
+        return ScalingResult(dset, "", StreamScaling(gain, offset, unit, applied=False, voltage=voltage))
+    scaling = StreamScaling(gain, offset, unit, applied=True, voltage=voltage)
     if is_identity_scaling(gain, offset):
         return ScalingResult(dset, unit, scaling)
     return ScalingResult(ScaledDataset(dset, gain, offset, dtype), unit, scaling)

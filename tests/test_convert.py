@@ -1,0 +1,203 @@
+"""Applying an NWB stream's scaling downstream instead of at the reader.
+
+The property that matters throughout is equivalence: reading with
+``apply_conversion=False`` and running the transformer must land on exactly what
+reading with ``apply_conversion=True`` would have produced. Anything less and
+"defer the conversion" becomes "get a slightly different answer", which is the
+class of difference nobody notices.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from conftest import CHANNEL_CONVERSION, CONVERSION, DECLARED_UNIT, MARKER_N, OFFSET
+from ezmsg.util.messages.axisarray import AxisArray
+
+from ezmsg.nwb import (
+    SCALING_ATTR,
+    NWBScalingSettings,
+    NWBScalingTransformer,
+    NWBSlicer,
+    StreamScaling,
+)
+
+
+def message(data: np.ndarray, scaling: StreamScaling | None, key: str = "Broadband") -> AxisArray:
+    attrs = {} if scaling is None else {SCALING_ATTR: scaling.as_attr()}
+    if scaling is not None and scaling.applied:
+        attrs["unit"] = scaling.unit
+    return AxisArray(
+        data=data,
+        dims=["time", "ch"],
+        axes={"time": AxisArray.LinearAxis.create_time_axis(fs=500.0)},
+        attrs=attrs,
+        key=key,
+    )
+
+
+def assert_same_scaling(got: dict, want: dict) -> None:
+    """Compare two scaling payloads; ``gain`` may be an array, so ``==`` on the
+    whole dict is ambiguous rather than False."""
+    assert got.keys() == want.keys()
+    np.testing.assert_allclose(got["gain"], want["gain"], rtol=1e-9)
+    assert got["offset"] == pytest.approx(want["offset"])
+    assert (got["unit"], got["applied"], got["voltage"]) == (want["unit"], want["applied"], want["voltage"])
+
+
+def read(path, **kw) -> AxisArray:
+    slicer = NWBSlicer(path, dejitter=False, **kw)
+    try:
+        return slicer.read_by_index("Broadband", 0, 20)
+    finally:
+        slicer.close()
+
+
+# --- The point of the thing --------------------------------------------------
+
+
+def test_deferred_conversion_equals_conversion_at_the_reader(scaled_nwb_path):
+    """Read raw, convert downstream, and land on the reader's own answer."""
+    raw = read(scaled_nwb_path, apply_conversion=False)
+    at_reader = read(scaled_nwb_path)
+
+    out = NWBScalingTransformer(settings=NWBScalingSettings())(raw)
+
+    assert raw.data.dtype == np.int16  # the deferral was real
+    np.testing.assert_array_equal(out.data, at_reader.data)
+    assert out.attrs["unit"] == at_reader.attrs["unit"] == DECLARED_UNIT
+    assert_same_scaling(out.attrs[SCALING_ATTR], at_reader.attrs[SCALING_ATTR])
+
+
+def test_deferred_target_unit_equals_target_unit_at_the_reader(scaled_nwb_path):
+    raw = read(scaled_nwb_path, apply_conversion=False)
+    at_reader = read(scaled_nwb_path, target_unit="volts")
+
+    out = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))(raw)
+
+    np.testing.assert_allclose(out.data, at_reader.data, rtol=1e-6)
+    assert out.attrs["unit"] == "volts"
+    assert out.attrs[SCALING_ATTR]["unit"] == "volts"
+
+
+def test_deferred_overrides_equal_overrides_at_the_reader(scaled_nwb_path):
+    raw = read(scaled_nwb_path, apply_conversion=False)
+    at_reader = read(scaled_nwb_path, scale_override=0.1, unit_override="volts", target_unit="microvolts")
+
+    out = NWBScalingTransformer(
+        settings=NWBScalingSettings(scale_override=0.1, unit_override="volts", target_unit="microvolts")
+    )(raw)
+
+    np.testing.assert_allclose(out.data, at_reader.data, rtol=1e-6)
+    assert out.attrs["unit"] == at_reader.attrs["unit"] == "microvolts"
+
+
+# --- Idempotence -------------------------------------------------------------
+
+
+def test_an_already_scaled_message_passes_through_untouched(scaled_nwb_path):
+    """Off the ``applied`` flag, not off the dtype -- so a transformer behind a
+    reader that already converted cannot double-scale."""
+    at_reader = read(scaled_nwb_path)
+    out = NWBScalingTransformer(settings=NWBScalingSettings())(at_reader)
+    assert out is at_reader
+
+
+def test_two_in_a_chain_scale_once(scaled_nwb_path):
+    raw = read(scaled_nwb_path, apply_conversion=False)
+    tx = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))
+    once = tx(raw)
+    twice = tx(once)
+    np.testing.assert_array_equal(twice.data, once.data)
+    assert_same_scaling(twice.attrs[SCALING_ATTR], once.attrs[SCALING_ATTR])
+
+
+def test_a_message_with_no_scaling_passes_through(scaled_nwb_path):
+    """Not from an NWB reader. Inventing a scaling would be worse than nothing."""
+    msg = message(np.ones((4, 2), dtype=np.int16), None)
+    out = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))(msg)
+    assert out is msg
+
+
+# --- Retargeting something already applied -----------------------------------
+
+
+def test_target_unit_retargets_an_already_scaled_message(scaled_nwb_path):
+    """A prefix change on top of a known unit is well defined, so this is
+    allowed where the gain overrides are not. One multiply: scaling the values
+    carries their offset with them."""
+    at_reader = read(scaled_nwb_path)  # microvolts
+    out = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))(at_reader)
+    np.testing.assert_allclose(out.data, at_reader.data * 1e-6, rtol=1e-6)
+    assert out.attrs["unit"] == "volts"
+    # The reported scaling stays cumulative: stored -> now, not previous -> now.
+    np.testing.assert_allclose(
+        out.attrs[SCALING_ATTR]["gain"], np.asarray(CONVERSION * CHANNEL_CONVERSION) * 1e-6, rtol=1e-6
+    )
+    assert out.attrs[SCALING_ATTR]["offset"] == pytest.approx(OFFSET * 1e-6)
+
+
+def test_retargeting_matches_asking_the_reader_directly(scaled_nwb_path):
+    at_reader = read(scaled_nwb_path)
+    direct = read(scaled_nwb_path, target_unit="nanovolts")
+    out = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="nanovolts"))(at_reader)
+    np.testing.assert_allclose(out.data, direct.data, rtol=1e-5)
+
+
+@pytest.mark.parametrize("setting", ["scale_override", "unit_override"])
+def test_gain_overrides_refuse_an_already_scaled_message(scaled_nwb_path, setting):
+    """Correcting a gain already applied would mean dividing it back out. Say
+    so rather than half-doing it or silently ignoring the setting."""
+    at_reader = read(scaled_nwb_path)
+    value = 0.1 if setting == "scale_override" else "volts"
+    tx = NWBScalingTransformer(settings=NWBScalingSettings(**{setting: value}))
+    with pytest.raises(ValueError, match="already applied upstream"):
+        tx(at_reader)
+
+
+# --- Non-voltage, identity, and the per-channel hazard ------------------------
+
+
+def test_non_voltage_streams_are_scaled_but_not_retargeted(scaled_nwb_path):
+    """ "pixels" gets its gain applied -- it has one -- and keeps its unit."""
+    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=False, dejitter=False)
+    try:
+        raw = slicer.read_by_index("Cursor", 0, 10)
+    finally:
+        slicer.close()
+    out = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))(raw)
+    assert out.attrs["unit"] == "pixels"
+    np.testing.assert_allclose(out.data, raw.data * np.float32(CONVERSION), rtol=1e-6)
+
+
+def test_identity_scaling_keeps_the_stored_dtype(scaled_nwb_path):
+    """The marker stream is already in its declared unit. Record that without
+    copying int16 into float to do it."""
+    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=False, dejitter=False)
+    try:
+        raw = slicer.read_by_index("Marker", 0, MARKER_N)
+    finally:
+        slicer.close()
+    out = NWBScalingTransformer(settings=NWBScalingSettings())(raw)
+    assert out.data.dtype == np.int16
+    assert out.attrs["unit"] == "n/a"
+    assert out.attrs[SCALING_ATTR]["applied"] is True
+
+
+def test_a_stale_per_channel_gain_raises_rather_than_broadcasting(scaled_nwb_path):
+    """A per-channel gain is positional, so a stage that dropped channels
+    upstream has invalidated it. Length is the only check available, and a
+    misaligned multiply that happened to broadcast would be silently wrong."""
+    raw = read(scaled_nwb_path, apply_conversion=False)
+    subset = AxisArray(data=raw.data[:, :2], dims=raw.dims, axes=raw.axes, attrs=dict(raw.attrs), key=raw.key)
+    with pytest.raises(ValueError, match="does not fit"):
+        NWBScalingTransformer(settings=NWBScalingSettings())(subset)
+
+
+def test_conversion_dtype_is_honoured(scaled_nwb_path, counts):
+    raw = read(scaled_nwb_path, apply_conversion=False)
+    out = NWBScalingTransformer(settings=NWBScalingSettings(conversion_dtype="float64"))(raw)
+    assert out.data.dtype == np.float64
+    np.testing.assert_allclose(
+        out.data, counts[:20].astype(np.float64) * CONVERSION * CHANNEL_CONVERSION + OFFSET, rtol=1e-12
+    )
