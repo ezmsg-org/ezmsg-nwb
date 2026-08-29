@@ -42,20 +42,52 @@ from ezmsg.nwb.reader import NWBIteratorUnit
 class NWBIteratorTestSettings(ez.Settings):
     nwbiterator_settings: NWBIteratorSettings
     log_settings: MessageLoggerSettings
+    term_settings: TerminateOnTotalSettings = field(default_factory=TerminateOnTotalSettings)
+    timeout_settings: TerminateOnTimeoutSettings = field(default_factory=TerminateOnTimeoutSettings)
 
 
 class NWBIteratorIntegrationTest(ez.Collection):
+    """Source -> logger -> terminate-on-count.
+
+    Termination is driven by the *sink*, not by the source running out, and the
+    source is told not to self-terminate. Both halves matter. ``NormalTermination``
+    sets the terminate event and ezmsg then cancels every task outright -- there
+    is no drain phase -- so a source that raises it immediately after its last
+    ``yield`` can have that message cancelled out of a subscriber in another
+    process before the subscriber writes it. This test lost exactly one 1000-sample
+    chunk that way, intermittently, on slower CI runners.
+
+    Counting on ``MessageLogger.OUTPUT_MESSAGE`` is what makes it deterministic:
+    with the default ``write_period`` of 0 the logger writes and flushes each
+    message *before* forwarding it, so by the time the count reaches the total,
+    every message is already on disk.
+
+    ``TIMEOUT`` is a backstop, not a second termination path. Waiting for a count
+    turns a lost message into a hang instead of a failure, and a hung job is a
+    worse signal than a red one: it costs the CI timeout and says nothing about
+    what went wrong. With it, a shortfall ends the run and the assertions below
+    report exactly how many messages arrived.
+    """
+
     SETTINGS = NWBIteratorTestSettings
 
     SOURCE = NWBIteratorUnit()
     SINK = MessageLogger()
+    TERM = TerminateOnTotal()
+    TIMEOUT = TerminateOnTimeout()
 
     def configure(self) -> None:
         self.SOURCE.apply_settings(self.SETTINGS.nwbiterator_settings)
         self.SINK.apply_settings(self.SETTINGS.log_settings)
+        self.TERM.apply_settings(self.SETTINGS.term_settings)
+        self.TIMEOUT.apply_settings(self.SETTINGS.timeout_settings)
 
     def network(self) -> ez.NetworkDefinition:
-        return ((self.SOURCE.OUTPUT_SIGNAL, self.SINK.INPUT_MESSAGE),)
+        return (
+            (self.SOURCE.OUTPUT_SIGNAL, self.SINK.INPUT_MESSAGE),
+            (self.SINK.OUTPUT_MESSAGE, self.TERM.INPUT_MESSAGE),
+            (self.SINK.OUTPUT_MESSAGE, self.TIMEOUT.INPUT),
+        )
 
 
 def test_nwbiterator_unit_system(test_nwb_path):
@@ -63,14 +95,21 @@ def test_nwbiterator_unit_system(test_nwb_path):
     log_file = Path(tempfile.gettempdir()) / "test_nwbiterator_unit.txt"
     log_file.write_text("")
 
+    # Broadband is 3000 samples at 1 s chunks: exactly 3 messages.
+    n_messages = 3
+
     settings = NWBIteratorTestSettings(
         nwbiterator_settings=NWBIteratorSettings(
             filepath=test_nwb_path,
             chunk_dur=1.0,
             reference_clock=ReferenceClockType.UNKNOWN,
             stream_keys=["Broadband"],
+            # Let the count below end the run. Self-termination races the last
+            # message against task cancellation -- see the collection's docstring.
+            self_terminating=False,
         ),
         log_settings=MessageLoggerSettings(output=log_file),
+        term_settings=TerminateOnTotalSettings(total=n_messages),
     )
 
     system = NWBIteratorIntegrationTest(settings)
@@ -79,7 +118,7 @@ def test_nwbiterator_unit_system(test_nwb_path):
     messages = list(message_log(log_file))
     log_file.unlink(missing_ok=True)
 
-    assert len(messages) > 0
+    assert len(messages) == n_messages
     assert all(isinstance(m, AxisArray) for m in messages)
     assert all(m.key == "Broadband" for m in messages)
     assert all(m.data.shape[1] == 8 for m in messages)
