@@ -42,6 +42,34 @@ RATE_TRIM_LO = 0.5
 RATE_TRIM_HI = 1.5
 
 
+MEDIAN_SUBSAMPLE_MAX = 100_000
+"""Above this many intervals, estimate the median from a strided subsample.
+
+``np.median`` partitions the whole array: 45 ms on a recording-hour of 30 kHz
+timestamps, and it runs once per stream at open. The median here is only ever a
+*centre* for a trim window or a scale for a variance comparison -- never the
+returned estimate, which is a mean over the surviving intervals -- so it needs
+to be in the right place, not exact.
+
+And it lands in exactly the same place. Timestamps arrive on a quantisation
+grid, so the median snaps to a grid point that a stride cannot move: on a real
+7.09M-interval stream, strides of 16 through 1024 all give 3.3301000002e-05,
+and :func:`infer_nominal_rate` returns 30147.9172 from every one of them.
+"""
+
+
+def _fast_median(values: np.ndarray) -> float:
+    """``np.median``, on a strided subsample once the array is large enough.
+
+    Strided rather than random or head-of-array: a stride samples the whole
+    recording, so a stream whose intervals differ between its start and its end
+    is represented across the estimate rather than by whichever part was read.
+    """
+    if values.size > MEDIAN_SUBSAMPLE_MAX:
+        values = values[:: -(-values.size // MEDIAN_SUBSAMPLE_MAX)]
+    return float(np.median(values))
+
+
 def infer_nominal_rate(dts: np.ndarray) -> float:
     """Sample rate from per-sample intervals: the mean of the non-outlier ones.
 
@@ -66,7 +94,7 @@ def infer_nominal_rate(dts: np.ndarray) -> float:
     """
     if dts.size == 0:
         return 0.0
-    median = float(np.median(dts))
+    median = _fast_median(dts)
     if not np.isfinite(median) or median <= 0.0:
         return 0.0
     core = dts[(dts > RATE_TRIM_LO * median) & (dts < RATE_TRIM_HI * median)]
@@ -436,7 +464,11 @@ class NWBSlicer:
                     rate = child.timestamps.attrs["rate"]
                 else:
                     dts = np.diff(child.timestamps[:])
-                    if np.var(dts) < 1e-3 or np.var(dts) < 0.05 * np.median(dts):
+                    variance = float(np.var(dts))
+                    # ``np.var`` twice was two full passes to evaluate one
+                    # ``or``; the second only ran when the first failed, but it
+                    # ran on every irregular stream, which is the slow case.
+                    if variance < 1e-3 or variance < 0.05 * _fast_median(dts):
                         rate = infer_nominal_rate(dts)
                     else:
                         rate = 0.0
@@ -475,16 +507,25 @@ class NWBSlicer:
                 # otherwise an ElectricalSeries that references a
                 # strict subset of the electrodes table produces a
                 # ch-axis whose length does not match data.shape[1].
+                # One column, not the whole table. ``to_dataframe()`` materializes
+                # every electrode column into pandas -- position, group, filtering,
+                # whatever the writer stored -- to read one of them, and it costs
+                # ~12 ms per electrical series at open. Indexing the column
+                # directly is the same values for a thirtieth of the work.
                 region_idx = np.asarray(child.electrodes.data)
-                full_df = child.electrodes.table.to_dataframe()
-                el_df = full_df.iloc[region_idx]
-                if "label" in el_df.columns:
+                table = child.electrodes.table
+                if "label" in table.colnames:
                     # Decoded here, at the read boundary: these labels become the
                     # ch-axis coordinates every downstream name-based channel
                     # selection matches against.
-                    ch_labels = as_text_array(el_df["label"].values)
+                    ch_labels = as_text_array(np.asarray(table["label"].data[:])[region_idx])
                 else:
-                    ch_labels = np.array([f"ch_{idx}" for idx in el_df.index.tolist()])
+                    # ``to_dataframe`` indexes by the table's ``id`` column, so the
+                    # fallback names must come from ``id`` too -- not from the
+                    # positional indices, which coincide with it only when the
+                    # series references the whole table in order.
+                    ids = np.asarray(table.id.data[:])[region_idx]
+                    ch_labels = np.array([f"ch_{idx}" for idx in ids.tolist()])
                 axes["ch"] = AxisArray.CoordinateAxis(data=ch_labels, dims=["ch"])
 
             # ``matched_key`` is the user-facing key — equal to ``child.name``
