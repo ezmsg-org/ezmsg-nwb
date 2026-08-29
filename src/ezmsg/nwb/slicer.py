@@ -440,9 +440,16 @@ class NWBSlicer:
 
             has_timestamps = hasattr(child, "timestamps") and child.timestamps is not None
 
+            # ``AnnotationSeries`` is a ``TimeSeries`` by inheritance but an event
+            # stream by intent: sparse, irregular, one text payload per row. Say so
+            # explicitly.
+            is_event_series = isinstance(child, pynwb.misc.AnnotationSeries)
+
             if has_timestamps:
                 # Determine nominal rate
-                if hasattr(child, "rate") and child.rate is not None:
+                if is_event_series:
+                    rate = 0.0
+                elif hasattr(child, "rate") and child.rate is not None:
                     rate = child.rate
                 elif "rate" in child.timestamps.attrs:
                     rate = child.timestamps.attrs["rate"]
@@ -459,13 +466,18 @@ class NWBSlicer:
 
                 t0_val = child.timestamps[0]
                 start_time = min(start_time, self._ts_off + t0_val)
-                gain = 1 / rate if rate != 0 else 1.0
-                stop_time = max(stop_time, self._ts_off + child.timestamps[-1] + gain)
-                stop_time = max(
-                    stop_time,
-                    self._ts_off + t0_val + (child.data.shape[0] + 1) * gain,
-                )
-                tvec = child.timestamps
+                if rate == 0:
+                    # No rate means no sample duration to extrapolate: the stream
+                    # ends at its last timestamp.
+                    stop_time = max(stop_time, self._ts_off + child.timestamps[-1])
+                else:
+                    gain = 1 / rate
+                    stop_time = max(stop_time, self._ts_off + child.timestamps[-1] + gain)
+                    stop_time = max(
+                        stop_time,
+                        self._ts_off + t0_val + (child.data.shape[0] + 1) * gain,
+                    )
+                tvec = child.timestamps[:] if is_event_series else child.timestamps
             else:
                 rate = child.rate
                 t0_val = child.starting_time
@@ -570,7 +582,7 @@ class NWBSlicer:
                 n_samples=child.data.shape[0],
                 timestamps=tvec if has_timestamps else None,
                 has_timestamps=has_timestamps,
-                is_event=False,
+                is_event=is_event_series,
                 table_ref=None,
                 scaling=scaling,
             )
@@ -751,8 +763,13 @@ class NWBSlicer:
                 stop_time = max(stop_time, ts_off + float(info.table_ref.stop_time[-1]))
             elif info.has_timestamps and info.timestamps is not None:
                 ts = info.timestamps
-                stop_time = max(stop_time, ts_off + float(ts[-1]) + gain)
-                stop_time = max(stop_time, ts_off + float(ts[0]) + (info.n_samples + 1) * gain)
+                if not info.fs:
+                    # Mirrors :meth:`_load`: with no rate there is no sample
+                    # duration to extrapolate.
+                    stop_time = max(stop_time, ts_off + float(ts[-1]))
+                else:
+                    stop_time = max(stop_time, ts_off + float(ts[-1]) + gain)
+                    stop_time = max(stop_time, ts_off + float(ts[0]) + (info.n_samples + 1) * gain)
             else:
                 stop_time = max(stop_time, ts_off + float(info.t0) + (info.n_samples + 1) * gain)
         if np.isfinite(stop_time):
@@ -810,6 +827,21 @@ class NWBSlicer:
         out_data = info.dset[start_idx:stop_idx]
         template = info.template
 
+        if not hasattr(template.axes["time"], "gain") and info.timestamps is not None:
+            # No rate, so no uniform axis to slide an ``offset`` along
+            return replace(
+                template,
+                data=out_data,
+                axes={
+                    **template.axes,
+                    "time": replace(
+                        template.axes["time"],
+                        data=self._ts_off + np.asarray(info.timestamps[start_idx:stop_idx]),
+                    ),
+                },
+                key=stream_key,
+            )
+
         if info.timestamps is not None and start_idx < len(info.timestamps):
             # Explicit timestamps are already absolute (file-relative) times.
             chunk_t0 = info.timestamps[start_idx]
@@ -863,10 +895,13 @@ class NWBSlicer:
             if start_idx >= stop_idx:
                 return template  # Zero-length template
 
-            # Return all events in the window as a single AxisArray
+            # Return all events in the window as a single AxisArray.
+            # Times come from ``info.timestamps`` -- the interval table's
+            # ``start_time`` copied at discovery, or an annotation series' own
+            # timestamps -- so this path never reaches into ``table_ref``, which
+            # only one of the two event flavours has.
             out_data = info.dset[start_idx:stop_idx]
-            table = info.table_ref
-            event_times = self._ts_off + table.start_time[start_idx:stop_idx]
+            event_times = self._ts_off + np.asarray(timestamps[start_idx:stop_idx])
 
             return replace(
                 template,
