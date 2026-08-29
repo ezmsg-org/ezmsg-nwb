@@ -71,6 +71,12 @@ class NWBIteratorSettings(ez.Settings):
     """Real-gap guard threshold in seconds (forwarded to ``NWBSlicer``). ``None``
     auto-derives per stream; genuine gaps are preserved so chunks still split at
     them. ``float("inf")`` disables the guard."""
+    structured_ch_axis: bool = False
+    """Build the ``ch`` axis as a structured record array from the electrodes
+    table (forwarded to ``NWBSlicer``), matching what a live acquisition source
+    emits: position, label, bank, headstage, array identity. Default False --
+    these columns are an acquisition-stack convention, not part of the NWB
+    schema. See :mod:`~ezmsg.nwb.electrodes`."""
 
 
 @processor_state
@@ -297,6 +303,7 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
             clock_groups=self.settings.clock_groups,
             dejitter_cache=self.settings.dejitter_cache,
             real_gap_threshold=self.settings.real_gap_threshold,
+            structured_ch_axis=self.settings.structured_ch_axis,
         )
         self._state.slicer = slicer
 

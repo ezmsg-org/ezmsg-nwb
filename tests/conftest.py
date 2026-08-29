@@ -553,3 +553,84 @@ def expected(counts: np.ndarray) -> np.ndarray:
     return counts.astype(np.float32) * np.float32(CONVERSION) * CHANNEL_CONVERSION.astype(np.float32) + np.float32(
         OFFSET
     )
+
+
+# --- An electrodes table shaped like an acquisition stack's ------------------
+#
+# Two connectors on one headstage plus one on a second, so the array-identity
+# derivation has something to separate and the bank letters span more than one
+# value. Geometry is a 400 um grid, matching real Utah-array pitch, and the
+# columns are named the way the CereLink writer names them (rel_x/rel_y/term).
+
+ELEC_N_CH = 8
+ELEC_PITCH = 400
+
+
+@pytest.fixture(scope="session")
+def mapped_nwb_path(tmp_path_factory):
+    """An NWB whose electrodes table carries channel-map columns."""
+    path = tmp_path_factory.mktemp("electrodes") / "mapped.nwb"
+    nwbfile = NWBFile(
+        session_description="channel map fixture",
+        identifier="map001",
+        session_start_time=datetime.datetime(2024, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc),
+    )
+    device = nwbfile.create_device(name="Hub", description="fixture")
+    for col, desc in (
+        ("label", "electrode label"),
+        ("rel_x", "x within array, um"),
+        ("rel_y", "y within array, um"),
+        ("size", "electrode size, um"),
+        ("bank", "1-based connector bank"),
+        ("term", "1-based terminal within bank"),
+        ("headstage", "1-based headstage id"),
+    ):
+        nwbfile.add_electrode_column(name=col, description=desc)
+
+    # (connector, region, headstage) per channel: two arrays on hs1, one on hs2.
+    layout = [("elec1", "m1", 1)] * 4 + [("elec2", "dlpfc", 1)] * 2 + [("elec1", "s1l", 2)] * 2
+    groups = {}
+    for i, (connector, region, hs) in enumerate(layout):
+        gname = f"Hub-hs{hs}-{connector}-{region}"
+        if gname not in groups:
+            groups[gname] = nwbfile.create_electrode_group(
+                name=gname, description="fixture", location=region, device=device
+            )
+        nwbfile.add_electrode(
+            location=region,
+            group=groups[gname],
+            label=f"{connector}-{region}-{i + 1}",
+            rel_x=float((i % 2) * ELEC_PITCH),
+            rel_y=float((i // 2) * ELEC_PITCH),
+            size=float(ELEC_PITCH),
+            bank=i // 4 + 1,  # 1,1,1,1,2,2,3,3 -> letters A,A,A,A,B,B,C,C
+            term=i % 4 + 1,
+            headstage=hs,
+        )
+    region = nwbfile.create_electrode_table_region(region=list(range(ELEC_N_CH)), description="all")
+    nwbfile.add_acquisition(
+        ElectricalSeries(
+            name="Mapped",
+            data=np.zeros((20, ELEC_N_CH), dtype=np.int16),
+            rate=100.0,
+            starting_time=0.0,
+            electrodes=region,
+            description="fixture",
+        )
+    )
+    # A second series over a strict subset, in a different order, so the region
+    # handling is exercised rather than assumed.
+    subset = nwbfile.create_electrode_table_region(region=[5, 1, 0], description="subset")
+    nwbfile.add_acquisition(
+        ElectricalSeries(
+            name="Subset",
+            data=np.zeros((20, 3), dtype=np.int16),
+            rate=100.0,
+            starting_time=0.0,
+            electrodes=subset,
+            description="fixture subset",
+        )
+    )
+    with NWBHDF5IO(str(path), "w") as io:
+        io.write(nwbfile)
+    return path
