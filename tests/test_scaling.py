@@ -23,6 +23,7 @@ from ezmsg.nwb import (
     ReferenceClockType,
     ScaledDataset,
     VoltageUnit,
+    is_voltage_stream,
     parse_voltage_unit,
     read_stored_scaling,
     resolve_scaling,
@@ -85,6 +86,35 @@ def scaled_nwb_path(tmp_path_factory):
             rate=RATE,
             starting_time=0.0,
             description="already in its declared unit",
+        )
+    )
+    # Voltage that is *not* an ElectricalSeries. Writers do this routinely -- a
+    # re-timestamped companion of an acquisition stream, pointing at the same
+    # samples, comes out as a plain TimeSeries -- and its declared unit is then
+    # the only evidence that it is voltage at all.
+    nwbfile.add_acquisition(
+        TimeSeries(
+            name="AuxVoltage",
+            data=counts,
+            unit="volts",
+            conversion=CONVERSION,
+            offset=OFFSET,
+            rate=RATE,
+            starting_time=0.0,
+            description="voltage written as a plain TimeSeries",
+        )
+    )
+    # Non-voltage with a real (non-identity) scaling, so "left alone" is a
+    # decision about its unit and not a side effect of having nothing to apply.
+    nwbfile.add_acquisition(
+        TimeSeries(
+            name="Cursor",
+            data=np.arange(MARKER_N, dtype=np.int16),
+            unit="pixels",
+            conversion=CONVERSION,
+            rate=RATE,
+            starting_time=0.0,
+            description="not a voltage at all",
         )
     )
     with NWBHDF5IO(str(path), "w") as io:
@@ -317,17 +347,56 @@ def test_target_unit_composes_with_the_overrides(scaled_nwb_path, counts):
         slicer.close()
 
 
-def test_target_unit_leaves_non_electrical_streams_alone(scaled_nwb_path):
-    """The marker stream declares "n/a". It is not an ``ElectricalSeries``, so
-    the request does not reach it -- rather than erroring on a unit that was
-    never a voltage, or worse, scaling counts by 1e6."""
+def test_target_unit_leaves_non_voltage_streams_alone(scaled_nwb_path):
+    """ "n/a" and "pixels" are not voltages, so the request does not reach them --
+    rather than erroring on a unit that was never a voltage, or worse, scaling a
+    cursor position by 1e6."""
     slicer = NWBSlicer(scaled_nwb_path, target_unit="volts", dejitter=False)
     try:
-        info = slicer.get_stream_info("Marker")
-        assert info.unit == "n/a"
-        np.testing.assert_array_equal(info.dset[:], np.arange(MARKER_N, dtype=np.int16))
+        marker = slicer.get_stream_info("Marker")
+        assert marker.unit == "n/a"
+        np.testing.assert_array_equal(marker.dset[:], np.arange(MARKER_N, dtype=np.int16))
+
+        cursor = slicer.get_stream_info("Cursor")
+        assert cursor.unit == "pixels"
+        np.testing.assert_allclose(
+            cursor.dset[:], np.arange(MARKER_N, dtype=np.float32) * np.float32(CONVERSION), rtol=1e-6
+        )
     finally:
         slicer.close()
+
+
+def test_target_unit_reaches_voltage_written_as_a_plain_timeseries(scaled_nwb_path, counts):
+    """Regression: gating on ``isinstance(..., ElectricalSeries)`` alone left a
+    ``*_device_ts`` companion -- a plain TimeSeries over the *same* samples as its
+    acquisition partner -- in the file's unit while the partner was converted.
+    Same bytes, two scales, one graph, no error: exactly what target_unit exists
+    to prevent."""
+    slicer = NWBSlicer(scaled_nwb_path, target_unit="microvolts", dejitter=False)
+    try:
+        electrical = slicer.get_stream_info("Broadband")
+        plain = slicer.get_stream_info("AuxVoltage")
+        # The two declare different units; both are asked for microvolts and both
+        # arrive there. Before the fix the plain one stayed in volts, 1e6 out.
+        assert plain.unit == electrical.unit == "microvolts"
+        np.testing.assert_allclose(plain.dset[:], (counts * CONVERSION + OFFSET) * 1e6, rtol=1e-5)
+        # Already microvolts, so its own numbers are unchanged.
+        np.testing.assert_array_equal(electrical.dset[:], expected(counts))
+    finally:
+        slicer.close()
+
+
+def test_is_voltage_stream_takes_either_kind_of_evidence():
+    assert is_voltage_stream("volts", is_electrical=False)
+    assert is_voltage_stream("uV", is_electrical=False)
+    # An ElectricalSeries is voltage by schema whatever string it carries --
+    # including none, which is what pynwb writes when nobody stamped one.
+    assert is_voltage_stream("", is_electrical=True)
+    assert is_voltage_stream("garbage", is_electrical=True)
+    # A bare TimeSeries gets no such benefit of the doubt: an unstamped unit
+    # says nothing, and assuming volts would invent a dimension.
+    assert not is_voltage_stream("", is_electrical=False)
+    assert not is_voltage_stream("pixels", is_electrical=False)
 
 
 def test_target_unit_rejects_an_unplaceable_declared_unit(scaled_nwb_path):

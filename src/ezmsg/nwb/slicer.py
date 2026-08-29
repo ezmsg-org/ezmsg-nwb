@@ -296,9 +296,11 @@ class NWBSlicer:
             against, say, microvolts is fed the same numbers by files that
             disagree about their own scale. Applied *after* the two overrides,
             so a file that lies can be corrected and converted in one pass.
-            Ignored for non-electrical streams, whose units this reader has no
-            basis to reason about. ``None`` (default) delivers the file's own
-            unit. Requires ``apply_conversion``.
+            Reaches every stream that is an ``ElectricalSeries`` *or* declares a
+            voltage unit -- the latter being how a re-timestamped ``*_device_ts``
+            companion of an acquisition stream is written -- and leaves streams
+            in other units (cursor positions, markers) alone. ``None`` (default)
+            delivers each stream's own unit. Requires ``apply_conversion``.
     """
 
     disk_cache = remfile.DiskCache(str(Path("~").expanduser() / ".ezmsg" / "nwb-cache"))
@@ -548,9 +550,9 @@ class NWBSlicer:
                     scale_override=self._scale_override,
                     unit_override=self._unit_override,
                     target_unit=self._target_unit,
-                    # Asked of the object, not of the declared unit: the unit
-                    # string is the thing we don't trust, whereas being an
-                    # ElectricalSeries is a structural fact about the file.
+                    # One of the two things that make a stream convertible; the
+                    # other is its declared unit, which is what covers voltage
+                    # written as a plain TimeSeries. See ``is_voltage_stream``.
                     is_electrical=isinstance(child, pynwb.ecephys.ElectricalSeries),
                     stream_key=matched_key,
                 )

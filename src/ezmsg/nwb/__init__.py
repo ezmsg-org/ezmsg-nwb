@@ -27,6 +27,7 @@ from .scaling import VOLTS_PER_UNIT as VOLTS_PER_UNIT
 from .scaling import ScaledDataset as ScaledDataset
 from .scaling import VoltageUnit as VoltageUnit
 from .scaling import convert_to_target_unit as convert_to_target_unit
+from .scaling import is_voltage_stream as is_voltage_stream
 from .scaling import parse_voltage_unit as parse_voltage_unit
 from .scaling import read_stored_scaling as read_stored_scaling
 from .scaling import resolve_scaling as resolve_scaling

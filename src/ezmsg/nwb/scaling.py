@@ -242,6 +242,31 @@ def _override_for(override: typing.Any, key: str) -> typing.Any:
     return override
 
 
+def is_voltage_stream(unit: str, is_electrical: bool) -> bool:
+    """Whether ``target_unit`` should convert a stream declaring *unit*.
+
+    Two independent pieces of evidence, either sufficient. *is_electrical* is a
+    structural fact -- an ``ElectricalSeries`` is voltage by schema, whatever
+    string it carries, including none. A unit that :func:`parse_voltage_unit`
+    places is a *declared* fact, and it is the only evidence available for a
+    plain ``TimeSeries`` holding voltage: writers store electrical data outside
+    ``ElectricalSeries`` routinely -- a re-timestamped companion of an
+    acquisition stream, pointing at the very same HDF5 dataset, is written as a
+    bare ``TimeSeries``. Converting one and not the other would hand two scales
+    for the same bytes to the same graph, silently, which is the failure
+    ``target_unit`` exists to remove.
+
+    Trusting the label here does not contradict distrusting it elsewhere. The
+    unit string is unreliable about *magnitude* -- that is what this module's
+    table of contradictions is about, and what ``scale_override`` /
+    ``unit_override`` exist for -- but about *dimension* it is all there is, and
+    a wrong dimension is not a failure mode writers exhibit: no one labels a
+    cursor position in volts. Streams whose unit names something else
+    (``pixels``, ``n/a``) do not parse, so they are left alone.
+    """
+    return is_electrical or parse_voltage_unit(unit) is not None
+
+
 def convert_to_target_unit(
     gain: typing.Union[float, np.ndarray],
     offset: float,
@@ -327,10 +352,10 @@ def resolve_scaling(
     ``scale_override`` replaces the resolved gain outright, for a file whose
     recorded factors are known to be wrong; ``unit_override`` replaces only the
     declared unit, for one whose number is right and whose label is not.
-    ``target_unit`` then converts the result into the unit the caller wants,
-    and is honoured only when *is_electrical* -- a voltage stream is the only
-    one whose unit this module can reason about. Any of the three may be a bare
-    value (applies to every stream) or a ``{stream_key: value}`` mapping.
+    ``target_unit`` then converts the result into the unit the caller wants, for
+    the voltage streams only -- see :func:`is_voltage_stream`, which *is_electrical*
+    feeds. Any of the three may be a bare value (applies to every stream) or a
+    ``{stream_key: value}`` mapping.
     """
     conversion, offset, unit = read_stored_scaling(dset)
 
@@ -354,7 +379,7 @@ def resolve_scaling(
         unit = str(forced_unit)
 
     target = _override_for(target_unit, stream_key)
-    if target is not None and is_electrical:
+    if target is not None and is_voltage_stream(unit, is_electrical):
         gain, offset, unit = convert_to_target_unit(
             gain, offset, unit, coerce_voltage_unit(target), stream_key=stream_key
         )
