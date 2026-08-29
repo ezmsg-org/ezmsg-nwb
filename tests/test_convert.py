@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from conftest import CHANNEL_CONVERSION, CONVERSION, DECLARED_UNIT, MARKER_N, OFFSET
+from conftest import CHANNEL_CONVERSION, CONVERSION, DECLARED_UNIT, MARKER_N, OFFSET, expected
 from ezmsg.util.messages.axisarray import AxisArray
 
 from ezmsg.nwb import (
@@ -201,3 +201,71 @@ def test_conversion_dtype_is_honoured(scaled_nwb_path, counts):
     np.testing.assert_allclose(
         out.data, counts[:20].astype(np.float64) * CONVERSION * CHANNEL_CONVERSION + OFFSET, rtol=1e-12
     )
+
+
+# --- The per-stream plan cache -----------------------------------------------
+
+
+def test_interleaved_streams_do_not_evict_each_other(scaled_nwb_path):
+    """One reader publishes every stream on one output, so a single cached plan
+    would be rebuilt on every message and two streams would swap scalings. Pin
+    that alternating keys stay correct."""
+    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=False, dejitter=False)
+    try:
+        broadband = slicer.read_by_index("Broadband", 0, 10)
+        aux = slicer.read_by_index("AuxVoltage", 0, 10)
+    finally:
+        slicer.close()
+    tx = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="microvolts"))
+
+    # Interleaved, several rounds, so a one-entry cache would thrash and a
+    # cross-contaminated one would show up as the wrong gain.
+    outs = [tx(m) for _ in range(3) for m in (broadband, aux)]
+    for i in range(0, len(outs), 2):
+        # Broadband declares microvolts already: its per-channel gain, no unit change.
+        np.testing.assert_allclose(outs[i].data, expected(broadband.data), rtol=1e-5)
+        # AuxVoltage declares volts: scalar gain, and a 1e6 unit change on top.
+        np.testing.assert_allclose(outs[i + 1].data, (aux.data * CONVERSION + OFFSET) * 1e6, rtol=1e-5)
+    # Both land in the requested unit despite starting from different ones.
+    assert {o.attrs["unit"] for o in outs} == {"microvolts"}
+
+
+def test_a_changed_scaling_rebuilds_the_plan(scaled_nwb_path):
+    """The cache is keyed on the reported scaling, held by reference. A message
+    carrying a different one must not reuse the old plan."""
+    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=False, dejitter=False)
+    try:
+        msg = slicer.read_by_index("Broadband", 0, 10)
+    finally:
+        slicer.close()
+    tx = NWBScalingTransformer(settings=NWBScalingSettings())
+    first = tx(msg)
+
+    doubled = StreamScaling(np.asarray(msg.attrs[SCALING_ATTR]["gain"]) * 2.0, OFFSET, DECLARED_UNIT, False, True)
+    changed = AxisArray(
+        data=msg.data,
+        dims=msg.dims,
+        axes=msg.axes,
+        attrs={SCALING_ATTR: doubled.as_attr()},
+        key=msg.key,
+    )
+    second = tx(changed)
+    np.testing.assert_allclose(second.data, (msg.data * CONVERSION * CHANNEL_CONVERSION * 2.0) + OFFSET, rtol=1e-5)
+    assert not np.allclose(second.data, first.data)
+
+
+def test_changed_settings_invalidate_cached_plans(scaled_nwb_path):
+    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=False, dejitter=False)
+    try:
+        msg = slicer.read_by_index("Broadband", 0, 10)
+    finally:
+        slicer.close()
+    tx = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="microvolts"))
+    before = tx(msg)
+    # ``update_settings`` is the framework's path: it diffs the fields and asks
+    # for a reset, which is what gives the cache a chance to notice.
+    tx.update_settings(NWBScalingSettings(target_unit="volts"))
+    after = tx(msg)
+    assert before.attrs["unit"] == "microvolts"
+    assert after.attrs["unit"] == "volts"
+    np.testing.assert_allclose(after.data, before.data * 1e-6, rtol=1e-5)

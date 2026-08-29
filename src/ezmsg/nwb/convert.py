@@ -17,15 +17,23 @@ The other use is a graph whose source is not always a file: the reader emits
 what the file declares, and one of these pinned to ``target_unit`` at the head
 of the processing chain makes every branch downstream agree on a scale
 regardless.
+
+**Everything per-stream is resolved once.** A stream's scaling does not change
+from message to message, so resolving overrides, parsing units, and building the
+output ``attrs`` on every message is pure waste -- and at simulated-online sizes
+(30 samples) that waste was 60% of the call. :class:`NWBScalingTransformer`
+caches a :class:`_Plan` per stream key and does nothing per message but one
+multiply.
 """
 
 from __future__ import annotations
 
 import typing
+from dataclasses import dataclass
 
 import ezmsg.core as ez
 import numpy as np
-from ezmsg.baseproc import BaseTransformer, BaseTransformerUnit
+from ezmsg.baseproc import BaseStatefulTransformer, BaseTransformerUnit, processor_state
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
 
@@ -64,40 +72,137 @@ class NWBScalingSettings(ez.Settings):
     change on top of a known unit is well defined."""
 
 
-class NWBScalingTransformer(BaseTransformer[NWBScalingSettings, AxisArray, AxisArray]):
+@dataclass
+class _Plan:
+    """Everything a stream needs, resolved once and reused per message.
+
+    ``source`` is the ``attrs[SCALING_ATTR]`` dict this was built from, kept as
+    a *reference* rather than a hash or an id. Holding it is what makes the
+    identity check safe: an object we hold cannot be freed and have its address
+    reused by a different payload, which is the trap in caching on ``id()``. A
+    payload mutated in place would go stale, but ezmsg messages are read-only by
+    convention and the reader builds each stream's attrs once.
+    """
+
+    source: typing.Any
+    out_attrs: dict[str, typing.Any]
+    """The complete attrs for output messages, prebuilt and shared. Shared is
+    safe for the same reason the slicer shares its template's: nothing mutates
+    an attrs dict in flight."""
+    passthrough: bool = False
+    """Nothing to do -- either no scaling reported, or already in the unit
+    asked for. The message is returned as-is, not copied."""
+    identity: bool = False
+    """The scaling is a no-op arithmetically but the message's labels still need
+    updating: say so in attrs without copying int16 into float to do it."""
+    gain: typing.Any = None
+    """Pre-cast to the output dtype and pre-reshaped for broadcasting."""
+    offset: typing.Any = None
+    """None when zero, so the common case skips a whole pass over the data."""
+    dtype: typing.Any = None
+    n_ch: int = -1
+    """Channel count a vector gain was built for; -1 for a scalar gain."""
+    ndim: int = -1
+
+
+@processor_state
+class NWBScalingState:
+    # ``processor_state`` builds the dataclass with ``init=False``, so a
+    # ``default_factory`` would never run; the repo's convention is a plain
+    # ``None`` default assigned on first reset.
+    plans: dict[str, _Plan] | None = None
+    settings_ref: typing.Any = None
+
+
+class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArray, AxisArray, NWBScalingState]):
     """Apply the scaling a message reports, and update what it reports.
 
-    Stateless and idempotent. Idempotent because it acts on the message's
-    ``applied`` flag rather than on its dtype: two of these in a chain, or one
-    behind a reader that already converted, cannot double-scale. That property
-    is the reason the flag exists -- without it, "has this been scaled?" would
-    have to be guessed from whether the data looks like integers, which is
-    exactly the kind of inference that makes wrong units silent.
+    Idempotent: it acts on the message's ``applied`` flag rather than on its
+    dtype, so two of these in a chain, or one behind a reader that already
+    converted, cannot double-scale. That property is the reason the flag exists
+    -- without it, "has this been scaled?" would have to be guessed from whether
+    the data looks like integers, which is exactly the kind of inference that
+    makes wrong units silent.
 
     A message with no ``attrs[SCALING_ATTR]`` passes through untouched: it did
     not come from an NWB reader, and inventing a scaling for it would be worse
     than doing nothing.
+
+    State is a plan per stream key, not a single current plan, because one
+    reader publishes every stream on one output: with a single plan, two
+    interleaved streams would evict each other on every message and the cache
+    would cost more than it saved.
     """
 
-    def _process(self, message: AxisArray) -> AxisArray:
+    def _hash_message(self, message: AxisArray) -> int:
+        """Cheap and allowed to be wrong.
+
+        Correctness lives in :meth:`_reset_state`, which re-validates against
+        the payload it holds; this only decides whether that check is worth
+        running. So it can use ``id()`` -- a collision costs one dict lookup,
+        not a wrong scaling.
+        """
+        return hash((message.key, id(message.attrs.get(SCALING_ATTR))))
+
+    def _reset_state(self, message: AxisArray) -> None:
+        plans = self._state.plans
+        if plans is None or self._state.settings_ref is not self.settings:
+            # First message, or settings replaced at runtime -- every existing
+            # plan was resolved against the old ones.
+            plans = self._state.plans = {}
+            self._state.settings_ref = self.settings
         payload = message.attrs.get(SCALING_ATTR)
+        plan = plans.get(message.key)
+        if plan is not None and plan.source is payload:
+            return
+        plans[message.key] = self._build_plan(message, payload)
+
+    def _build_plan(self, message: AxisArray, payload: typing.Any) -> _Plan:
         if payload is None:
-            return message
+            return _Plan(source=None, out_attrs=message.attrs, passthrough=True)
 
         scaling = StreamScaling.from_attr(payload)
         requested = override_for(self.settings.target_unit, message.key)
         target = coerce_voltage_unit(requested) if requested is not None and scaling.voltage else None
 
         if scaling.applied:
-            return self._retarget(message, scaling, target)
-        return self._apply(message, scaling, target)
+            resolved = self._plan_retarget(message, scaling, target)
+        else:
+            resolved = self._plan_apply(message, scaling, target)
+        if resolved is None:
+            return _Plan(source=payload, out_attrs=message.attrs, passthrough=True)
 
-    def _retarget(self, message: AxisArray, scaling: StreamScaling, target: typing.Optional[VoltageUnit]) -> AxisArray:
-        """Convert data that already carries its gain and offset.
+        gain, offset, final = resolved
+        out_attrs = {**message.attrs, "unit": final.unit, SCALING_ATTR: final.as_attr()}
+        if is_identity_scaling(gain, offset):
+            # Arithmetically a no-op: record the unit, keep the stored dtype.
+            return _Plan(source=payload, out_attrs=out_attrs, identity=True)
 
-        Only a unit change is available here, and it is one multiply: for
-        ``value = stored * gain + offset``, scaling the values by the unit ratio
-        carries the offset with them, so there is nothing to unwind.
+        out_dtype = np.dtype(self.settings.conversion_dtype)
+        gain_arr = np.asarray(gain, dtype=out_dtype)
+        n_ch = -1
+        if gain_arr.ndim == 1:
+            n_ch = gain_arr.size
+            _check_channels(gain_arr.size, message.data.shape, message.key)
+            gain_arr = gain_arr.reshape((1, gain_arr.size) + (1,) * (message.data.ndim - 2))
+        return _Plan(
+            source=payload,
+            out_attrs=out_attrs,
+            gain=gain_arr,
+            offset=out_dtype.type(offset) if offset else None,
+            dtype=out_dtype,
+            n_ch=n_ch,
+            ndim=message.data.ndim,
+        )
+
+    def _plan_retarget(
+        self, message: AxisArray, scaling: StreamScaling, target: typing.Optional[VoltageUnit]
+    ) -> typing.Optional[tuple[typing.Any, float, StreamScaling]]:
+        """Data already carries its gain and offset; only a unit change is left.
+
+        And that is one multiply: for ``value = stored * gain + offset``, scaling
+        the values by the unit ratio carries the offset along with them, so
+        there is nothing to unwind.
         """
         for name, value in (
             ("scale_override", self.settings.scale_override),
@@ -114,17 +219,19 @@ class NWBScalingTransformer(BaseTransformer[NWBScalingSettings, AxisArray, AxisA
                     f"apply_conversion=False and correct it here."
                 )
         if target is None:
-            return message
+            return None
         ratio = unit_ratio(scaling.unit, target, stream_key=message.key)
         if ratio == 1.0:
-            return message
-        return self._emit(
-            message,
-            _scale(message.data, ratio, 0.0, self.settings.conversion_dtype, message.key),
+            return None
+        return (
+            ratio,
+            0.0,
             StreamScaling(scaling.gain * ratio, scaling.offset * ratio, target.value, True, scaling.voltage),
         )
 
-    def _apply(self, message: AxisArray, scaling: StreamScaling, target: typing.Optional[VoltageUnit]) -> AxisArray:
+    def _plan_apply(
+        self, message: AxisArray, scaling: StreamScaling, target: typing.Optional[VoltageUnit]
+    ) -> tuple[typing.Any, float, StreamScaling]:
         """Apply a pending scaling to stored samples, as the reader would have."""
         gain, offset, unit = scaling.gain, scaling.offset, scaling.unit
         override = override_for(self.settings.scale_override, message.key)
@@ -135,56 +242,36 @@ class NWBScalingTransformer(BaseTransformer[NWBScalingSettings, AxisArray, AxisA
             unit = str(forced)
         if target is not None:
             gain, offset, unit = convert_to_target_unit(gain, offset, unit, target, stream_key=message.key)
+        return gain, offset, StreamScaling(gain, offset, unit, True, scaling.voltage)
 
-        resolved = StreamScaling(gain, offset, unit, True, scaling.voltage)
-        if is_identity_scaling(gain, offset):
-            # The stored samples are already in `unit` -- an integer marker
-            # channel, say. Record that, but do not copy it into float to do so.
-            return self._emit(message, message.data, resolved)
-        return self._emit(
-            message, _scale(message.data, gain, offset, self.settings.conversion_dtype, message.key), resolved
+    def _process(self, message: AxisArray) -> AxisArray:
+        plan = self._state.plans[message.key]
+        if plan.passthrough:
+            return message
+        if plan.identity:
+            return replace(message, attrs=plan.out_attrs)
+        data = message.data
+        if plan.n_ch >= 0 and (data.ndim != plan.ndim or data.shape[1] != plan.n_ch):
+            # Re-checked per message, not just per plan: the plan is keyed on the
+            # reported scaling, which an upstream channel selection does not
+            # change even though it invalidates a positional gain.
+            _check_channels(plan.n_ch, data.shape, message.key)
+        out = np.multiply(data, plan.gain, dtype=plan.dtype)
+        if plan.offset is not None:
+            out += plan.offset
+        return replace(message, data=out, attrs=plan.out_attrs)
+
+
+def _check_channels(n_gain: int, shape: tuple[int, ...], stream_key: str) -> None:
+    """A per-channel gain is positional, so a stage that dropped or reordered
+    channels upstream has silently invalidated it. Length is the only check
+    available, and it catches the common case (a channel subset)."""
+    if len(shape) < 2 or n_gain != shape[1]:
+        raise ValueError(
+            f"per-channel gain of length {n_gain} does not fit {stream_key!r} with shape {shape}. "
+            f"A stage upstream changed the channel axis after the scaling was recorded; apply the conversion "
+            f"before that stage, or at the reader."
         )
-
-    @staticmethod
-    def _emit(message: AxisArray, data: np.ndarray, scaling: StreamScaling) -> AxisArray:
-        return replace(
-            message,
-            data=data,
-            attrs={
-                **message.attrs,
-                "unit": scaling.unit,
-                # Cumulative, stored -> now, so the message keeps describing its
-                # relationship to the file rather than to its previous stage.
-                SCALING_ATTR: scaling.as_attr(),
-            },
-        )
-
-
-def _scale(
-    data: np.ndarray,
-    gain: typing.Union[float, np.ndarray],
-    offset: float,
-    dtype: typing.Any,
-    stream_key: str,
-) -> np.ndarray:
-    """``data * gain + offset`` in *dtype*, with the channel axis respected."""
-    out_dtype = np.dtype(dtype)
-    gain_arr = np.asarray(gain, dtype=out_dtype)
-    if gain_arr.ndim == 1:
-        # A per-channel gain is positional, so any upstream stage that dropped
-        # or reordered channels has silently invalidated it. Length is the only
-        # check available, and it catches the common case (a channel subset).
-        if data.ndim < 2 or gain_arr.size != data.shape[1]:
-            raise ValueError(
-                f"per-channel gain of length {gain_arr.size} does not fit {stream_key!r} with shape {data.shape}. "
-                f"A stage upstream changed the channel axis after the scaling was recorded; apply the conversion "
-                f"before that stage, or at the reader."
-            )
-        gain_arr = gain_arr.reshape((1, gain_arr.size) + (1,) * (data.ndim - 2))
-    out = np.multiply(data, gain_arr, dtype=out_dtype)
-    if offset:
-        out += out_dtype.type(offset)
-    return out
 
 
 class NWBScalingUnit(BaseTransformerUnit[NWBScalingSettings, AxisArray, AxisArray, NWBScalingTransformer]):

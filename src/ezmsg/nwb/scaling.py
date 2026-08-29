@@ -406,8 +406,18 @@ def is_identity_scaling(gain: typing.Union[float, np.ndarray], offset: float) ->
     claims, so wrapping it would only trade its stored dtype for a float32 copy
     of the same numbers -- a needless doubling on an int16 broadband stream, and
     a surprise for a caller reading an integer marker channel.
+
+    The scalar case avoids numpy entirely. ``np.all(np.asarray(x) == 1.0)`` on a
+    Python float costs ~1.5 us -- two array allocations and a reduction to
+    answer a question ``==`` answers -- which is a third of the budget for a
+    30-sample message and was the single largest per-message cost in the
+    downstream transformer.
     """
-    return bool(np.all(np.asarray(gain) == 1.0)) and offset == 0.0
+    if offset:
+        return False
+    if isinstance(gain, float):
+        return gain == 1.0
+    return bool(np.all(np.asarray(gain) == 1.0))
 
 
 SCALING_ATTR = "nwb_scaling"
