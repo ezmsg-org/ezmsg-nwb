@@ -26,6 +26,7 @@ from .clockmodel import (
     group_clocks,
     reconstruct_group,
 )
+from .electrodes import build_channel_axis
 from .scaling import SCALING_ATTR, StreamScaling, describe_stream_scaling
 from .util import ReferenceClockType, as_text, as_text_array, interval_median
 
@@ -273,6 +274,15 @@ class NWBSlicer:
             segment is reconstructed independently) so the iterator still splits a
             chunk there. Pass ``float("inf")`` to disable the guard and smooth
             everything. Ignored when ``dejitter`` is False.
+        structured_ch_axis: Build the ``ch`` axis as a structured
+            :data:`~ezmsg.nwb.electrodes.CHANNEL_DTYPE` array -- position,
+            label, bank, headstage, array identity -- from the electrodes table,
+            matching what a live acquisition source emits, so a graph replaying
+            a file sees the axis it was written against. Default False: the
+            columns this reads are an acquisition-stack convention rather than
+            part of the NWB schema, and most files carry none of them. Raises
+            for a file that has none rather than inventing geometry. See
+            :mod:`~ezmsg.nwb.electrodes`.
     Note:
         Data comes back as the file stores it -- integer ADC counts, typically,
         not the unit the file declares. Every message carries what it takes to
@@ -300,6 +310,7 @@ class NWBSlicer:
         clock_groups: typing.Optional[list[list[str]]] = None,
         dejitter_cache: bool = True,
         real_gap_threshold: typing.Optional[float] = None,
+        structured_ch_axis: bool = False,
     ):
         self._filepath = filepath
         self._reference_clock = reference_clock
@@ -311,6 +322,7 @@ class NWBSlicer:
         self._clock_groups = clock_groups
         self._dejitter_cache = dejitter_cache
         self._real_gap_threshold = real_gap_threshold
+        self._structured_ch_axis = structured_ch_axis
 
         self._io: pynwb.NWBHDF5IO | None = None
         self._ts_off: float = 0.0
@@ -486,19 +498,29 @@ class NWBSlicer:
                 # directly is the same values for a thirtieth of the work.
                 region_idx = np.asarray(child.electrodes.data)
                 table = child.electrodes.table
-                if "label" in table.colnames:
+                if self._structured_ch_axis:
+                    # A record per channel, matching what a live source emits, so
+                    # a graph replaying a file sees the axis it was written for.
+                    axes["ch"] = AxisArray.CoordinateAxis(
+                        data=build_channel_axis(table, region_idx, stream_key=matched_key),
+                        dims=["ch"],
+                        unit="struct",
+                    )
+                elif "label" in table.colnames:
                     # Decoded here, at the read boundary: these labels become the
                     # ch-axis coordinates every downstream name-based channel
                     # selection matches against.
                     ch_labels = as_text_array(np.asarray(table["label"].data[:])[region_idx])
+                    axes["ch"] = AxisArray.CoordinateAxis(data=ch_labels, dims=["ch"])
                 else:
                     # ``to_dataframe`` indexes by the table's ``id`` column, so the
                     # fallback names must come from ``id`` too -- not from the
                     # positional indices, which coincide with it only when the
                     # series references the whole table in order.
                     ids = np.asarray(table.id.data[:])[region_idx]
-                    ch_labels = np.array([f"ch_{idx}" for idx in ids.tolist()])
-                axes["ch"] = AxisArray.CoordinateAxis(data=ch_labels, dims=["ch"])
+                    axes["ch"] = AxisArray.CoordinateAxis(
+                        data=np.array([f"ch_{idx}" for idx in ids.tolist()]), dims=["ch"]
+                    )
 
             # ``matched_key`` is the user-facing key — equal to ``child.name``
             # when there's no stream_keys filter or an exact match, or the

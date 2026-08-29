@@ -5,6 +5,10 @@ from .clockdriven import NWBClockDrivenUnit as NWBClockDrivenUnit
 from .convert import NWBScalingSettings as NWBScalingSettings
 from .convert import NWBScalingTransformer as NWBScalingTransformer
 from .convert import NWBScalingUnit as NWBScalingUnit
+from .electrodes import CHANNEL_DTYPE as CHANNEL_DTYPE
+from .electrodes import array_identity as array_identity
+from .electrodes import build_channel_axis as build_channel_axis
+from .electrodes import has_channel_metadata as has_channel_metadata
 from .iterator import NWBAxisArrayIterator as NWBAxisArrayIterator
 from .iterator import NWBIteratorSettings as NWBIteratorSettings
 from .iterator import NWBIteratorState as NWBIteratorState
