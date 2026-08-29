@@ -9,6 +9,7 @@ file where any of them is 1.0/0.0 cannot tell you whether it was applied.
 from __future__ import annotations
 
 import datetime
+import json
 
 import numpy as np
 import pytest
@@ -17,6 +18,7 @@ from pynwb.ecephys import ElectricalSeries
 
 from ezmsg.nwb import (
     MICROVOLT_UNITS,
+    SCALING_ATTR,
     NWBAxisArrayIterator,
     NWBIteratorSettings,
     NWBSlicer,
@@ -27,6 +29,7 @@ from ezmsg.nwb import (
     parse_voltage_unit,
     read_stored_scaling,
     resolve_scaling,
+    resolve_stream_scaling,
 )
 
 N_SAMPLES = 500
@@ -434,6 +437,120 @@ def test_target_unit_flows_through_the_iterator(scaled_nwb_path, counts):
     got = np.concatenate([m.data for m in msgs], axis=0)
     assert msgs[0].attrs["unit"] == "volts"
     np.testing.assert_allclose(got, expected(counts)[: got.shape[0]] * 1e-6, rtol=1e-6)
+
+
+# --- The scaling reported on the message -------------------------------------
+
+
+def test_scaling_is_reported_when_applied(scaled_nwb_path):
+    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=True, dejitter=False)
+    try:
+        sc = slicer.read_by_index("Broadband", 0, 5).attrs[SCALING_ATTR]
+    finally:
+        slicer.close()
+    assert sc["applied"] is True
+    assert sc["unit"] == DECLARED_UNIT
+    assert sc["offset"] == pytest.approx(OFFSET)
+    np.testing.assert_allclose(sc["gain"], CONVERSION * CHANNEL_CONVERSION, rtol=1e-6)
+
+
+def test_scaling_is_reported_even_when_not_applied(scaled_nwb_path, counts):
+    """``apply_conversion=False`` asks for the stored samples, not for the
+    factors to be forgotten. Without them on the message a caller who wants to
+    scale downstream -- after decimation, on a GPU -- has to reopen the file to
+    recover what the reader already had."""
+    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=False, dejitter=False)
+    try:
+        msg = slicer.read_by_index("Broadband", 0, 5)
+    finally:
+        slicer.close()
+    sc = msg.attrs[SCALING_ATTR]
+    assert sc["applied"] is False
+    # No ``unit`` on the message: the data is counts, and calling counts
+    # microvolts is the bug this module exists to prevent. The unit the data
+    # *would* be in lives inside the scaling, where it cannot be mistaken for a
+    # description of what the caller is holding.
+    assert "unit" not in msg.attrs
+    assert sc["unit"] == DECLARED_UNIT
+
+    # The reported factors are sufficient: applying them by hand reproduces
+    # exactly what apply_conversion=True would have returned.
+    by_hand = msg.data * np.asarray(sc["gain"], dtype=np.float32) + np.float32(sc["offset"])
+    np.testing.assert_allclose(by_hand, expected(counts)[0:5], rtol=1e-6)
+
+
+def test_reported_scaling_includes_the_overrides_and_target(scaled_nwb_path):
+    """It describes the numbers the caller holds, not the file's raw attributes
+    -- otherwise a stage trusting it would undo the correction it was given."""
+    slicer = NWBSlicer(scaled_nwb_path, scale_override=0.1, target_unit="volts", dejitter=False)
+    try:
+        sc = slicer.read_by_index("Broadband", 0, 5).attrs[SCALING_ATTR]
+    finally:
+        slicer.close()
+    assert sc["unit"] == "volts"
+    assert sc["gain"] == pytest.approx(0.1 * 1e-6)
+    assert sc["offset"] == pytest.approx(OFFSET * 1e-6)
+
+
+def test_reported_gain_is_scalar_when_the_channels_agree(scaled_nwb_path):
+    """Uniform per-channel factors collapse, so the common case reports one
+    number rather than an array a downstream stage has to keep aligned with the
+    ch axis through every channel selection."""
+    slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
+    try:
+        broadband = slicer.read_by_index("Broadband", 0, 5).attrs[SCALING_ATTR]
+        aux = slicer.read_by_index("AuxVoltage", 0, 5).attrs[SCALING_ATTR]
+    finally:
+        slicer.close()
+    # Broadband's channel_conversion entries differ, so its gain stays a vector.
+    assert np.ndim(broadband["gain"]) == 1
+    # AuxVoltage has none at all.
+    assert isinstance(aux["gain"], float)
+
+
+def test_reported_scaling_survives_the_message_codec(scaled_nwb_path, tmp_path):
+    """A vector gain puts a numpy array inside attrs, which is a shape nothing
+    else in these messages has. Pin that it logs and reloads."""
+    from ezmsg.util.messagecodec import MessageDecoder, MessageEncoder
+
+    slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
+    try:
+        msg = slicer.read_by_index("Broadband", 0, 5)
+    finally:
+        slicer.close()
+    reloaded = json.loads(json.dumps(msg, cls=MessageEncoder), cls=MessageDecoder)
+    sc = reloaded.attrs[SCALING_ATTR]
+    np.testing.assert_allclose(sc["gain"], msg.attrs[SCALING_ATTR]["gain"], rtol=1e-9)
+    assert sc["unit"] == DECLARED_UNIT and sc["applied"] is True
+
+
+def test_text_streams_report_no_scaling():
+    """A text series is materialized into a str array before this point. It has
+    no gain, so it reports no scaling at all rather than a misleading identity
+    one -- and no ``unit``, which would be nonsense on strings."""
+    result = resolve_stream_scaling(np.array(["left", "right"]))
+    assert result.scaling is None
+    assert result.unit == ""
+
+
+def test_iterator_messages_carry_the_scaling(scaled_nwb_path):
+    it = NWBAxisArrayIterator(
+        settings=NWBIteratorSettings(
+            filepath=str(scaled_nwb_path),
+            chunk_dur=0.2,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            stream_keys=["Broadband"],
+            dejitter=False,
+            apply_conversion=False,
+        )
+    )
+    try:
+        msg = next(m for m in it if m.data.shape[0])
+    finally:
+        it.close()
+    assert msg.data.dtype == np.int16
+    assert msg.attrs[SCALING_ATTR]["applied"] is False
+    np.testing.assert_allclose(msg.attrs[SCALING_ATTR]["gain"], CONVERSION * CHANNEL_CONVERSION, rtol=1e-6)
 
 
 # --- Through the iterator ---------------------------------------------------

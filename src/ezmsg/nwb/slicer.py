@@ -26,7 +26,14 @@ from .clockmodel import (
     group_clocks,
     reconstruct_group,
 )
-from .scaling import DEFAULT_CONVERSION_DTYPE, VoltageUnit, maybe_scale, unwrap_dataset
+from .scaling import (
+    DEFAULT_CONVERSION_DTYPE,
+    SCALING_ATTR,
+    StreamScaling,
+    VoltageUnit,
+    resolve_stream_scaling,
+    unwrap_dataset,
+)
 from .util import ReferenceClockType, as_text, as_text_array
 
 # Default gap threshold as a fraction of the nominal sample period (1.5x period).
@@ -130,6 +137,15 @@ class StreamInfo:
     the requested unit instead when ``target_unit`` converted the stream, since
     then it describes the numbers rather than the file. Either way it is copied
     onto each message's ``attrs["unit"]``.
+    """
+
+    scaling: typing.Optional[StreamScaling] = None
+    """How this stream's samples relate to the file, applied or not.
+
+    Present even when ``apply_conversion`` is off, so a caller who asked for
+    stored samples can still scale them downstream without reopening the file.
+    Copied onto each message's ``attrs[SCALING_ATTR]``. None only for text
+    streams, which have no scaling to describe.
     """
 
 
@@ -277,7 +293,10 @@ class NWBSlicer:
             data comes out in the unit the file declares rather than as raw ADC
             counts. See :mod:`~ezmsg.nwb.scaling`. Set False to read the stored
             integers unchanged -- the pre-1.9 behaviour, and the only way to
-            reproduce a result computed under it.
+            reproduce a result computed under it. The factors are reported on
+            every message either way, under ``attrs[SCALING_ATTR]``, so reading
+            stored samples does not throw away what it takes to scale them
+            later.
         conversion_dtype: Output dtype for streams that get scaled
             (default ``float32``). Ignored when ``apply_conversion`` is False,
             and for any stream whose scaling is the identity: those keep their
@@ -541,21 +560,20 @@ class NWBSlicer:
             # Wrap the dataset rather than converting at each call site: every
             # read path here and in the iterator goes through ``info.dset``, so
             # one wrapper covers all of them and none can forget.
-            unit = ""
-            if self._apply_conversion:
-                dset, unit = maybe_scale(
-                    dset,
-                    getattr(child, "channel_conversion", None),
-                    dtype=self._conversion_dtype,
-                    scale_override=self._scale_override,
-                    unit_override=self._unit_override,
-                    target_unit=self._target_unit,
-                    # One of the two things that make a stream convertible; the
-                    # other is its declared unit, which is what covers voltage
-                    # written as a plain TimeSeries. See ``is_voltage_stream``.
-                    is_electrical=isinstance(child, pynwb.ecephys.ElectricalSeries),
-                    stream_key=matched_key,
-                )
+            dset, unit, scaling = resolve_stream_scaling(
+                dset,
+                getattr(child, "channel_conversion", None),
+                apply=self._apply_conversion,
+                dtype=self._conversion_dtype,
+                scale_override=self._scale_override,
+                unit_override=self._unit_override,
+                target_unit=self._target_unit,
+                # One of the two things that make a stream convertible; the
+                # other is its declared unit, which is what covers voltage
+                # written as a plain TimeSeries. See ``is_voltage_stream``.
+                is_electrical=isinstance(child, pynwb.ecephys.ElectricalSeries),
+                stream_key=matched_key,
+            )
 
             self._streams[matched_key] = StreamInfo(
                 dset=dset,
@@ -565,10 +583,14 @@ class NWBSlicer:
                     if child.data.ndim > 1
                     else ["time"],
                     axes=axes,
-                    # The unit each message is in, as the file declares it. Only
-                    # meaningful once the conversion has been applied, so it is
-                    # absent (not "counts") when it has not.
-                    attrs={"unit": unit} if unit else {},
+                    # ``unit`` describes the data, so it is absent (not
+                    # "counts") when the conversion was not applied.
+                    # ``nwb_scaling`` describes the file, so it is present
+                    # either way -- with ``applied`` saying which.
+                    attrs=(
+                        ({"unit": unit} if unit else {})
+                        | ({SCALING_ATTR: scaling.as_attr()} if scaling is not None else {})
+                    ),
                     key=matched_key,
                 ),
                 fs=rate,
@@ -583,6 +605,7 @@ class NWBSlicer:
                 is_event=False,
                 table_ref=None,
                 unit=unit,
+                scaling=scaling,
             )
 
         self._start_time = start_time

@@ -398,25 +398,81 @@ def is_identity_scaling(gain: typing.Union[float, np.ndarray], offset: float) ->
     return bool(np.all(np.asarray(gain) == 1.0)) and offset == 0.0
 
 
-def maybe_scale(
+SCALING_ATTR = "nwb_scaling"
+"""Key under which a message reports the scaling that relates it to the file.
+
+Namespaced rather than flat ``attrs["conversion"]``/``attrs["offset"]``: attrs
+is a shared dict that any stage downstream may add to, and three unqualified
+generic words are a collision waiting to happen.
+"""
+
+
+class StreamScaling(typing.NamedTuple):
+    """The total transformation from a stream's stored samples to its values.
+
+    ``value = stored * gain + offset``, expressed in ``unit``. Total, not the
+    file's raw attributes: any ``scale_override`` and ``target_unit`` are
+    already folded in, so this describes the numbers a caller actually holds
+    (or, when ``applied`` is False, the ones they would hold after applying it
+    themselves).
+    """
+
+    gain: typing.Union[float, np.ndarray]
+    """Scalar, or a per-channel vector aligned with the ``ch`` axis."""
+    offset: float
+    unit: str
+    """Unit the values are in once *gain* and *offset* are applied."""
+    applied: bool
+    """False when the caller asked for the stored samples (``apply_conversion``
+    off), in which case the data is raw and this is what to do about it."""
+
+    def as_attr(self) -> dict[str, typing.Any]:
+        """The ``attrs[SCALING_ATTR]`` payload -- a plain dict, so it survives
+        the message codec and anything else that walks attrs generically."""
+        return {"gain": self.gain, "offset": self.offset, "unit": self.unit, "applied": self.applied}
+
+
+class ScalingResult(typing.NamedTuple):
+    """What :func:`resolve_stream_scaling` hands the slicer."""
+
+    dset: typing.Any
+    """The dataset to read through -- wrapped, or the original."""
+    unit: str
+    """Unit of what ``dset`` yields; ``""`` when that is raw stored samples,
+    because counts are not volts and labelling them so is the whole bug."""
+    scaling: typing.Optional[StreamScaling]
+    """None only for a stream that has no scaling to speak of (text)."""
+
+
+def resolve_stream_scaling(
     dset: typing.Any,
     channel_conversion: typing.Any = None,
     *,
+    apply: bool = True,
     dtype: typing.Any = DEFAULT_CONVERSION_DTYPE,
     scale_override: typing.Any = None,
     unit_override: typing.Any = None,
     target_unit: typing.Any = None,
     is_electrical: bool = False,
     stream_key: str = "",
-) -> tuple[typing.Any, str]:
-    """``(dataset, unit)`` with the stored scaling applied on read.
+) -> ScalingResult:
+    """Resolve a stream's scaling, and apply it unless *apply* is False.
 
-    Returns *dset* unwrapped and unchanged when the resolved scaling is the
-    identity, or when *dset* is not an h5py dataset (a materialized text column
-    has no gain to apply). Otherwise returns a :class:`ScaledDataset`.
+    Resolved either way, on purpose. ``apply=False`` asks for the stored
+    samples, not for the factors to be forgotten: a caller who wants counts
+    usually wants to scale them later (in a processing stage, on a GPU, after
+    decimation), and dropping the factors here would make them reopen the file
+    to recover what this function already had in hand. So the numbers are
+    reported on the message either way, and ``applied`` says which it is.
+
+    Returns *dset* unwrapped when the resolved scaling is the identity -- there
+    is nothing to compute, so a stored int16 stays int16 rather than becoming a
+    float32 copy of the same values.
     """
     if not isinstance(dset, h5py.Dataset) or dset.dtype.kind not in "iuf":
-        return dset, ""
+        # A materialized text column: no gain, and nothing to say about one.
+        return ScalingResult(dset, "", None)
+
     gain, offset, unit = resolve_scaling(
         dset,
         channel_conversion,
@@ -426,6 +482,11 @@ def maybe_scale(
         is_electrical=is_electrical,
         stream_key=stream_key,
     )
+    gain = gain if isinstance(gain, np.ndarray) else float(gain)
+
+    if not apply:
+        return ScalingResult(dset, "", StreamScaling(gain, offset, unit, applied=False))
+    scaling = StreamScaling(gain, offset, unit, applied=True)
     if is_identity_scaling(gain, offset):
-        return dset, unit
-    return ScaledDataset(dset, gain, offset, dtype), unit
+        return ScalingResult(dset, unit, scaling)
+    return ScalingResult(ScaledDataset(dset, gain, offset, dtype), unit, scaling)
