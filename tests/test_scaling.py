@@ -23,12 +23,18 @@ from conftest import (
 )
 
 from ezmsg.nwb import (
+    APPLIED_ATTR,
+    GAIN_ATTR,
     MICROVOLT_UNITS,
-    SCALING_ATTR,
+    OFFSET_ATTR,
+    SCALING_ATTRS,
+    UNIT_ATTR,
+    VOLTAGE_ATTR,
     NWBAxisArrayIterator,
     NWBIteratorSettings,
     NWBSlicer,
     ReferenceClockType,
+    StreamScaling,
     VoltageUnit,
     describe_stream_scaling,
     is_voltage_stream,
@@ -107,14 +113,14 @@ def test_the_slicer_reports_what_the_samples_mean(scaled_nwb_path):
     slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
     try:
         info = slicer.get_stream_info("Broadband")
-        sc = info.template.attrs[SCALING_ATTR]
+        sc = StreamScaling.from_attrs(info.template.attrs)
     finally:
         slicer.close()
-    np.testing.assert_allclose(sc["gain"], CONVERSION * CHANNEL_CONVERSION, rtol=1e-6)
-    assert sc["offset"] == pytest.approx(OFFSET)
-    assert sc["unit"] == DECLARED_UNIT
-    assert sc["applied"] is False
-    assert sc["voltage"] is True
+    np.testing.assert_allclose(sc.gain, CONVERSION * CHANNEL_CONVERSION, rtol=1e-6)
+    assert sc.offset == pytest.approx(OFFSET)
+    assert sc.unit == DECLARED_UNIT
+    assert sc.applied is False
+    assert sc.voltage is True
     # No ``unit`` key: the data is counts, and calling counts microvolts is the
     # bug this whole module exists to prevent. The unit lives inside the
     # scaling, where it reads as pending rather than as a claim about the data.
@@ -140,7 +146,7 @@ def test_read_by_index_carries_the_scaling(scaled_nwb_path, counts):
     finally:
         slicer.close()
     np.testing.assert_array_equal(msg.data, counts[10:20])
-    assert msg.attrs[SCALING_ATTR]["unit"] == DECLARED_UNIT
+    assert msg.attrs[UNIT_ATTR] == DECLARED_UNIT
 
 
 def test_reported_gain_is_scalar_when_the_channels_agree(scaled_nwb_path):
@@ -149,14 +155,14 @@ def test_reported_gain_is_scalar_when_the_channels_agree(scaled_nwb_path):
     ch axis through every channel selection."""
     slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
     try:
-        broadband = slicer.read_by_index("Broadband", 0, 5).attrs[SCALING_ATTR]
-        aux = slicer.read_by_index("AuxVoltage", 0, 5).attrs[SCALING_ATTR]
+        broadband = slicer.read_by_index("Broadband", 0, 5).attrs[GAIN_ATTR]
+        aux = slicer.read_by_index("AuxVoltage", 0, 5).attrs[GAIN_ATTR]
     finally:
         slicer.close()
     # Broadband's channel_conversion entries differ, so its gain stays a vector.
-    assert np.ndim(broadband["gain"]) == 1
+    assert np.ndim(broadband) == 1
     # AuxVoltage has none at all.
-    assert isinstance(aux["gain"], float)
+    assert isinstance(aux, float)
 
 
 def test_reported_scaling_survives_the_message_codec(scaled_nwb_path):
@@ -170,9 +176,8 @@ def test_reported_scaling_survives_the_message_codec(scaled_nwb_path):
     finally:
         slicer.close()
     reloaded = json.loads(json.dumps(msg, cls=MessageEncoder), cls=MessageDecoder)
-    sc = reloaded.attrs[SCALING_ATTR]
-    np.testing.assert_allclose(sc["gain"], msg.attrs[SCALING_ATTR]["gain"], rtol=1e-9)
-    assert sc["unit"] == DECLARED_UNIT and sc["applied"] is False
+    np.testing.assert_allclose(reloaded.attrs[GAIN_ATTR], msg.attrs[GAIN_ATTR], rtol=1e-9)
+    assert reloaded.attrs[UNIT_ATTR] == DECLARED_UNIT and reloaded.attrs[APPLIED_ATTR] is False
 
 
 def test_iterator_messages_are_stored_samples_carrying_the_scaling(scaled_nwb_path, counts):
@@ -192,8 +197,8 @@ def test_iterator_messages_are_stored_samples_carrying_the_scaling(scaled_nwb_pa
     got = np.concatenate([m.data for m in chunks], axis=0)
     assert got.dtype == np.int16
     np.testing.assert_array_equal(got, counts[: got.shape[0]])
-    np.testing.assert_allclose(chunks[0].attrs[SCALING_ATTR]["gain"], CONVERSION * CHANNEL_CONVERSION, rtol=1e-6)
-    assert chunks[0].attrs[SCALING_ATTR]["applied"] is False
+    np.testing.assert_allclose(chunks[0].attrs[GAIN_ATTR], CONVERSION * CHANNEL_CONVERSION, rtol=1e-6)
+    assert chunks[0].attrs[APPLIED_ATTR] is False
 
 
 def test_marker_streams_keep_their_dtype_and_declare_identity(scaled_nwb_path):
@@ -251,3 +256,47 @@ def test_unit_spellings_are_all_accepted():
     assert parse_voltage_unit("V") is VoltageUnit.VOLTS
     assert parse_voltage_unit("nanovolts") is VoltageUnit.NANOVOLTS
     assert parse_voltage_unit("pixels") is None
+
+
+# --- The shape the scaling takes in attrs ------------------------------------
+
+
+class TestFlatAttrShape:
+    """Five prefixed scalars, not one nested dict.
+
+    The shape is part of the contract, not an implementation detail: a nested
+    dict is opaque to any stage that walks attrs generically, and ezmsg-sigproc's
+    ``concat`` rejects one outright -- even when both messages carry an identical
+    one. See :data:`~ezmsg.nwb.scaling.SCALING_ATTR`.
+    """
+
+    def test_no_value_is_a_container(self, scaled_nwb_path):
+        slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
+        try:
+            attrs = slicer.read_by_index("AuxVoltage", 0, 5).attrs
+        finally:
+            slicer.close()
+        assert set(attrs) == set(SCALING_ATTRS)
+        for key, value in attrs.items():
+            assert isinstance(value, (str, int, float, bool)), f"{key} is {type(value).__name__}"
+
+    def test_a_vector_gain_is_the_one_documented_exception(self, scaled_nwb_path):
+        """Broadband's channel_conversion entries genuinely differ, so its gain
+        stays an array. Every other key is still a scalar."""
+        slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
+        try:
+            attrs = slicer.read_by_index("Broadband", 0, 5).attrs
+        finally:
+            slicer.close()
+        assert isinstance(attrs[GAIN_ATTR], np.ndarray)
+        for key in (OFFSET_ATTR, UNIT_ATTR, APPLIED_ATTR, VOLTAGE_ATTR):
+            assert isinstance(attrs[key], (str, int, float, bool))
+
+    def test_attrs_round_trip_through_stream_scaling(self):
+        original = StreamScaling(gain=0.25, offset=1.5, unit="volts", applied=True, voltage=True)
+
+        assert StreamScaling.from_attrs(original.as_attrs()) == original
+
+    def test_a_message_with_no_scaling_reads_back_as_none(self):
+        assert StreamScaling.from_attrs({}) is None
+        assert StreamScaling.from_attrs({"unit": "volts"}) is None

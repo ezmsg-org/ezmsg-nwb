@@ -27,7 +27,7 @@ from .clockmodel import (
     reconstruct_group,
 )
 from .electrodes import build_channel_axis
-from .scaling import SCALING_ATTR, StreamScaling, describe_stream_scaling
+from .scaling import StreamScaling, describe_stream_scaling
 from .util import ReferenceClockType, as_text, as_text_array, interval_median
 
 # Default gap threshold as a fraction of the nominal sample period (1.5x period).
@@ -130,7 +130,7 @@ class StreamInfo:
     The file's own numbers verbatim, including its unit string, which is
     frequently wrong; interpreting it here would hide that. Correcting and
     applying it is :mod:`~ezmsg.nwb.convert`'s job. Copied onto every message's
-    ``attrs[SCALING_ATTR]``. None only for text streams, which have no scaling
+    ``nwb_scaling_*`` attrs. None only for text streams, which have no scaling
     to describe.
     """
 
@@ -286,7 +286,7 @@ class NWBSlicer:
     Note:
         Data comes back as the file stores it -- integer ADC counts, typically,
         not the unit the file declares. Every message carries what it takes to
-        convert under ``attrs[SCALING_ATTR]``; put a
+        convert under its ``nwb_scaling_*`` attrs; put a
         :class:`~ezmsg.nwb.convert.NWBScalingUnit` in the graph (or call
         :class:`~ezmsg.nwb.convert.NWBScalingTransformer` directly) to apply it.
         Doing it there rather than here is both cleaner and marginally faster --
@@ -558,7 +558,7 @@ class NWBSlicer:
                     # volts is the whole bug. ``nwb_scaling`` says what they
                     # would become, and the transformer stamps ``unit`` once it
                     # has actually made them that.
-                    attrs={SCALING_ATTR: scaling.as_attr()} if scaling is not None else {},
+                    attrs=scaling.as_attrs() if scaling is not None else {},
                     key=matched_key,
                 ),
                 fs=rate,

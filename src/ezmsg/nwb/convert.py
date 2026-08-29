@@ -3,7 +3,7 @@
 :class:`~ezmsg.nwb.slicer.NWBSlicer` applies a file's conversion on read by
 default. Passing ``apply_conversion=False`` defers it, and this is what picks it
 up later in the graph: every message carries the factors under
-``attrs[SCALING_ATTR]`` (see :mod:`~ezmsg.nwb.scaling`), so a stage far from the
+``nwb_scaling_*`` attrs (see :mod:`~ezmsg.nwb.scaling`), so a stage far from the
 file can still do exactly what the reader would have.
 
 Why defer at all? Reading raw is the only way to keep a broadband stream int16
@@ -39,13 +39,13 @@ from ezmsg.util.messages.util import replace
 
 from .scaling import (
     DEFAULT_CONVERSION_DTYPE,
-    SCALING_ATTR,
     StreamScaling,
     VoltageUnit,
     coerce_voltage_unit,
     convert_to_target_unit,
     is_identity_scaling,
     override_for,
+    scaling_fingerprint,
     unit_ratio,
 )
 
@@ -76,15 +76,19 @@ class NWBScalingSettings(ez.Settings):
 class _Plan:
     """Everything a stream needs, resolved once and reused per message.
 
-    ``source`` is the ``attrs[SCALING_ATTR]`` dict this was built from, kept as
-    a *reference* rather than a hash or an id. Holding it is what makes the
-    identity check safe: an object we hold cannot be freed and have its address
-    reused by a different payload, which is the trap in caching on ``id()``. A
-    payload mutated in place would go stale, but ezmsg messages are read-only by
-    convention and the reader builds each stream's attrs once.
+    ``source`` is the :func:`~ezmsg.nwb.scaling.scaling_fingerprint` of the attrs
+    this was built from -- a by-value summary, so a stage that rebuilds attrs
+    without changing the scaling still hits, and a stream whose scaling genuinely
+    changes mid-run rebuilds. None when the message reported no scaling.
+
+    ``attrs_ref`` is the attrs dict itself, kept only to pin it alive. The cheap
+    per-message check in :meth:`NWBScalingTransformer._hash_message` is keyed on
+    its ``id()``, and an object we hold cannot be freed and have its address
+    reused by a different dict -- which is the trap in caching on ``id()``.
     """
 
     source: typing.Any
+    attrs_ref: typing.Any
     out_attrs: dict[str, typing.Any]
     """The complete attrs for output messages, prebuilt and shared. Shared is
     safe for the same reason the slicer shares its template's: nothing mutates
@@ -124,7 +128,7 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
     the data looks like integers, which is exactly the kind of inference that
     makes wrong units silent.
 
-    A message with no ``attrs[SCALING_ATTR]`` passes through untouched: it did
+    A message with no ``nwb_scaling_*`` attrs passes through untouched: it did
     not come from an NWB reader, and inventing a scaling for it would be worse
     than doing nothing.
 
@@ -135,14 +139,21 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
     """
 
     def _hash_message(self, message: AxisArray) -> int:
-        """Cheap and allowed to be wrong.
+        """Cheap and allowed to be wrong -- this runs on *every* message.
 
-        Correctness lives in :meth:`_reset_state`, which re-validates against
-        the payload it holds; this only decides whether that check is worth
-        running. So it can use ``id()`` -- a collision costs one dict lookup,
-        not a wrong scaling.
+        Correctness lives in :meth:`_reset_state`, which re-validates by value
+        against the fingerprint it holds; this only decides whether that check is
+        worth running. So it keys on the identity of the attrs dict, which the
+        reader builds once per stream and every message of that stream shares.
+
+        Reading the five ``nwb_scaling_*`` values here instead would be right but
+        wasteful: it costs ~160 ns against a ~2 us call, and :meth:`_reset_state`
+        pays it again on the way through. ``id()`` is safe because the plan holds
+        the dict (see :class:`_Plan`), so no other object can take its address.
+        A stage that rebuilds attrs per message merely lands in ``_reset_state``,
+        whose by-value check then hits without rebuilding the plan.
         """
-        return hash((message.key, id(message.attrs.get(SCALING_ATTR))))
+        return hash((message.key, id(message.attrs)))
 
     def _reset_state(self, message: AxisArray) -> None:
         plans = self._state.plans
@@ -151,17 +162,21 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
             # plan was resolved against the old ones.
             plans = self._state.plans = {}
             self._state.settings_ref = self.settings
-        payload = message.attrs.get(SCALING_ATTR)
+        fingerprint = scaling_fingerprint(message.attrs)
         plan = plans.get(message.key)
-        if plan is not None and plan.source is payload:
+        if plan is not None and plan.source == fingerprint:
+            # Same scaling, different attrs dict -- an upstream stage rebuilt it.
+            # Re-pin to the dict ``_hash_message`` is now keyed on, or that id()
+            # would name an object nothing holds, free to be released and have
+            # its address taken by attrs carrying a *different* scaling.
+            plan.attrs_ref = message.attrs
             return
-        plans[message.key] = self._build_plan(message, payload)
+        plans[message.key] = self._build_plan(message, fingerprint)
 
-    def _build_plan(self, message: AxisArray, payload: typing.Any) -> _Plan:
-        if payload is None:
-            return _Plan(source=None, out_attrs=message.attrs, passthrough=True)
-
-        scaling = StreamScaling.from_attr(payload)
+    def _build_plan(self, message: AxisArray, fingerprint: typing.Optional[tuple]) -> _Plan:
+        scaling = StreamScaling.from_attrs(message.attrs)
+        if scaling is None:
+            return _Plan(source=None, attrs_ref=message.attrs, out_attrs=message.attrs, passthrough=True)
         requested = override_for(self.settings.target_unit, message.key)
         target = coerce_voltage_unit(requested) if requested is not None and scaling.voltage else None
 
@@ -170,13 +185,13 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
         else:
             resolved = self._plan_apply(message, scaling, target)
         if resolved is None:
-            return _Plan(source=payload, out_attrs=message.attrs, passthrough=True)
+            return _Plan(source=fingerprint, attrs_ref=message.attrs, out_attrs=message.attrs, passthrough=True)
 
         gain, offset, final = resolved
-        out_attrs = {**message.attrs, "unit": final.unit, SCALING_ATTR: final.as_attr()}
+        out_attrs = {**message.attrs, "unit": final.unit, **final.as_attrs()}
         if is_identity_scaling(gain, offset):
             # Arithmetically a no-op: record the unit, keep the stored dtype.
-            return _Plan(source=payload, out_attrs=out_attrs, identity=True)
+            return _Plan(source=fingerprint, attrs_ref=message.attrs, out_attrs=out_attrs, identity=True)
 
         out_dtype = np.dtype(self.settings.conversion_dtype)
         gain_arr = np.asarray(gain, dtype=out_dtype)
@@ -186,7 +201,8 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
             _check_channels(gain_arr.size, message.data.shape, message.key)
             gain_arr = gain_arr.reshape((1, gain_arr.size) + (1,) * (message.data.ndim - 2))
         return _Plan(
-            source=payload,
+            source=fingerprint,
+            attrs_ref=message.attrs,
             out_attrs=out_attrs,
             gain=gain_arr,
             offset=out_dtype.type(offset) if offset else None,
