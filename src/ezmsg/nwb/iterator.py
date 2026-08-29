@@ -127,7 +127,9 @@ def _build_chunk_messages_static(
 
         if info.is_event:
             if start_idx < stop_idx:
-                table = info.table_ref
+                # ``info.timestamps``, not ``info.table_ref.start_time``: an
+                # annotation series is an event stream with no backing table.
+                event_ts = info.timestamps
                 for idx in range(start_idx, stop_idx):
                     out.append(
                         replace(
@@ -137,7 +139,7 @@ def _build_chunk_messages_static(
                                 **template.axes,
                                 "time": replace(
                                     template.axes["time"],
-                                    data=ts_off + table.start_time[idx : idx + 1],
+                                    data=ts_off + np.asarray(event_ts[idx : idx + 1]),
                                 ),
                             },
                             key=strm_name,
@@ -173,6 +175,24 @@ def _build_chunk_messages_static(
                             key=strm_name,
                         )
                     )
+            elif not hasattr(time_axis, "gain") and info.timestamps is not None:
+                # No rate, so no uniform axis to slide an ``offset`` along; the
+                # ``replace(..., offset=...)`` below would raise on a
+                # CoordinateAxis. Carry the window's true timestamps instead.
+                out.append(
+                    replace(
+                        template,
+                        data=out_data,
+                        axes={
+                            **template.axes,
+                            "time": replace(
+                                time_axis,
+                                data=ts_off + np.asarray(info.timestamps[start_idx:stop_idx]),
+                            ),
+                        },
+                        key=strm_name,
+                    )
+                )
             else:
                 if info.timestamps is not None and start_idx < len(info.timestamps):
                     # Explicit timestamps are already absolute (file-relative) times.
@@ -331,8 +351,17 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
             template = info.template
 
             if info.is_event:
-                # Irregular interval stream — find first sample index in each chunk.
-                timestamps = info.timestamps
+                # Irregular event stream — find first sample index in each chunk.
+                timestamps = np.asarray(info.timestamps)
+                chunk_boundaries = start_time + np.arange(n_chunks) * self.settings.chunk_dur - slicer.ts_off
+                chunk_ix_offsets = np.searchsorted(timestamps, chunk_boundaries, side="left").astype(int)
+            elif not hasattr(template.axes["time"], "gain") and info.timestamps is not None:
+                # Irregular stream with no usable rate that isn't a declared event
+                # stream -- e.g. markers written as a plain ``TimeSeries``. There is
+                # no sample grid to project boundaries onto, so locate them in the
+                # timestamps directly, exactly as the event branch does. Reading
+                # ``.gain`` here is what crashed on any file containing one of these.
+                timestamps = np.asarray(info.timestamps)
                 chunk_boundaries = start_time + np.arange(n_chunks) * self.settings.chunk_dur - slicer.ts_off
                 chunk_ix_offsets = np.searchsorted(timestamps, chunk_boundaries, side="left").astype(int)
             else:
