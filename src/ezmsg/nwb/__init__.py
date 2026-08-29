@@ -28,9 +28,15 @@ from .pipeline_settings import (
     PipelineSettingsTableCollectionSettings as PipelineSettingsTableCollectionSettings,
 )
 from .reader import NWBIteratorUnit as NWBIteratorUnit
+from .scaling import APPLIED_ATTR as APPLIED_ATTR
 from .scaling import DEFAULT_CONVERSION_DTYPE as DEFAULT_CONVERSION_DTYPE
+from .scaling import GAIN_ATTR as GAIN_ATTR
 from .scaling import MICROVOLT_UNITS as MICROVOLT_UNITS
+from .scaling import OFFSET_ATTR as OFFSET_ATTR
 from .scaling import SCALING_ATTR as SCALING_ATTR
+from .scaling import SCALING_ATTRS as SCALING_ATTRS
+from .scaling import UNIT_ATTR as UNIT_ATTR
+from .scaling import VOLTAGE_ATTR as VOLTAGE_ATTR
 from .scaling import VOLTS_PER_UNIT as VOLTS_PER_UNIT
 from .scaling import StreamScaling as StreamScaling
 from .scaling import VoltageUnit as VoltageUnit

@@ -335,12 +335,57 @@ def is_identity_scaling(gain: typing.Union[float, np.ndarray], offset: float) ->
 
 
 SCALING_ATTR = "nwb_scaling"
-"""Key under which a message reports the scaling that relates it to the file.
+"""Prefix under which a message reports the scaling that relates it to the file.
 
 Namespaced rather than flat ``attrs["conversion"]``/``attrs["offset"]``: attrs
 is a shared dict that any stage downstream may add to, and three unqualified
 generic words are a collision waiting to happen.
+
+Five prefixed keys rather than one nested dict under this name, because a dict
+is opaque to every stage that walks attrs generically. ``ezmsg-sigproc``'s
+``concat`` is the case that forced it: it merges two messages' attrs and rejects
+any value that is not a scalar, so a nested dict raised ``TypeError`` even when
+both sides carried an identical one. Flat keys also let it do the *right* thing
+when two streams disagree -- an unequal ``nwb_scaling_gain`` gets promoted onto
+the ``ch`` axis, which is where a per-channel gain belongs and is something a
+dict could never express.
 """
+
+GAIN_ATTR = f"{SCALING_ATTR}_gain"
+OFFSET_ATTR = f"{SCALING_ATTR}_offset"
+UNIT_ATTR = f"{SCALING_ATTR}_unit"
+APPLIED_ATTR = f"{SCALING_ATTR}_applied"
+VOLTAGE_ATTR = f"{SCALING_ATTR}_voltage"
+
+SCALING_ATTRS = (GAIN_ATTR, OFFSET_ATTR, UNIT_ATTR, APPLIED_ATTR, VOLTAGE_ATTR)
+"""Every key :meth:`StreamScaling.as_attrs` writes, for stripping or checking."""
+
+
+def scaling_fingerprint(attrs: typing.Mapping[str, typing.Any]) -> typing.Optional[tuple]:
+    """A hashable summary of a message's reported scaling, or None if it has none.
+
+    Compares *by value*. The nested-dict form could be cached on the identity of
+    the one payload object, which is cheaper, but that only worked because the
+    reader built each stream's attrs once and every message shared it: an
+    upstream stage that rebuilds attrs per message would have thrashed such a
+    cache anyway, and with five separate keys there is no single object left to
+    anchor on.
+
+    A vector gain is summarised by its bytes rather than its ``id``, so that an
+    array rebuilt with the same contents still hits. That costs a pass over the
+    channel axis, but it is a few hundred floats against a message of samples,
+    and it avoids having to pin the array alive to keep its address unique.
+    """
+    if GAIN_ATTR not in attrs:
+        return None
+    gain = attrs[GAIN_ATTR]
+    return (
+        gain.tobytes() if isinstance(gain, np.ndarray) else gain,
+        attrs[OFFSET_ATTR],
+        attrs[UNIT_ATTR],
+        attrs[APPLIED_ATTR],
+        attrs.get(VOLTAGE_ATTR, False),
+    )
 
 
 class StreamScaling(typing.NamedTuple):
@@ -372,26 +417,38 @@ class StreamScaling(typing.NamedTuple):
     stage convert exactly the streams the reader would have.
     """
 
-    def as_attr(self) -> dict[str, typing.Any]:
-        """The ``attrs[SCALING_ATTR]`` payload -- a plain dict, so it survives
-        the message codec and anything else that walks attrs generically."""
+    def as_attrs(self) -> dict[str, typing.Any]:
+        """The ``nwb_scaling_*`` entries to merge into a message's attrs.
+
+        Flat scalars, so every stage that walks attrs generically can read,
+        compare, and merge them -- see :data:`SCALING_ATTR`. ``gain`` is the one
+        that can still be a non-scalar, when the channels genuinely disagree.
+        """
         return {
-            "gain": self.gain,
-            "offset": self.offset,
-            "unit": self.unit,
-            "applied": self.applied,
-            "voltage": self.voltage,
+            GAIN_ATTR: self.gain,
+            OFFSET_ATTR: self.offset,
+            UNIT_ATTR: self.unit,
+            APPLIED_ATTR: self.applied,
+            VOLTAGE_ATTR: self.voltage,
         }
 
     @classmethod
-    def from_attr(cls, payload: typing.Mapping[str, typing.Any]) -> StreamScaling:
-        """Rebuild from an ``attrs[SCALING_ATTR]`` payload."""
+    def from_attrs(cls, attrs: typing.Mapping[str, typing.Any]) -> typing.Optional[StreamScaling]:
+        """Rebuild from a message's attrs, or None if it reports no scaling.
+
+        Keyed on ``gain``: a message either carries the whole set or none of it,
+        and treating a partial set as absent is the safe reading -- inventing a
+        gain for a message that never declared one is the failure this module
+        exists to prevent.
+        """
+        if GAIN_ATTR not in attrs:
+            return None
         return cls(
-            gain=payload["gain"],
-            offset=float(payload["offset"]),
-            unit=str(payload["unit"]),
-            applied=bool(payload["applied"]),
-            voltage=bool(payload.get("voltage", False)),
+            gain=attrs[GAIN_ATTR],
+            offset=float(attrs[OFFSET_ATTR]),
+            unit=str(attrs[UNIT_ATTR]),
+            applied=bool(attrs[APPLIED_ATTR]),
+            voltage=bool(attrs.get(VOLTAGE_ATTR, False)),
         )
 
 

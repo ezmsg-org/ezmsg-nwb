@@ -14,7 +14,11 @@ from conftest import CHANNEL_CONVERSION, CONVERSION, DECLARED_UNIT, MARKER_N, OF
 from ezmsg.util.messages.axisarray import AxisArray
 
 from ezmsg.nwb import (
-    SCALING_ATTR,
+    APPLIED_ATTR,
+    GAIN_ATTR,
+    OFFSET_ATTR,
+    UNIT_ATTR,
+    VOLTAGE_ATTR,
     NWBScalingSettings,
     NWBScalingTransformer,
     NWBSlicer,
@@ -23,7 +27,7 @@ from ezmsg.nwb import (
 
 
 def message(data: np.ndarray, scaling: StreamScaling | None, key: str = "Broadband") -> AxisArray:
-    attrs = {} if scaling is None else {SCALING_ATTR: scaling.as_attr()}
+    attrs = {} if scaling is None else scaling.as_attrs()
     if scaling is not None and scaling.applied:
         attrs["unit"] = scaling.unit
     return AxisArray(
@@ -35,13 +39,14 @@ def message(data: np.ndarray, scaling: StreamScaling | None, key: str = "Broadba
     )
 
 
-def assert_same_scaling(got: dict, want: dict) -> None:
-    """Compare two scaling payloads; ``gain`` may be an array, so ``==`` on the
-    whole dict is ambiguous rather than False."""
-    assert got.keys() == want.keys()
-    np.testing.assert_allclose(got["gain"], want["gain"], rtol=1e-9)
-    assert got["offset"] == pytest.approx(want["offset"])
-    assert (got["unit"], got["applied"], got["voltage"]) == (want["unit"], want["applied"], want["voltage"])
+def assert_same_scaling(got: AxisArray, want: AxisArray) -> None:
+    """Compare two messages' reported scaling; ``gain`` may be an array, so
+    ``==`` on the values is ambiguous rather than False."""
+    np.testing.assert_allclose(got.attrs[GAIN_ATTR], want.attrs[GAIN_ATTR], rtol=1e-9)
+    assert got.attrs[OFFSET_ATTR] == pytest.approx(want.attrs[OFFSET_ATTR])
+    assert [got.attrs[k] for k in (UNIT_ATTR, APPLIED_ATTR, VOLTAGE_ATTR)] == [
+        want.attrs[k] for k in (UNIT_ATTR, APPLIED_ATTR, VOLTAGE_ATTR)
+    ]
 
 
 def read(path, key: str = "Broadband", stop: int = 20) -> AxisArray:
@@ -71,7 +76,7 @@ def test_it_applies_what_the_message_reports(scaled_nwb_path):
     assert raw.data.dtype == np.int16 and "unit" not in raw.attrs
     np.testing.assert_array_equal(out.data, expected(raw.data))
     assert out.attrs["unit"] == DECLARED_UNIT
-    assert out.attrs[SCALING_ATTR]["applied"] is True
+    assert out.attrs[APPLIED_ATTR] is True
 
 
 def test_target_unit_converts_on_top_of_the_files_own(scaled_nwb_path):
@@ -80,7 +85,7 @@ def test_target_unit_converts_on_top_of_the_files_own(scaled_nwb_path):
     raw = read(scaled_nwb_path)
     out = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))(raw)
     np.testing.assert_allclose(out.data, expected(raw.data) * 1e-6, rtol=1e-6)
-    assert out.attrs["unit"] == out.attrs[SCALING_ATTR]["unit"] == "volts"
+    assert out.attrs["unit"] == out.attrs[UNIT_ATTR] == "volts"
 
 
 def test_overrides_correct_the_file_then_target_converts(scaled_nwb_path):
@@ -112,7 +117,7 @@ def test_two_in_a_chain_scale_once(scaled_nwb_path):
     once = tx(raw)
     twice = tx(once)
     np.testing.assert_array_equal(twice.data, once.data)
-    assert_same_scaling(twice.attrs[SCALING_ATTR], once.attrs[SCALING_ATTR])
+    assert_same_scaling(twice, once)
 
 
 def test_a_message_with_no_scaling_passes_through(scaled_nwb_path):
@@ -134,10 +139,8 @@ def test_target_unit_retargets_an_already_scaled_message(scaled_nwb_path):
     np.testing.assert_allclose(out.data, at_reader.data * 1e-6, rtol=1e-6)
     assert out.attrs["unit"] == "volts"
     # The reported scaling stays cumulative: stored -> now, not previous -> now.
-    np.testing.assert_allclose(
-        out.attrs[SCALING_ATTR]["gain"], np.asarray(CONVERSION * CHANNEL_CONVERSION) * 1e-6, rtol=1e-6
-    )
-    assert out.attrs[SCALING_ATTR]["offset"] == pytest.approx(OFFSET * 1e-6)
+    np.testing.assert_allclose(out.attrs[GAIN_ATTR], np.asarray(CONVERSION * CHANNEL_CONVERSION) * 1e-6, rtol=1e-6)
+    assert out.attrs[OFFSET_ATTR] == pytest.approx(OFFSET * 1e-6)
 
 
 def test_retargeting_matches_asking_the_reader_directly(scaled_nwb_path):
@@ -184,7 +187,7 @@ def test_identity_scaling_keeps_the_stored_dtype(scaled_nwb_path):
     out = NWBScalingTransformer(settings=NWBScalingSettings())(raw)
     assert out.data.dtype == np.int16
     assert out.attrs["unit"] == "n/a"
-    assert out.attrs[SCALING_ATTR]["applied"] is True
+    assert out.attrs[APPLIED_ATTR] is True
 
 
 def test_a_stale_per_channel_gain_raises_rather_than_broadcasting(scaled_nwb_path):
@@ -244,12 +247,12 @@ def test_a_changed_scaling_rebuilds_the_plan(scaled_nwb_path):
     tx = NWBScalingTransformer(settings=NWBScalingSettings())
     first = tx(msg)
 
-    doubled = StreamScaling(np.asarray(msg.attrs[SCALING_ATTR]["gain"]) * 2.0, OFFSET, DECLARED_UNIT, False, True)
+    doubled = StreamScaling(np.asarray(msg.attrs[GAIN_ATTR]) * 2.0, OFFSET, DECLARED_UNIT, False, True)
     changed = AxisArray(
         data=msg.data,
         dims=msg.dims,
         axes=msg.axes,
-        attrs={SCALING_ATTR: doubled.as_attr()},
+        attrs=doubled.as_attrs(),
         key=msg.key,
     )
     second = tx(changed)
@@ -272,3 +275,35 @@ def test_changed_settings_invalidate_cached_plans(scaled_nwb_path):
     assert before.attrs["unit"] == "microvolts"
     assert after.attrs["unit"] == "volts"
     np.testing.assert_allclose(after.data, before.data * 1e-6, rtol=1e-5)
+
+
+def test_rebuilt_attrs_with_the_same_scaling_reuse_the_plan():
+    """The per-message check keys on the attrs dict's identity, so a stage that
+    rebuilds attrs upstream lands in ``_reset_state`` -- whose by-value check
+    must then recognise the scaling and keep the plan rather than re-resolving
+    overrides and units on every message."""
+    scaling = StreamScaling(gain=0.25, offset=0.0, unit="volts", applied=False, voltage=True)
+    tx = NWBScalingTransformer(settings=NWBScalingSettings())
+
+    first = message(np.ones((4, 2), dtype=np.int16), scaling)
+    tx(first)
+    plan = tx.state.plans["Broadband"]
+
+    # Same values, different dict object -- as an upstream stage would produce.
+    rebuilt = message(np.ones((4, 2), dtype=np.int16), scaling)
+    assert rebuilt.attrs is not first.attrs
+    tx(rebuilt)
+
+    assert tx.state.plans["Broadband"] is plan
+    # And the plan must now pin the dict the identity check is keyed on.
+    assert tx.state.plans["Broadband"].attrs_ref is rebuilt.attrs
+
+
+def test_a_genuinely_changed_scaling_still_rebuilds_the_plan():
+    tx = NWBScalingTransformer(settings=NWBScalingSettings())
+    tx(message(np.ones((4, 2), dtype=np.int16), StreamScaling(0.25, 0.0, "volts", False, True)))
+    plan = tx.state.plans["Broadband"]
+
+    tx(message(np.ones((4, 2), dtype=np.int16), StreamScaling(0.50, 0.0, "volts", False, True)))
+
+    assert tx.state.plans["Broadband"] is not plan
