@@ -1,9 +1,9 @@
-"""Applying the scaling an NWB file stores alongside its samples.
+"""What an NWB file says its samples mean, and how the reader reports it.
 
-The ``scaled_nwb_path`` fixture lives in ``conftest.py`` because
-``test_convert.py`` reads the same file: the property that ties the two modules
-together is that deferring the conversion downstream lands on exactly what the
-reader would have produced, which is only checkable against one file.
+The reader never applies a scaling -- it hands back the stored integers and
+describes them. Everything about *applying* lives in ``test_convert.py``. The
+``scaled_nwb_path`` fixture is shared via ``conftest.py`` because the two
+modules are two halves of one contract.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from conftest import (
     N_CH,
     N_SAMPLES,
     OFFSET,
-    expected,
 )
 
 from ezmsg.nwb import (
@@ -30,13 +29,12 @@ from ezmsg.nwb import (
     NWBIteratorSettings,
     NWBSlicer,
     ReferenceClockType,
-    ScaledDataset,
     VoltageUnit,
+    describe_stream_scaling,
     is_voltage_stream,
     parse_voltage_unit,
     read_stored_scaling,
     resolve_scaling,
-    resolve_stream_scaling,
 )
 
 # --- The stored factors, read back ------------------------------------------
@@ -73,7 +71,7 @@ def test_resolve_scaling_folds_channel_conversion_into_the_gain(scaled_nwb_path)
 
 
 def test_resolve_scaling_keeps_uniform_channel_conversion_scalar(scaled_nwb_path):
-    """All-equal per-channel gains collapse to a scalar, so the hot path stays a
+    """All-equal per-channel gains collapse to a scalar, so the multiply stays a
     scalar broadcast instead of a vector one."""
     import h5py
 
@@ -83,304 +81,66 @@ def test_resolve_scaling_keeps_uniform_channel_conversion_scalar(scaled_nwb_path
     assert gain == pytest.approx(CONVERSION * 2.0)
 
 
-# --- Through the slicer -----------------------------------------------------
+def test_text_streams_are_described_as_having_no_scaling():
+    """A text series is materialized into a str array before this point. It has
+    no gain, so it reports no scaling at all rather than a misleading identity
+    one -- which would invite a consumer to multiply strings."""
+    assert describe_stream_scaling(np.array(["left", "right"])) is None
 
 
-def test_slicer_applies_all_three_factors(scaled_nwb_path, counts):
-    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=True, dejitter=False)
-    try:
-        info = slicer.get_stream_info("Broadband")
-        np.testing.assert_array_equal(info.dset[:], expected(counts))
-        assert info.dset.dtype == np.float32
-        assert info.unit == DECLARED_UNIT
-        assert info.template.attrs["unit"] == DECLARED_UNIT
-    finally:
-        slicer.close()
+# --- Through the slicer: stored samples, plus a description ------------------
 
 
-def test_slicer_off_returns_the_stored_counts(scaled_nwb_path, counts):
-    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=False, dejitter=False)
+def test_the_slicer_returns_the_stored_samples(scaled_nwb_path, counts):
+    """No conversion on read, ever. Applying it is ``NWBScalingUnit``'s job, and
+    keeping the reader to one job is why the split exists."""
+    slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
     try:
         info = slicer.get_stream_info("Broadband")
         np.testing.assert_array_equal(info.dset[:], counts)
         assert info.dset.dtype == np.int16
-        assert info.unit == ""
     finally:
         slicer.close()
 
 
-def test_identity_scaling_leaves_the_stored_dtype_alone(scaled_nwb_path):
-    """A stream declaring conversion=1.0/offset=0.0 is already in its declared
-    unit. Wrapping it would buy nothing and cost a float32 copy of every sample."""
-    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=True, dejitter=False)
-    try:
-        info = slicer.get_stream_info("Marker")
-        assert info.dset.dtype == np.int16
-        assert not isinstance(info.dset, ScaledDataset)
-        np.testing.assert_array_equal(info.dset[:], np.arange(MARKER_N, dtype=np.int16))
-    finally:
-        slicer.close()
-
-
-def test_read_by_index_is_scaled(scaled_nwb_path, counts):
-    """The slice paths go through ``info.dset``, so they pick the scaling up too
-    -- this is what the clock-driven replay producer reads through. The fixture
-    stream is rate-only, so ``read_by_time`` (which needs explicit timestamps)
-    is covered by the gappy-stream tests instead."""
-    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=True, dejitter=False)
-    try:
-        by_index = slicer.read_by_index("Broadband", 10, 20)
-        np.testing.assert_array_equal(by_index.data, expected(counts)[10:20])
-        assert by_index.attrs["unit"] == DECLARED_UNIT
-    finally:
-        slicer.close()
-
-
-def test_conversion_dtype_is_honoured(scaled_nwb_path, counts):
-    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=True, conversion_dtype="float64", dejitter=False)
+def test_the_slicer_reports_what_the_samples_mean(scaled_nwb_path):
+    slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
     try:
         info = slicer.get_stream_info("Broadband")
-        assert info.dset.dtype == np.float64
-        np.testing.assert_allclose(
-            info.dset[:5],
-            counts[:5].astype(np.float64) * CONVERSION * CHANNEL_CONVERSION.astype(np.float64) + OFFSET,
-            rtol=1e-12,
-        )
+        sc = info.template.attrs[SCALING_ATTR]
     finally:
         slicer.close()
-
-
-# --- Overrides, for files whose own metadata is wrong ------------------------
-
-
-def test_scale_override_replaces_the_recorded_gain(scaled_nwb_path, counts):
-    """Recorded conversion factors are sometimes a library default rather than
-    the hardware's -- a reader cannot detect that, so a caller who knows must be
-    able to say so."""
-    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=True, scale_override=0.1, dejitter=False)
-    try:
-        got = slicer.get_stream_info("Broadband").dset[:]
-        np.testing.assert_allclose(got, counts.astype(np.float32) * np.float32(0.1) + np.float32(OFFSET), rtol=1e-6)
-    finally:
-        slicer.close()
-
-
-def test_scale_override_accepts_a_per_stream_mapping(scaled_nwb_path, counts):
-    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=True, scale_override={"Broadband": 0.1}, dejitter=False)
-    try:
-        np.testing.assert_allclose(
-            slicer.get_stream_info("Broadband").dset[:],
-            counts.astype(np.float32) * np.float32(0.1) + np.float32(OFFSET),
-            rtol=1e-6,
-        )
-        # Unnamed streams keep the file's own scaling.
-        assert slicer.get_stream_info("Marker").dset.dtype == np.int16
-    finally:
-        slicer.close()
-
-
-def test_unit_override_relabels_without_rescaling(scaled_nwb_path, counts):
-    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=True, unit_override="volts", dejitter=False)
-    try:
-        info = slicer.get_stream_info("Broadband")
-        assert info.unit == "volts"
-        np.testing.assert_array_equal(info.dset[:], expected(counts))
-    finally:
-        slicer.close()
-
-
-# --- target_unit: what the pipeline wants, not what the file holds -----------
-
-
-def test_target_unit_converts_from_the_files_own_unit(scaled_nwb_path, counts):
-    """The fixture declares microvolts; asking for volts scales both the gain and
-    the offset by 1e-6, so the samples come out 1e6 times smaller."""
-    slicer = NWBSlicer(scaled_nwb_path, target_unit=VoltageUnit.VOLTS, dejitter=False)
-    try:
-        info = slicer.get_stream_info("Broadband")
-        assert info.unit == "volts"
-        assert info.template.attrs["unit"] == "volts"
-        np.testing.assert_allclose(info.dset[:], expected(counts) * 1e-6, rtol=1e-6)
-    finally:
-        slicer.close()
-
-
-def test_target_unit_matching_the_file_is_a_no_op(scaled_nwb_path, counts):
-    slicer = NWBSlicer(scaled_nwb_path, target_unit="microvolts", dejitter=False)
-    try:
-        np.testing.assert_array_equal(slicer.get_stream_info("Broadband").dset[:], expected(counts))
-    finally:
-        slicer.close()
-
-
-def test_target_unit_accepts_any_spelling(scaled_nwb_path):
-    """A caller writing a setting should not have to know which spelling this
-    module canonicalized on."""
-    assert parse_voltage_unit("uV") is parse_voltage_unit("µV") is VoltageUnit.MICROVOLTS
-    slicer = NWBSlicer(scaled_nwb_path, target_unit="nV", dejitter=False)
-    try:
-        assert slicer.get_stream_info("Broadband").unit == "nanovolts"
-    finally:
-        slicer.close()
-
-
-def test_target_unit_composes_with_the_overrides(scaled_nwb_path, counts):
-    """``unit_override`` says what the file really holds, ``target_unit`` says
-    what to deliver. Order matters: correct first, then convert, so a file that
-    lies about its unit can still be requested in any other one.
-
-    Here the file's numbers are relabelled volts, then converted to microvolts:
-    a net 1e6, not the 1.0 that believing the file's "microvolts" would give.
-    """
-    slicer = NWBSlicer(scaled_nwb_path, unit_override="volts", target_unit="microvolts", dejitter=False)
-    try:
-        info = slicer.get_stream_info("Broadband")
-        assert info.unit == "microvolts"
-        np.testing.assert_allclose(info.dset[:], expected(counts) * 1e6, rtol=1e-6)
-    finally:
-        slicer.close()
-
-
-def test_target_unit_leaves_non_voltage_streams_alone(scaled_nwb_path):
-    """ "n/a" and "pixels" are not voltages, so the request does not reach them --
-    rather than erroring on a unit that was never a voltage, or worse, scaling a
-    cursor position by 1e6."""
-    slicer = NWBSlicer(scaled_nwb_path, target_unit="volts", dejitter=False)
-    try:
-        marker = slicer.get_stream_info("Marker")
-        assert marker.unit == "n/a"
-        np.testing.assert_array_equal(marker.dset[:], np.arange(MARKER_N, dtype=np.int16))
-
-        cursor = slicer.get_stream_info("Cursor")
-        assert cursor.unit == "pixels"
-        np.testing.assert_allclose(
-            cursor.dset[:], np.arange(MARKER_N, dtype=np.float32) * np.float32(CONVERSION), rtol=1e-6
-        )
-    finally:
-        slicer.close()
-
-
-def test_target_unit_reaches_voltage_written_as_a_plain_timeseries(scaled_nwb_path, counts):
-    """Regression: gating on ``isinstance(..., ElectricalSeries)`` alone left a
-    ``*_device_ts`` companion -- a plain TimeSeries over the *same* samples as its
-    acquisition partner -- in the file's unit while the partner was converted.
-    Same bytes, two scales, one graph, no error: exactly what target_unit exists
-    to prevent."""
-    slicer = NWBSlicer(scaled_nwb_path, target_unit="microvolts", dejitter=False)
-    try:
-        electrical = slicer.get_stream_info("Broadband")
-        plain = slicer.get_stream_info("AuxVoltage")
-        # The two declare different units; both are asked for microvolts and both
-        # arrive there. Before the fix the plain one stayed in volts, 1e6 out.
-        assert plain.unit == electrical.unit == "microvolts"
-        np.testing.assert_allclose(plain.dset[:], (counts * CONVERSION + OFFSET) * 1e6, rtol=1e-5)
-        # Already microvolts, so its own numbers are unchanged.
-        np.testing.assert_array_equal(electrical.dset[:], expected(counts))
-    finally:
-        slicer.close()
-
-
-def test_is_voltage_stream_takes_either_kind_of_evidence():
-    assert is_voltage_stream("volts", is_electrical=False)
-    assert is_voltage_stream("uV", is_electrical=False)
-    # An ElectricalSeries is voltage by schema whatever string it carries --
-    # including none, which is what pynwb writes when nobody stamped one.
-    assert is_voltage_stream("", is_electrical=True)
-    assert is_voltage_stream("garbage", is_electrical=True)
-    # A bare TimeSeries gets no such benefit of the doubt: an unstamped unit
-    # says nothing, and assuming volts would invent a dimension.
-    assert not is_voltage_stream("", is_electrical=False)
-    assert not is_voltage_stream("pixels", is_electrical=False)
-
-
-def test_target_unit_rejects_an_unplaceable_declared_unit(scaled_nwb_path):
-    """Converting needs a starting point. Passing the data through unconverted
-    while stamping it "volts" is the silently-wrong-units bug this module
-    exists to prevent, so this raises instead."""
-    with pytest.raises(ValueError, match="not a recognized voltage unit"):
-        NWBSlicer(scaled_nwb_path, unit_override="adc counts", target_unit="volts", dejitter=False).get_stream_info(
-            "Broadband"
-        )
-
-
-def test_target_unit_requires_apply_conversion(scaled_nwb_path):
-    """The two ask for opposite things; resolving that silently either way
-    would deliver a wrong scale under a confident label."""
-    with pytest.raises(ValueError, match="requires apply_conversion"):
-        NWBSlicer(scaled_nwb_path, apply_conversion=False, target_unit="volts", dejitter=False)
-
-
-def test_target_unit_flows_through_the_iterator(scaled_nwb_path, counts):
-    it = NWBAxisArrayIterator(
-        settings=NWBIteratorSettings(
-            filepath=str(scaled_nwb_path),
-            chunk_dur=0.2,
-            reference_clock=ReferenceClockType.UNKNOWN,
-            stream_keys=["Broadband"],
-            dejitter=False,
-            target_unit=VoltageUnit.VOLTS,
-        )
-    )
-    try:
-        msgs = [msg for msg in it if msg.data.shape[0]]
-    finally:
-        it.close()
-    got = np.concatenate([m.data for m in msgs], axis=0)
-    assert msgs[0].attrs["unit"] == "volts"
-    np.testing.assert_allclose(got, expected(counts)[: got.shape[0]] * 1e-6, rtol=1e-6)
-
-
-# --- The scaling reported on the message -------------------------------------
-
-
-def test_scaling_is_reported_when_applied(scaled_nwb_path):
-    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=True, dejitter=False)
-    try:
-        sc = slicer.read_by_index("Broadband", 0, 5).attrs[SCALING_ATTR]
-    finally:
-        slicer.close()
-    assert sc["applied"] is True
-    assert sc["unit"] == DECLARED_UNIT
-    assert sc["offset"] == pytest.approx(OFFSET)
     np.testing.assert_allclose(sc["gain"], CONVERSION * CHANNEL_CONVERSION, rtol=1e-6)
-
-
-def test_scaling_is_reported_even_when_not_applied(scaled_nwb_path, counts):
-    """``apply_conversion=False`` asks for the stored samples, not for the
-    factors to be forgotten. Without them on the message a caller who wants to
-    scale downstream -- after decimation, on a GPU -- has to reopen the file to
-    recover what the reader already had."""
-    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=False, dejitter=False)
-    try:
-        msg = slicer.read_by_index("Broadband", 0, 5)
-    finally:
-        slicer.close()
-    sc = msg.attrs[SCALING_ATTR]
-    assert sc["applied"] is False
-    # No ``unit`` on the message: the data is counts, and calling counts
-    # microvolts is the bug this module exists to prevent. The unit the data
-    # *would* be in lives inside the scaling, where it cannot be mistaken for a
-    # description of what the caller is holding.
-    assert "unit" not in msg.attrs
+    assert sc["offset"] == pytest.approx(OFFSET)
     assert sc["unit"] == DECLARED_UNIT
+    assert sc["applied"] is False
+    assert sc["voltage"] is True
+    # No ``unit`` key: the data is counts, and calling counts microvolts is the
+    # bug this whole module exists to prevent. The unit lives inside the
+    # scaling, where it reads as pending rather than as a claim about the data.
+    assert "unit" not in info.template.attrs
 
-    # The reported factors are sufficient: applying them by hand reproduces
-    # exactly what apply_conversion=True would have returned.
-    by_hand = msg.data * np.asarray(sc["gain"], dtype=np.float32) + np.float32(sc["offset"])
-    np.testing.assert_allclose(by_hand, expected(counts)[0:5], rtol=1e-6)
 
-
-def test_reported_scaling_includes_the_overrides_and_target(scaled_nwb_path):
-    """It describes the numbers the caller holds, not the file's raw attributes
-    -- otherwise a stage trusting it would undo the correction it was given."""
-    slicer = NWBSlicer(scaled_nwb_path, scale_override=0.1, target_unit="volts", dejitter=False)
+def test_the_reported_scaling_is_the_files_own_numbers(scaled_nwb_path):
+    """Verbatim, uncorrected. A reader that pre-corrected would leave the report
+    describing neither the file nor the data."""
+    slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
     try:
-        sc = slicer.read_by_index("Broadband", 0, 5).attrs[SCALING_ATTR]
+        assert slicer.get_stream_info("Broadband").scaling.unit == DECLARED_UNIT
+        assert slicer.get_stream_info("Cursor").scaling.unit == "pixels"
+        assert slicer.get_stream_info("Marker").scaling.unit == "n/a"
     finally:
         slicer.close()
-    assert sc["unit"] == "volts"
-    assert sc["gain"] == pytest.approx(0.1 * 1e-6)
-    assert sc["offset"] == pytest.approx(OFFSET * 1e-6)
+
+
+def test_read_by_index_carries_the_scaling(scaled_nwb_path, counts):
+    slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
+    try:
+        msg = slicer.read_by_index("Broadband", 10, 20)
+    finally:
+        slicer.close()
+    np.testing.assert_array_equal(msg.data, counts[10:20])
+    assert msg.attrs[SCALING_ATTR]["unit"] == DECLARED_UNIT
 
 
 def test_reported_gain_is_scalar_when_the_channels_agree(scaled_nwb_path):
@@ -399,7 +159,7 @@ def test_reported_gain_is_scalar_when_the_channels_agree(scaled_nwb_path):
     assert isinstance(aux["gain"], float)
 
 
-def test_reported_scaling_survives_the_message_codec(scaled_nwb_path, tmp_path):
+def test_reported_scaling_survives_the_message_codec(scaled_nwb_path):
     """A vector gain puts a numpy array inside attrs, which is a shape nothing
     else in these messages has. Pin that it logs and reloads."""
     from ezmsg.util.messagecodec import MessageDecoder, MessageEncoder
@@ -412,42 +172,10 @@ def test_reported_scaling_survives_the_message_codec(scaled_nwb_path, tmp_path):
     reloaded = json.loads(json.dumps(msg, cls=MessageEncoder), cls=MessageDecoder)
     sc = reloaded.attrs[SCALING_ATTR]
     np.testing.assert_allclose(sc["gain"], msg.attrs[SCALING_ATTR]["gain"], rtol=1e-9)
-    assert sc["unit"] == DECLARED_UNIT and sc["applied"] is True
+    assert sc["unit"] == DECLARED_UNIT and sc["applied"] is False
 
 
-def test_text_streams_report_no_scaling():
-    """A text series is materialized into a str array before this point. It has
-    no gain, so it reports no scaling at all rather than a misleading identity
-    one -- and no ``unit``, which would be nonsense on strings."""
-    result = resolve_stream_scaling(np.array(["left", "right"]))
-    assert result.scaling is None
-    assert result.unit == ""
-
-
-def test_iterator_messages_carry_the_scaling(scaled_nwb_path):
-    it = NWBAxisArrayIterator(
-        settings=NWBIteratorSettings(
-            filepath=str(scaled_nwb_path),
-            chunk_dur=0.2,
-            reference_clock=ReferenceClockType.UNKNOWN,
-            stream_keys=["Broadband"],
-            dejitter=False,
-            apply_conversion=False,
-        )
-    )
-    try:
-        msg = next(m for m in it if m.data.shape[0])
-    finally:
-        it.close()
-    assert msg.data.dtype == np.int16
-    assert msg.attrs[SCALING_ATTR]["applied"] is False
-    np.testing.assert_allclose(msg.attrs[SCALING_ATTR]["gain"], CONVERSION * CHANNEL_CONVERSION, rtol=1e-6)
-
-
-# --- Through the iterator ---------------------------------------------------
-
-
-def test_iterator_emits_scaled_messages(scaled_nwb_path, counts):
+def test_iterator_messages_are_stored_samples_carrying_the_scaling(scaled_nwb_path, counts):
     it = NWBAxisArrayIterator(
         settings=NWBIteratorSettings(
             filepath=str(scaled_nwb_path),
@@ -458,42 +186,68 @@ def test_iterator_emits_scaled_messages(scaled_nwb_path, counts):
         )
     )
     try:
-        chunks = [msg.data for msg in it if msg.data.shape[0]]
+        chunks = [msg for msg in it if msg.data.shape[0]]
     finally:
         it.close()
-    got = np.concatenate(chunks, axis=0)
-    assert got.dtype == np.float32
-    np.testing.assert_array_equal(got, expected(counts)[: got.shape[0]])
+    got = np.concatenate([m.data for m in chunks], axis=0)
+    assert got.dtype == np.int16
+    np.testing.assert_array_equal(got, counts[: got.shape[0]])
+    np.testing.assert_allclose(chunks[0].attrs[SCALING_ATTR]["gain"], CONVERSION * CHANNEL_CONVERSION, rtol=1e-6)
+    assert chunks[0].attrs[SCALING_ATTR]["applied"] is False
 
 
-def test_iterator_default_is_on(scaled_nwb_path):
-    """The default is deliberately "apply", not "preserve the old behaviour":
-    the failure mode of not applying is silently-wrong units, which no exception
-    announces and which downstream absolute thresholds turn into wrong results."""
-    assert NWBIteratorSettings(filepath=str(scaled_nwb_path)).apply_conversion is True
-
-
-# --- ScaledDataset itself ---------------------------------------------------
-
-
-def test_scaled_dataset_indexing_forms(scaled_nwb_path, counts):
-    """Integer indexing drops the time axis; the per-channel gain still has to
-    land on the channel axis."""
-    slicer = NWBSlicer(scaled_nwb_path, apply_conversion=True, dejitter=False)
+def test_marker_streams_keep_their_dtype_and_declare_identity(scaled_nwb_path):
+    slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
     try:
-        dset = slicer.get_stream_info("Broadband").dset
-        ref = expected(counts)
-        np.testing.assert_array_equal(dset[3], ref[3])
-        np.testing.assert_array_equal(dset[3:9], ref[3:9])
-        np.testing.assert_array_equal(dset[-2:], ref[-2:])
-        assert len(dset) == N_SAMPLES
-        assert dset.shape == (N_SAMPLES, N_CH)
-        assert dset.ndim == 2
+        info = slicer.get_stream_info("Marker")
+        assert info.dset.dtype == np.int16
+        np.testing.assert_array_equal(info.dset[:], np.arange(MARKER_N, dtype=np.int16))
+        assert info.scaling.gain == 1.0 and info.scaling.offset == 0.0
     finally:
         slicer.close()
 
 
-def test_scaled_dataset_rejects_a_mismatched_channel_gain():
-    base = np.zeros((10, 4), dtype=np.int16)
-    with pytest.raises(ValueError, match="does not match dataset shape"):
-        ScaledDataset(base, np.ones(3), 0.0, "float32")
+def test_streams_are_all_loaded(scaled_nwb_path):
+    slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
+    try:
+        assert slicer.get_stream_info("Broadband").n_samples == N_SAMPLES
+    finally:
+        slicer.close()
+
+
+# --- Units ------------------------------------------------------------------
+
+
+def test_is_voltage_stream_takes_either_kind_of_evidence():
+    assert is_voltage_stream("volts", is_electrical=False)
+    assert is_voltage_stream("uV", is_electrical=False)
+    # An ElectricalSeries is voltage by schema whatever string it carries --
+    # including none, which is what pynwb writes when nobody stamped one.
+    assert is_voltage_stream("", is_electrical=True)
+    assert is_voltage_stream("garbage", is_electrical=True)
+    # A bare TimeSeries gets no such benefit of the doubt: an unstamped unit
+    # says nothing, and assuming volts would invent a dimension.
+    assert not is_voltage_stream("", is_electrical=False)
+    assert not is_voltage_stream("pixels", is_electrical=False)
+
+
+def test_voltage_written_as_a_plain_timeseries_is_recognized(scaled_nwb_path):
+    """Regression: gating on ``isinstance(..., ElectricalSeries)`` alone left a
+    ``*_device_ts`` companion -- a plain TimeSeries over the *same* samples as
+    its acquisition partner -- unconvertible while the partner converted."""
+    slicer = NWBSlicer(scaled_nwb_path, dejitter=False)
+    try:
+        assert slicer.get_stream_info("AuxVoltage").scaling.voltage is True
+        assert slicer.get_stream_info("Broadband").scaling.voltage is True
+        assert slicer.get_stream_info("Cursor").scaling.voltage is False
+    finally:
+        slicer.close()
+
+
+def test_unit_spellings_are_all_accepted():
+    """A caller writing a setting should not have to know which spelling this
+    module canonicalized on."""
+    assert parse_voltage_unit("uV") is parse_voltage_unit("µV") is VoltageUnit.MICROVOLTS
+    assert parse_voltage_unit("V") is VoltageUnit.VOLTS
+    assert parse_voltage_unit("nanovolts") is VoltageUnit.NANOVOLTS
+    assert parse_voltage_unit("pixels") is None

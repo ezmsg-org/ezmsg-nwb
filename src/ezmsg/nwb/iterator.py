@@ -15,7 +15,6 @@ from ezmsg.baseproc.stateful import BaseStatefulProducer
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
 
-from .scaling import DEFAULT_CONVERSION_DTYPE, VoltageUnit
 from .slicer import DEFAULT_GAP_TOL, NWBSlicer, find_gaps
 from .util import ReferenceClockType
 
@@ -72,24 +71,6 @@ class NWBIteratorSettings(ez.Settings):
     """Real-gap guard threshold in seconds (forwarded to ``NWBSlicer``). ``None``
     auto-derives per stream; genuine gaps are preserved so chunks still split at
     them. ``float("inf")`` disables the guard."""
-    apply_conversion: bool = True
-    """Apply each stream's stored ``conversion``/``channel_conversion``/``offset``
-    on read (forwarded to ``NWBSlicer``), so messages carry the unit the file
-    declares instead of raw ADC counts. See :mod:`~ezmsg.nwb.scaling`. Set False
-    to read the stored integers unchanged."""
-    conversion_dtype: str = DEFAULT_CONVERSION_DTYPE
-    """Output dtype for scaled streams (forwarded to ``NWBSlicer``)."""
-    scale_override: typing.Union[float, dict[str, float], None] = None
-    """Replace the resolved gain for a file whose recorded conversion factors are
-    wrong (forwarded to ``NWBSlicer``). Bare value or ``{stream_key: value}``."""
-    unit_override: typing.Union[str, dict[str, str], None] = None
-    """Replace the declared unit string without changing the gain (forwarded to
-    ``NWBSlicer``). Bare value or ``{stream_key: value}``."""
-    target_unit: typing.Union[str, VoltageUnit, dict[str, typing.Union[str, VoltageUnit]], None] = None
-    """Deliver electrical streams in this unit whatever the file works in
-    (forwarded to ``NWBSlicer``), so the graph downstream can be written against
-    one scale. ``None`` emits the file's own unit. Bare value or
-    ``{stream_key: value}``; requires ``apply_conversion``."""
 
 
 @processor_state
@@ -316,11 +297,6 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
             clock_groups=self.settings.clock_groups,
             dejitter_cache=self.settings.dejitter_cache,
             real_gap_threshold=self.settings.real_gap_threshold,
-            apply_conversion=self.settings.apply_conversion,
-            conversion_dtype=self.settings.conversion_dtype,
-            scale_override=self.settings.scale_override,
-            unit_override=self.settings.unit_override,
-            target_unit=self.settings.target_unit,
         )
         self._state.slicer = slicer
 

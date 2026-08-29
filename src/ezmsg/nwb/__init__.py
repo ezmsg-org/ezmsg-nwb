@@ -28,15 +28,14 @@ from .scaling import DEFAULT_CONVERSION_DTYPE as DEFAULT_CONVERSION_DTYPE
 from .scaling import MICROVOLT_UNITS as MICROVOLT_UNITS
 from .scaling import SCALING_ATTR as SCALING_ATTR
 from .scaling import VOLTS_PER_UNIT as VOLTS_PER_UNIT
-from .scaling import ScaledDataset as ScaledDataset
 from .scaling import StreamScaling as StreamScaling
 from .scaling import VoltageUnit as VoltageUnit
 from .scaling import convert_to_target_unit as convert_to_target_unit
+from .scaling import describe_stream_scaling as describe_stream_scaling
 from .scaling import is_voltage_stream as is_voltage_stream
 from .scaling import parse_voltage_unit as parse_voltage_unit
 from .scaling import read_stored_scaling as read_stored_scaling
 from .scaling import resolve_scaling as resolve_scaling
-from .scaling import resolve_stream_scaling as resolve_stream_scaling
 from .slicer import NWBSlicer as NWBSlicer
 from .util import ReferenceClockType as ReferenceClockType
 from .util import as_text as as_text

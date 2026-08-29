@@ -15,7 +15,6 @@ from ezmsg.baseproc.clock import Clock, ClockSettings
 from ezmsg.util.messagecodec import message_log
 from ezmsg.util.messagelogger import MessageLogger, MessageLoggerSettings
 from ezmsg.util.messages.axisarray import AxisArray
-from ezmsg.util.messages.util import replace
 from ezmsg.util.terminate import (
     TerminateOnTimeout,
     TerminateOnTimeoutSettings,
@@ -27,6 +26,8 @@ from pynwb import NWBHDF5IO
 from ezmsg.nwb import (
     NWBAxisArrayIterator,
     NWBIteratorSettings,
+    NWBScalingSettings,
+    NWBScalingTransformer,
     NWBSink,
     NWBSinkConsumer,
     NWBSinkSettings,
@@ -201,20 +202,21 @@ def test_writer_roundtrip_continuous(test_nwb_path):
     assert total_read == total_written
     assert read_msgs[0].data.shape[1] == 8
 
-    # Verify data content matches. NWBSink declares ``conversion=1e-6`` on every
-    # series it writes -- "the values handed to me are microvolts, multiply by
-    # this for volts" -- and the reader now honours that, so a round trip returns
-    # volts, not the microvolts that went in. Asserting the factor rather than
-    # equality is what makes the sink's declaration part of the contract instead
-    # of a comment nobody reads.
+    # The reader returns what is stored, so a round trip is value-preserving.
     src_data = np.concatenate([m.data for m in src_msgs], axis=0)
     read_data = np.concatenate([m.data for m in read_msgs], axis=0)
-    np.testing.assert_allclose(read_data, src_data * 1e-6, rtol=1e-6)
+    np.testing.assert_array_almost_equal(read_data, src_data)
 
-    # Same file read as stored: the samples themselves are untouched on disk.
-    it3 = NWBAxisArrayIterator(replace(read_settings, apply_conversion=False))
-    stored = np.concatenate([m.data for m in it3], axis=0)
-    np.testing.assert_array_almost_equal(stored, src_data)
+    # NWBSink declares ``conversion=1e-6`` on every series it writes -- "the
+    # values handed to me are microvolts, multiply by this for volts" -- and the
+    # reader reports that declaration rather than acting on it. Running the
+    # conversion is what turns the round trip into volts. Asserting the factor
+    # rather than equality makes the sink's declaration part of the contract
+    # instead of a comment nobody reads.
+    tx = NWBScalingTransformer(settings=NWBScalingSettings())
+    converted = np.concatenate([tx(m).data for m in read_msgs], axis=0)
+    np.testing.assert_allclose(converted, src_data * 1e-6, rtol=1e-6)
+    assert tx(read_msgs[0]).attrs["unit"] == "volts"
 
     outpath.unlink(missing_ok=True)
 

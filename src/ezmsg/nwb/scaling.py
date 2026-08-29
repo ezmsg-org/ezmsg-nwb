@@ -13,9 +13,18 @@ volts are both just numbers. Any downstream stage with an absolute threshold
 (a rail guard, a power clip) is then comparing against the wrong scale.
 
 So this module resolves those three factors into a single gain and offset
-(:func:`resolve_scaling`) and applies them lazily on read
-(:class:`ScaledDataset`), leaving the file's chunked I/O and the slicer's
-laziness intact.
+(:func:`resolve_scaling`) and describes them for the reader to attach to every
+message (:func:`describe_stream_scaling`, :class:`StreamScaling`).
+
+**Nothing here applies anything.** The reader hands back the integers the file
+stores, plus this description of what they mean;
+:class:`~ezmsg.nwb.convert.NWBScalingUnit` does the arithmetic, wherever in the
+graph it belongs. Splitting it that way is what keeps the two halves honest: the
+reader has one job and states a fact about the file, the transformer has one job
+and states what it did. It is also no slower -- measured on a real recording at
+1 s chunks, reading int16 and converting downstream beats converting during the
+read, because the reader then moves half as many bytes and only the messages
+that survive get widened.
 
 **The declared unit cannot be trusted, and neither can the conversion.** All
 four of these combinations have been seen on files describing the same
@@ -36,17 +45,17 @@ scale sits in a ``channel_conversion`` that is a writing library's default for
 some *other* amplifier, 5x off for the hardware that actually recorded it --
 and no amount of care in a *reader* can tell a wrong gain from a real one.
 
-That is why the scaling resolved here is overridable per stream
-(``scale_override`` / ``unit_override``): honouring the file is the right
-default, but a caller who knows a particular writer lies needs to say so
-without patching the file.
+That is why the scaling is overridable per stream on the transformer
+(``scale_override`` / ``unit_override``): reporting the file verbatim is the
+right thing for a reader to do, but a caller who knows a particular writer lies
+needs to say so without patching the file.
 
 Separately from *what the file means*, a pipeline has an opinion about *what it
 wants on the wire*: ``target_unit`` converts a voltage stream to a requested
 :class:`VoltageUnit` on top of whatever the file (as corrected) turned out to
 be, so a graph can be written against microvolts and fed by files that disagree
-about their own scale. It applies only to electrical streams -- see
-:func:`convert_to_target_unit`.
+about their own scale. It applies only to voltage streams -- see
+:func:`is_voltage_stream` and :func:`convert_to_target_unit`.
 """
 
 from __future__ import annotations
@@ -153,79 +162,6 @@ against int16's 16 bits of input, so applying a gain is exact for any gain that
 is a power of two (0.25 is) and otherwise correctly rounded -- there is no
 precision to recover by going wider.
 """
-
-
-class ScaledDataset:
-    """Lazy ``data * gain + offset`` view over an h5py dataset.
-
-    Quacks like the dataset it wraps (``shape``, ``dtype``, ``ndim``, ``len``,
-    ``__getitem__``) so every read path -- the iterator's chunk builder and both
-    of :class:`~ezmsg.nwb.slicer.NWBSlicer`'s slice methods -- picks up the
-    scaling without knowing it exists. Nothing is materialized: the wrapped
-    dataset is still sliced lazily and only the requested block is converted.
-
-    ``base`` stays reachable because the dejitter pass identifies a stream's
-    ``*_device_ts`` partner by comparing HDF5 object addresses, which only exist
-    on the real dataset (see :meth:`~ezmsg.nwb.slicer.NWBSlicer._data_addr`).
-    """
-
-    __slots__ = ("base", "shape", "dtype", "_gain", "_offset", "_gain_shape")
-
-    def __init__(
-        self,
-        base: typing.Any,
-        gain: typing.Union[float, np.ndarray],
-        offset: float = 0.0,
-        dtype: typing.Any = DEFAULT_CONVERSION_DTYPE,
-    ) -> None:
-        self.base = base
-        self.dtype = np.dtype(dtype)
-        self.shape = tuple(base.shape)
-        gain_arr = np.asarray(gain, dtype=self.dtype)
-        if gain_arr.ndim > 1:
-            raise ValueError(f"gain must be scalar or 1-D, got shape {gain_arr.shape}.")
-        if gain_arr.ndim == 1:
-            # Per-channel gains live on axis 1 (the ``ch`` axis; axis 0 is time).
-            if len(self.shape) < 2 or gain_arr.size != self.shape[1]:
-                raise ValueError(
-                    f"per-channel gain of length {gain_arr.size} does not match dataset shape {self.shape}."
-                )
-            self._gain_shape = (1, gain_arr.size) + (1,) * (len(self.shape) - 2)
-        else:
-            self._gain_shape = ()
-        self._gain = gain_arr
-        self._offset = self.dtype.type(offset)
-
-    @property
-    def ndim(self) -> int:
-        return len(self.shape)
-
-    def __len__(self) -> int:
-        return self.shape[0]
-
-    def __getitem__(self, key: typing.Any) -> np.ndarray:
-        raw = self.base[key]
-        gain = self._gain
-        if self._gain_shape:
-            # An integer index on the time axis drops a leading dimension from
-            # the result; trim the same number off the front of the broadcast
-            # shape so the channel gains still land on the channel axis.
-            dropped = self.ndim - np.ndim(raw)
-            gain = gain.reshape(self._gain_shape[dropped:])
-        # One allocation: multiply reads the int16 straight into a float32 out,
-        # rather than casting the whole block first and scaling that copy.
-        out = np.multiply(raw, gain, dtype=self.dtype)
-        if self._offset:
-            out += self._offset
-        return out
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"ScaledDataset({self.base!r}, gain={self._gain!r}, offset={self._offset!r})"
-
-
-def unwrap_dataset(dset: typing.Any) -> typing.Any:
-    """The underlying dataset, whether or not it is wrapped for scaling."""
-    return dset.base if isinstance(dset, ScaledDataset) else dset
 
 
 def override_for(override: typing.Any, key: str) -> typing.Any:
@@ -347,27 +283,18 @@ def read_stored_scaling(dset: typing.Any) -> tuple[float, float, str]:
 def resolve_scaling(
     dset: typing.Any,
     channel_conversion: typing.Any = None,
-    *,
-    scale_override: typing.Any = None,
-    unit_override: typing.Any = None,
-    target_unit: typing.Any = None,
-    is_electrical: bool = False,
-    stream_key: str = "",
 ) -> tuple[typing.Union[float, np.ndarray], float, str]:
     """Collapse a stream's stored scaling into one ``(gain, offset, unit)``.
+
+    Verbatim: what the file says, with nothing corrected and nothing converted.
+    Overrides and target units belong to :mod:`~ezmsg.nwb.convert`, which is
+    where the applying happens; a reader that pre-corrected would leave the
+    reported scaling describing neither the file nor the data.
 
     ``gain`` is ``conversion * channel_conversion`` -- a scalar when the
     per-channel factors are absent or all equal (the common case, and the one
     that keeps the multiply a scalar broadcast), a vector only when the channels
     genuinely disagree.
-
-    ``scale_override`` replaces the resolved gain outright, for a file whose
-    recorded factors are known to be wrong; ``unit_override`` replaces only the
-    declared unit, for one whose number is right and whose label is not.
-    ``target_unit`` then converts the result into the unit the caller wants, for
-    the voltage streams only -- see :func:`is_voltage_stream`, which *is_electrical*
-    feeds. Any of the three may be a bare value (applies to every stream) or a
-    ``{stream_key: value}`` mapping.
     """
     conversion, offset, unit = read_stored_scaling(dset)
 
@@ -382,19 +309,6 @@ def resolve_scaling(
                 gain = conversion * float(per_channel[0])
             else:
                 gain = conversion * per_channel
-
-    scale = override_for(scale_override, stream_key)
-    if scale is not None:
-        gain = scale
-    forced_unit = override_for(unit_override, stream_key)
-    if forced_unit is not None:
-        unit = str(forced_unit)
-
-    target = override_for(target_unit, stream_key)
-    if target is not None and is_voltage_stream(unit, is_electrical):
-        gain, offset, unit = convert_to_target_unit(
-            gain, offset, unit, coerce_voltage_unit(target), stream_key=stream_key
-        )
 
     return gain, offset, unit
 
@@ -481,62 +395,30 @@ class StreamScaling(typing.NamedTuple):
         )
 
 
-class ScalingResult(typing.NamedTuple):
-    """What :func:`resolve_stream_scaling` hands the slicer."""
-
-    dset: typing.Any
-    """The dataset to read through -- wrapped, or the original."""
-    unit: str
-    """Unit of what ``dset`` yields; ``""`` when that is raw stored samples,
-    because counts are not volts and labelling them so is the whole bug."""
-    scaling: typing.Optional[StreamScaling]
-    """None only for a stream that has no scaling to speak of (text)."""
-
-
-def resolve_stream_scaling(
+def describe_stream_scaling(
     dset: typing.Any,
     channel_conversion: typing.Any = None,
     *,
-    apply: bool = True,
-    dtype: typing.Any = DEFAULT_CONVERSION_DTYPE,
-    scale_override: typing.Any = None,
-    unit_override: typing.Any = None,
-    target_unit: typing.Any = None,
     is_electrical: bool = False,
-    stream_key: str = "",
-) -> ScalingResult:
-    """Resolve a stream's scaling, and apply it unless *apply* is False.
+) -> typing.Optional[StreamScaling]:
+    """What a stream's stored samples mean, for the reader to report.
 
-    Resolved either way, on purpose. ``apply=False`` asks for the stored
-    samples, not for the factors to be forgotten: a caller who wants counts
-    usually wants to scale them later (in a processing stage, on a GPU, after
-    decimation), and dropping the factors here would make them reopen the file
-    to recover what this function already had in hand. So the numbers are
-    reported on the message either way, and ``applied`` says which it is.
+    Describes; never applies. The reader hands back the integers the file
+    stores and this alongside them, so :mod:`~ezmsg.nwb.convert` can do the
+    arithmetic wherever in the graph it belongs. ``applied`` is therefore always
+    False here -- it turns True only once something has actually multiplied.
 
-    Returns *dset* unwrapped when the resolved scaling is the identity -- there
-    is nothing to compute, so a stored int16 stays int16 rather than becoming a
-    float32 copy of the same values.
+    None for a stream with no scaling to speak of: a materialized text column
+    has no gain, and reporting an identity one would invite a consumer to
+    multiply strings.
     """
     if not isinstance(dset, h5py.Dataset) or dset.dtype.kind not in "iuf":
-        # A materialized text column: no gain, and nothing to say about one.
-        return ScalingResult(dset, "", None)
-
-    gain, offset, unit = resolve_scaling(
-        dset,
-        channel_conversion,
-        scale_override=scale_override,
-        unit_override=unit_override,
-        target_unit=target_unit,
-        is_electrical=is_electrical,
-        stream_key=stream_key,
+        return None
+    gain, offset, unit = resolve_scaling(dset, channel_conversion)
+    return StreamScaling(
+        gain=gain if isinstance(gain, np.ndarray) else float(gain),
+        offset=offset,
+        unit=unit,
+        applied=False,
+        voltage=is_voltage_stream(unit, is_electrical),
     )
-    gain = gain if isinstance(gain, np.ndarray) else float(gain)
-    voltage = is_voltage_stream(unit, is_electrical)
-
-    if not apply:
-        return ScalingResult(dset, "", StreamScaling(gain, offset, unit, applied=False, voltage=voltage))
-    scaling = StreamScaling(gain, offset, unit, applied=True, voltage=voltage)
-    if is_identity_scaling(gain, offset):
-        return ScalingResult(dset, unit, scaling)
-    return ScalingResult(ScaledDataset(dset, gain, offset, dtype), unit, scaling)

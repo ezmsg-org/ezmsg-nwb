@@ -26,14 +26,7 @@ from .clockmodel import (
     group_clocks,
     reconstruct_group,
 )
-from .scaling import (
-    DEFAULT_CONVERSION_DTYPE,
-    SCALING_ATTR,
-    StreamScaling,
-    VoltageUnit,
-    resolve_stream_scaling,
-    unwrap_dataset,
-)
+from .scaling import SCALING_ATTR, StreamScaling, describe_stream_scaling
 from .util import ReferenceClockType, as_text, as_text_array
 
 # Default gap threshold as a fraction of the nominal sample period (1.5x period).
@@ -129,23 +122,15 @@ class StreamInfo:
     table_ref: typing.Any = None
     """Reference to the interval table (events only)."""
 
-    unit: str = ""
-    """Unit the data read from this stream is in (``""`` when unknown).
-
-    The file's own string verbatim by default, because it is frequently wrong
-    and interpreting it would hide that -- see :mod:`~ezmsg.nwb.scaling`. It is
-    the requested unit instead when ``target_unit`` converted the stream, since
-    then it describes the numbers rather than the file. Either way it is copied
-    onto each message's ``attrs["unit"]``.
-    """
-
     scaling: typing.Optional[StreamScaling] = None
-    """How this stream's samples relate to the file, applied or not.
+    """What this stream's stored samples mean -- gain, offset, and the unit they
+    would be in once those are applied.
 
-    Present even when ``apply_conversion`` is off, so a caller who asked for
-    stored samples can still scale them downstream without reopening the file.
-    Copied onto each message's ``attrs[SCALING_ATTR]``. None only for text
-    streams, which have no scaling to describe.
+    The file's own numbers verbatim, including its unit string, which is
+    frequently wrong; interpreting it here would hide that. Correcting and
+    applying it is :mod:`~ezmsg.nwb.convert`'s job. Copied onto every message's
+    ``attrs[SCALING_ATTR]``. None only for text streams, which have no scaling
+    to describe.
     """
 
 
@@ -288,38 +273,14 @@ class NWBSlicer:
             segment is reconstructed independently) so the iterator still splits a
             chunk there. Pass ``float("inf")`` to disable the guard and smooth
             everything. Ignored when ``dejitter`` is False.
-        apply_conversion: Apply each stream's stored ``conversion`` /
-            ``channel_conversion`` / ``offset`` on read (default True), so the
-            data comes out in the unit the file declares rather than as raw ADC
-            counts. See :mod:`~ezmsg.nwb.scaling`. Set False to read the stored
-            integers unchanged -- the pre-1.9 behaviour, and the only way to
-            reproduce a result computed under it. The factors are reported on
-            every message either way, under ``attrs[SCALING_ATTR]``, so reading
-            stored samples does not throw away what it takes to scale them
-            later.
-        conversion_dtype: Output dtype for streams that get scaled
-            (default ``float32``). Ignored when ``apply_conversion`` is False,
-            and for any stream whose scaling is the identity: those keep their
-            stored dtype, since there is nothing to compute.
-        scale_override: Replace the resolved gain for a file whose recorded
-            conversion factors are wrong (they occur; see
-            :mod:`~ezmsg.nwb.scaling`). A float applies to every stream, a
-            ``{stream_key: float}`` mapping to the named ones. ``None`` (default)
-            honours the file.
-        unit_override: Replace the declared unit string without touching the
-            gain, for a file whose number is right and whose label is not. Same
-            bare-value-or-mapping form as ``scale_override``.
-        target_unit: Deliver electrical streams in this
-            :class:`~ezmsg.nwb.scaling.VoltageUnit` (accepts any spelling of
-            one) regardless of the unit the file works in, so a graph written
-            against, say, microvolts is fed the same numbers by files that
-            disagree about their own scale. Applied *after* the two overrides,
-            so a file that lies can be corrected and converted in one pass.
-            Reaches every stream that is an ``ElectricalSeries`` *or* declares a
-            voltage unit -- the latter being how a re-timestamped ``*_device_ts``
-            companion of an acquisition stream is written -- and leaves streams
-            in other units (cursor positions, markers) alone. ``None`` (default)
-            delivers each stream's own unit. Requires ``apply_conversion``.
+    Note:
+        Data comes back as the file stores it -- integer ADC counts, typically,
+        not the unit the file declares. Every message carries what it takes to
+        convert under ``attrs[SCALING_ATTR]``; put a
+        :class:`~ezmsg.nwb.convert.NWBScalingUnit` in the graph (or call
+        :class:`~ezmsg.nwb.convert.NWBScalingTransformer` directly) to apply it.
+        Doing it there rather than here is both cleaner and marginally faster --
+        see :mod:`~ezmsg.nwb.scaling`.
     """
 
     disk_cache = remfile.DiskCache(str(Path("~").expanduser() / ".ezmsg" / "nwb-cache"))
@@ -339,11 +300,6 @@ class NWBSlicer:
         clock_groups: typing.Optional[list[list[str]]] = None,
         dejitter_cache: bool = True,
         real_gap_threshold: typing.Optional[float] = None,
-        apply_conversion: bool = True,
-        conversion_dtype: str = DEFAULT_CONVERSION_DTYPE,
-        scale_override: typing.Union[float, dict[str, float], None] = None,
-        unit_override: typing.Union[str, dict[str, str], None] = None,
-        target_unit: typing.Union[str, VoltageUnit, dict[str, typing.Union[str, VoltageUnit]], None] = None,
     ):
         self._filepath = filepath
         self._reference_clock = reference_clock
@@ -355,19 +311,6 @@ class NWBSlicer:
         self._clock_groups = clock_groups
         self._dejitter_cache = dejitter_cache
         self._real_gap_threshold = real_gap_threshold
-        self._apply_conversion = apply_conversion
-        self._conversion_dtype = conversion_dtype
-        self._scale_override = scale_override
-        self._unit_override = unit_override
-        if target_unit is not None and not apply_conversion:
-            # Raise rather than pick one: the two say opposite things about what
-            # should come out, and either silent resolution is a wrong-units bug
-            # of the kind this whole path exists to make impossible.
-            raise ValueError(
-                "target_unit requires apply_conversion=True: raw stored samples are counts, "
-                "which cannot be converted to a voltage unit."
-            )
-        self._target_unit = target_unit
 
         self._io: pynwb.NWBHDF5IO | None = None
         self._ts_off: float = 0.0
@@ -557,22 +500,15 @@ class NWBSlicer:
             # order of the interval tables already read whole just above.
             dset = as_text_array(child.data[:]) if _is_bytes_text(child.data) else child.data
 
-            # Wrap the dataset rather than converting at each call site: every
-            # read path here and in the iterator goes through ``info.dset``, so
-            # one wrapper covers all of them and none can forget.
-            dset, unit, scaling = resolve_stream_scaling(
+            # Described, not applied: the reader's job is to say what the
+            # stored samples mean, and ``NWBScalingUnit``'s is to act on it.
+            scaling = describe_stream_scaling(
                 dset,
                 getattr(child, "channel_conversion", None),
-                apply=self._apply_conversion,
-                dtype=self._conversion_dtype,
-                scale_override=self._scale_override,
-                unit_override=self._unit_override,
-                target_unit=self._target_unit,
                 # One of the two things that make a stream convertible; the
                 # other is its declared unit, which is what covers voltage
                 # written as a plain TimeSeries. See ``is_voltage_stream``.
                 is_electrical=isinstance(child, pynwb.ecephys.ElectricalSeries),
-                stream_key=matched_key,
             )
 
             self._streams[matched_key] = StreamInfo(
@@ -583,14 +519,11 @@ class NWBSlicer:
                     if child.data.ndim > 1
                     else ["time"],
                     axes=axes,
-                    # ``unit`` describes the data, so it is absent (not
-                    # "counts") when the conversion was not applied.
-                    # ``nwb_scaling`` describes the file, so it is present
-                    # either way -- with ``applied`` saying which.
-                    attrs=(
-                        ({"unit": unit} if unit else {})
-                        | ({SCALING_ATTR: scaling.as_attr()} if scaling is not None else {})
-                    ),
+                    # No ``unit``: the data is stored counts, and calling counts
+                    # volts is the whole bug. ``nwb_scaling`` says what they
+                    # would become, and the transformer stamps ``unit`` once it
+                    # has actually made them that.
+                    attrs={SCALING_ATTR: scaling.as_attr()} if scaling is not None else {},
                     key=matched_key,
                 ),
                 fs=rate,
@@ -604,7 +537,6 @@ class NWBSlicer:
                 has_timestamps=has_timestamps,
                 is_event=False,
                 table_ref=None,
-                unit=unit,
                 scaling=scaling,
             )
 
@@ -626,13 +558,7 @@ class NWBSlicer:
         a re-timestamped fixed-rate acquisition. Non-datasets (materialized text
         arrays) and any error yield None, so the caller falls back to the name
         convention rather than crashing.
-
-        Unwrapped first: a scaled stream's ``dset`` is a wrapper, and taking one
-        at face value would report None for both members of every pair, quietly
-        demoting this structural check to the name convention it exists to back
-        up.
         """
-        dset = unwrap_dataset(dset)
         try:
             if isinstance(dset, h5py.Dataset):
                 return int(h5py.h5o.get_info(dset.id).addr)
