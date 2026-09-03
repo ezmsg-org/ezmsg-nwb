@@ -964,3 +964,57 @@ def test_jittered_stream_not_oversplit(test_nwb_path):
     msgs = [m for m in it if m.data.shape[0] > 0]
     # 3 s of 1 kHz data in 1 s chunks -> exactly 3 non-empty messages.
     assert len(msgs) == 3
+
+
+class TestMessagesArriveReadyForConsumers:
+    """Two things only the source can supply, both set once per file.
+
+    ``chunk_dim`` names the dimension messages accumulate along -- the one whose
+    length is just however much of the file this chunk covered, and which a
+    consumer must leave out of the state it caches against the stream's
+    configuration. ``fingerprint`` is the channel axis's content digest, cached
+    on the axis and pickled with it; priming it here spares the first consumer
+    in every process from recomputing it on every message.
+    """
+
+    @staticmethod
+    def _messages(path):
+        it = NWBAxisArrayIterator(
+            NWBIteratorSettings(
+                filepath=path,
+                chunk_dur=1.0,
+                reference_clock=ReferenceClockType.UNKNOWN,
+            )
+        )
+        return [msg for msg in it if math.prod(msg.data.shape) > 0]
+
+    def test_every_message_declares_its_chunk_dim(self, test_nwb_path):
+        msgs = self._messages(test_nwb_path)
+        assert msgs, "no messages produced"
+        undeclared = sorted({m.key for m in msgs if m.chunk_dim != "time"})
+        assert not undeclared, f"streams not declaring chunk_dim='time': {undeclared}"
+
+    def test_every_channel_axis_is_primed(self, test_nwb_path):
+        cold = sorted(
+            {
+                m.key
+                for m in self._messages(test_nwb_path)
+                if "ch" in m.axes and "_fingerprint" not in m.axes["ch"].__dict__
+            }
+        )
+        assert not cold, f"streams handing over a cold ch axis: {cold}"
+
+    def test_the_chunk_axis_is_left_cold(self, test_nwb_path):
+        """Digesting per-message timestamps would be pure cost: no consumer reads
+        the chunk axis's fingerprint."""
+        irregular = [m for m in self._messages(test_nwb_path) if hasattr(m.axes.get("time"), "data")]
+        assert irregular, "expected at least one stream with coordinate timestamps"
+        assert all("_fingerprint" not in m.axes["time"].__dict__ for m in irregular)
+
+    def test_it_all_survives_the_transport(self, test_nwb_path):
+        import pickle
+
+        msg = next(m for m in self._messages(test_nwb_path) if "ch" in m.axes)
+        landed = pickle.loads(pickle.dumps(msg))
+        assert landed.chunk_dim == "time"
+        assert "_fingerprint" in landed.axes["ch"].__dict__

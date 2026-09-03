@@ -376,6 +376,8 @@ class NWBSlicer:
                     # the repr -- an event payload of "b'{\"cause\": ...}'" that no
                     # consumer can match or parse, with nothing raised to say so.
                     dset = np.array([as_text_array(table[_].data) for _ in ch_labels]).T
+                    event_ch_ax = AxisArray.CoordinateAxis(data=np.array(ch_labels), dims=["ch"])
+                    event_ch_ax.fingerprint  # primed once for the file -- see `_load` below
                     self._streams[attr] = StreamInfo(
                         dset=dset,
                         template=AxisArray(
@@ -383,9 +385,10 @@ class NWBSlicer:
                             dims=["time", "ch"],
                             axes={
                                 "time": AxisArray.CoordinateAxis(data=np.array([]), dims=["time"], unit="s"),
-                                "ch": AxisArray.CoordinateAxis(data=np.array(ch_labels), dims=["ch"]),
+                                "ch": event_ch_ax,
                             },
                             key=attr,
+                            chunk_dim="time",
                         ),
                         fs=0.0,
                         t0=float(table.start_time[0]),
@@ -558,6 +561,15 @@ class NWBSlicer:
                 is_electrical=isinstance(child, pynwb.ecephys.ElectricalSeries),
             )
 
+            # Compute the channel fingerprint once, now. It is cached on the axis
+            # and pickled with it, and every message from this stream reuses this
+            # same axis object, so one checksum covers the whole file. Left cold it
+            # would be computed by the first stateful consumer in this process --
+            # and, since unpickling builds a new axis object per message, by the
+            # first consumer in every other process, on every message.
+            if "ch" in axes:
+                axes["ch"].fingerprint
+
             self._streams[matched_key] = StreamInfo(
                 dset=dset,
                 template=AxisArray(
@@ -572,6 +584,10 @@ class NWBSlicer:
                     # has actually made them that.
                     attrs=scaling.as_attrs() if scaling is not None else {},
                     key=matched_key,
+                    # Messages accumulate along `time`, whether it reads back as a
+                    # regular LinearAxis or, across a gap, as per-sample
+                    # coordinates. Everything else describes the recording.
+                    chunk_dim="time",
                 ),
                 fs=rate,
                 t0=(
