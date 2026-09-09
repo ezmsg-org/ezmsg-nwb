@@ -388,7 +388,7 @@ class NWBSlicer:
                                 "ch": event_ch_ax,
                             },
                             key=attr,
-                            chunk_dim="time",
+                            stream_dim="time",
                         ),
                         fs=0.0,
                         t0=float(table.start_time[0]),
@@ -587,7 +587,7 @@ class NWBSlicer:
                     # Messages accumulate along `time`, whether it reads back as a
                     # regular LinearAxis or, across a gap, as per-sample
                     # coordinates. Everything else describes the recording.
-                    chunk_dim="time",
+                    stream_dim="time",
                 ),
                 fs=rate,
                 t0=(
