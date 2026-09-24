@@ -20,6 +20,16 @@ dependencies = [
   "pyyaml",
 ]
 
+
+[project.entry-points."ezmsg.components"]
+"nwb.NWBClockDrivenUnit" = "ezmsg.nwb.clockdriven:NWBClockDrivenUnit"
+"nwb.NWBIteratorUnit" = "ezmsg.nwb.reader:NWBIteratorUnit"
+"nwb.NWBPipelineSettingsSink" = "ezmsg.nwb.pipeline_settings:NWBPipelineSettingsSink"
+"nwb.NWBScalingUnit" = "ezmsg.nwb.convert:NWBScalingUnit"
+"nwb.NWBSink" = "ezmsg.nwb.writer:NWBSink"
+"nwb.PipelineSettingsTableCollection" = "ezmsg.nwb.pipeline_settings:PipelineSettingsTableCollection"
+
+
 [project.optional-dependencies]
 sigproc = ["ezmsg-sigproc"]
 
