@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
   # 3.10.0b3 for AxisArray.stream_dim and CoordinateAxis.fingerprint.
-  "ezmsg>=3.10.0b3",
+  "ezmsg>=3.10.0b4",
   "ezmsg-baseproc>=1.14.0",
   "numpy>=1.26.0",
   "pynwb",
@@ -19,6 +19,16 @@ dependencies = [
   "remfile",
   "pyyaml",
 ]
+
+
+[project.entry-points."ezmsg.components"]
+"nwb.NWBClockDrivenUnit" = "ezmsg.nwb.clockdriven:NWBClockDrivenUnit"
+"nwb.NWBIteratorUnit" = "ezmsg.nwb.reader:NWBIteratorUnit"
+"nwb.NWBPipelineSettingsSink" = "ezmsg.nwb.pipeline_settings:NWBPipelineSettingsSink"
+"nwb.NWBScalingUnit" = "ezmsg.nwb.convert:NWBScalingUnit"
+"nwb.NWBSink" = "ezmsg.nwb.writer:NWBSink"
+"nwb.PipelineSettingsTableCollection" = "ezmsg.nwb.pipeline_settings:PipelineSettingsTableCollection"
+
 
 [project.optional-dependencies]
 sigproc = ["ezmsg-sigproc"]
@@ -80,3 +90,5 @@ known-third-party = ["ezmsg"]
 [tool.uv.sources]
 # Uncomment to use development version of ezmsg from git
 #ezmsg = { git = "https://github.com/ezmsg-org/ezmsg.git", branch = "dev" }
+# Use unreleased neuroconv until release > 0.10.2 whihc includes zarr dep fix.
+neuroconv = { git = "https://github.com/catalystneuro/neuroconv.git", branch = "main" }
