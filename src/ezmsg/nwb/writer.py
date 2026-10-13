@@ -85,8 +85,8 @@ from ezmsg.baseproc import BaseConsumerUnit, BaseStatefulConsumer, processor_sta
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
 from hdmf.backends.hdf5.h5_utils import H5DataIO
-from neuroconv.utils import DeepDict, dict_deep_update, load_dict_from_file
 
+from ._dictutil import DeepDict, dict_deep_update, load_dict_from_file
 from .util import (
     ReferenceClockType,
     build_nwb_fname,

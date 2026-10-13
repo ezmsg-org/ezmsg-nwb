@@ -77,6 +77,8 @@ class NWBIteratorSettings(ez.Settings):
     emits: position, label, bank, headstage, array identity. Default False --
     these columns are an acquisition-stack convention, not part of the NWB
     schema. See :mod:`~ezmsg.nwb.electrodes`."""
+    storage_options: typing.Optional[dict] = None
+    """fsspec options for a remote Zarr store (e.g. ``account_name`` for ``abfs://``)."""
 
 
 @processor_state
@@ -324,6 +326,7 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
             dejitter_cache=self.settings.dejitter_cache,
             real_gap_threshold=self.settings.real_gap_threshold,
             structured_ch_axis=self.settings.structured_ch_axis,
+            storage_options=self.settings.storage_options,
         )
         self._state.slicer = slicer
 
