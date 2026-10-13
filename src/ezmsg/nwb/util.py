@@ -2,7 +2,8 @@ import typing
 from enum import Enum
 
 import numpy as np
-from neuroconv.utils import DeepDict
+
+from ._dictutil import DeepDict
 
 
 def as_text(value: typing.Any) -> str:
@@ -73,3 +74,9 @@ def interval_median(values: np.ndarray) -> float:
     if values.size > MEDIAN_SUBSAMPLE_MAX:
         values = values[:: -(-values.size // MEDIAN_SUBSAMPLE_MAX)]
     return float(np.median(values))
+
+
+def is_zarr_array(dset: typing.Any) -> bool:
+    """A zarr-backed array: what NWBZarrIO hands back where NWBHDF5IO hands back an h5py dataset
+    (``hdmf_zarr``'s wrapper, or a bare ``zarr`` array)."""
+    return type(dset).__module__.split(".")[0] in ("zarr", "hdmf_zarr") and hasattr(dset, "chunks")

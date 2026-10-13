@@ -28,7 +28,7 @@ from .clockmodel import (
 )
 from .electrodes import build_channel_axis
 from .scaling import StreamScaling, describe_stream_scaling
-from .util import ReferenceClockType, as_text, as_text_array, interval_median
+from .util import ReferenceClockType, as_text, as_text_array, interval_median, is_zarr_array
 
 # Default gap threshold as a fraction of the nominal sample period (1.5x period).
 # Sits between neural-data jitter (<~1.05x) and the smallest real gap (one dropped
@@ -90,6 +90,13 @@ def find_gaps(timestamps: np.ndarray, gain: float, gap_tol: float) -> np.ndarray
     if gain <= 0.0 or timestamps.shape[0] < 2:
         return np.empty(0, dtype=int)
     return np.flatnonzero(np.diff(timestamps) > gain * (1.0 + gap_tol))
+
+
+def is_zarr_store(filepath: typing.Union[os.PathLike, str]) -> bool:
+    """An NWB file stored as an hdmf-zarr store: a ``.zarr`` path (local or URL), or a local
+    directory holding a Zarr root."""
+    p = str(filepath).split("?")[0].rstrip("/")
+    return p.endswith(".zarr") or (Path(p).is_dir() and any((Path(p) / n).exists() for n in ("zarr.json", ".zgroup")))
 
 
 @dataclass
@@ -311,8 +318,10 @@ class NWBSlicer:
         dejitter_cache: bool = True,
         real_gap_threshold: typing.Optional[float] = None,
         structured_ch_axis: bool = False,
+        storage_options: typing.Optional[dict] = None,
     ):
         self._filepath = filepath
+        self._storage_options = storage_options
         self._reference_clock = reference_clock
         self._reref_now = reref_now
         self._stream_keys = stream_keys
@@ -324,7 +333,7 @@ class NWBSlicer:
         self._real_gap_threshold = real_gap_threshold
         self._structured_ch_axis = structured_ch_axis
 
-        self._io: pynwb.NWBHDF5IO | None = None
+        self._io: typing.Any = None  # NWBHDF5IO, or NWBZarrIO for a Zarr store
         self._ts_off: float = 0.0
         self._streams: dict[str, StreamInfo] = {}
         self._start_time: float = np.inf
@@ -334,7 +343,11 @@ class NWBSlicer:
 
     def _load(self) -> None:
         """Open the NWB file and discover all streams."""
-        if str(self._filepath).startswith("http"):
+        if is_zarr_store(self._filepath):
+            from hdmf_zarr.nwb import NWBZarrIO  # the `zarr` extra
+
+            self._io = NWBZarrIO(str(self._filepath), mode="r", storage_options=self._storage_options)
+        elif str(self._filepath).startswith("http"):
             f = remfile.File(self._filepath, disk_cache=self.disk_cache)
             file = h5py.File(f, rdcc_nbytes=self._rdcc_nbytes, rdcc_nslots=self._rdcc_nslots)
             self._io = pynwb.NWBHDF5IO(file=file)
@@ -625,6 +638,8 @@ class NWBSlicer:
         try:
             if isinstance(dset, h5py.Dataset):
                 return int(h5py.h5o.get_info(dset.id).addr)
+            if is_zarr_array(dset):  # same store + path = same array (a resolved link)
+                return hash((str(dset.store), dset.path))
         except Exception:
             return None
         return None

@@ -66,7 +66,7 @@ import typing
 import h5py
 import numpy as np
 
-from .util import as_text
+from .util import as_text, is_zarr_array
 
 
 class VoltageUnit(str, enum.Enum):
@@ -474,7 +474,7 @@ def describe_stream_scaling(
     has no gain, and reporting an identity one would invite a consumer to
     multiply strings.
     """
-    if not isinstance(dset, h5py.Dataset) or dset.dtype.kind not in "iuf":
+    if not (isinstance(dset, h5py.Dataset) or is_zarr_array(dset)) or dset.dtype.kind not in "iuf":
         return None
     gain, offset, unit = resolve_scaling(dset, channel_conversion)
     return StreamScaling(
