@@ -456,9 +456,17 @@ class NWBSlicer:
         # reconstruction (see ``_apply_dejitter``), so they never surface as
         # iterable streams -- the filter behaves as requested while dejitter
         # still fires. Without a filter (None) every stream is already present.
-        match_keys = self._stream_keys
+        # Keyed by the partner's own name and giving the key it is stored under,
+        # which follows the requested stream's: a stream asked for by its short
+        # name (``HUB1`` for ``CereLink_HUB1``) has a partner that cannot be
+        # matched by name, having no electrode group to take a manufacturer from.
+        partner_keys: dict[str, str] = {}
         if self._dejitter and self._stream_keys is not None:
-            match_keys = list(self._stream_keys) + [f"{k}_device_ts" for k in self._stream_keys]
+            for _, ts in all_timeseries:
+                if isinstance(ts, pynwb.TimeSeries):
+                    key = _match_stream_key(ts, self._stream_keys)
+                    if key is not None:
+                        partner_keys[f"{ts.name}_device_ts"] = f"{key}_device_ts"
 
         # Gaps are looked for on device time wherever a stream has it, dejittered or
         # not, so find each partner's timestamps here rather than through discovery
@@ -475,7 +483,7 @@ class NWBSlicer:
                 continue
             if not isinstance(child, pynwb.TimeSeries):
                 continue
-            matched_key = _match_stream_key(child, match_keys)
+            matched_key = _match_stream_key(child, self._stream_keys) or partner_keys.get(child.name)
             if matched_key is None:
                 continue
             if child.data.size == 0:

@@ -142,3 +142,21 @@ def test_dejitter_cache_reused_across_opens(dejitter_nwb_path, tmp_path, monkeyp
     rec2 = np.asarray(s2.get_stream_info("HUB").timestamps[:], dtype=float)
     s2.close()
     assert np.array_equal(rec1, rec2)
+
+
+def test_dejitter_applies_to_a_stream_asked_for_by_its_short_name(tmp_path):
+    """``HUB`` for ``Maker_HUB``: the partner has no electrode group to match the
+    short name through, and used to be left out, silently skipping the dejitter."""
+    from conftest import DEJITTER_N, _index_data, _write_dejitter_nwb
+
+    _truth, converted, device = dejitter_timestamps()
+    path = _write_dejitter_nwb(
+        tmp_path / "prefixed.nwb", converted, device, _index_data(DEJITTER_N, 4), name="Maker_HUB", manufacturer="Maker"
+    )
+    s = NWBSlicer(path, stream_keys=["HUB"], dejitter=True, dejitter_cache=False)
+    rec = np.asarray(s.get_stream_info("HUB").timestamps[:], dtype=float)
+    names = s.stream_names
+    s.close()
+    assert names == ["HUB"]  # the partner stays hidden
+    assert _n_gaps(rec) == 0
+    assert not np.array_equal(rec, converted)
