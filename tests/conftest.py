@@ -287,7 +287,7 @@ def dejitter_gapped_timestamps():
     return truth, converted, device
 
 
-def _write_dejitter_nwb(path, converted, device, data):
+def _write_dejitter_nwb(path, converted, device, data, name="HUB", manufacturer=None):
     import h5py
     from create_test_nwb import _downgrade_electrodes_table
     from pynwb import NWBHDF5IO, NWBFile, TimeSeries
@@ -298,7 +298,7 @@ def _write_dejitter_nwb(path, converted, device, data):
         identifier="dejitter001",
         session_start_time=datetime.datetime(2024, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc),
     )
-    dev = nwbfile.create_device(name="TestArray")
+    dev = nwbfile.create_device(name="TestArray", manufacturer=manufacturer)
     group = nwbfile.create_electrode_group(name="G", description="g", location="M1", device=dev)
     nwbfile.add_electrode_column(name="label", description="label")
     for i in range(4):
@@ -306,18 +306,18 @@ def _write_dejitter_nwb(path, converted, device, data):
     region = nwbfile.create_electrode_table_region(region=list(range(4)), description="all")
 
     nwbfile.add_acquisition(
-        ElectricalSeries(name="HUB", data=data, timestamps=converted, electrodes=region, description="jittery")
+        ElectricalSeries(name=name, data=data, timestamps=converted, electrodes=region, description="jittery")
     )
     ecephys = nwbfile.create_processing_module(name="ecephys", description="ecephys")
-    ecephys.add(TimeSeries(name="HUB_device_ts", data=data.copy(), unit="V", timestamps=device, description="device"))
+    ecephys.add(TimeSeries(name=f"{name}_device_ts", data=data.copy(), unit="V", timestamps=device, description="dev"))
 
     with NWBHDF5IO(str(path), "w") as io:
         io.write(nwbfile)
 
     with h5py.File(str(path), "a") as f:
-        f["acquisition/HUB/timestamps"].attrs["rate"] = np.float32(DEJITTER_RATE)
-        del f["processing/ecephys/HUB_device_ts/data"]
-        f["processing/ecephys/HUB_device_ts/data"] = f["acquisition/HUB/data"]
+        f[f"acquisition/{name}/timestamps"].attrs["rate"] = np.float32(DEJITTER_RATE)
+        del f[f"processing/ecephys/{name}_device_ts/data"]
+        f[f"processing/ecephys/{name}_device_ts/data"] = f[f"acquisition/{name}/data"]
 
     _downgrade_electrodes_table(path)
     return path
@@ -359,7 +359,7 @@ def dejitter_nwb_path(tmp_path_factory):
         ElectricalSeries(name="HUB", data=data, timestamps=converted, electrodes=region, description="jittery")
     )
     ecephys = nwbfile.create_processing_module(name="ecephys", description="ecephys")
-    ecephys.add(TimeSeries(name="HUB_device_ts", data=data.copy(), unit="V", timestamps=device, description="device"))
+    ecephys.add(TimeSeries(name="HUB_device_ts", data=data.copy(), unit="V", timestamps=device, description="dev"))
 
     with NWBHDF5IO(str(path), "w") as io:
         io.write(nwbfile)

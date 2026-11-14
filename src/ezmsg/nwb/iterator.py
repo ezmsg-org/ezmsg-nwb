@@ -6,6 +6,7 @@ import queue
 import sys
 import threading
 import typing
+import warnings
 from collections import deque
 
 import ezmsg.core as ez
@@ -15,7 +16,8 @@ from ezmsg.baseproc.stateful import BaseStatefulProducer
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
 
-from .slicer import DEFAULT_GAP_TOL, NWBSlicer, find_gaps
+from .clockmodel import GAP_MIN_S
+from .slicer import NWBSlicer
 from .util import ReferenceClockType
 
 # Sentinel pushed to the prefetch queue to indicate end-of-stream. Identity-compared.
@@ -45,16 +47,22 @@ class NWBIteratorSettings(ez.Settings):
     """HDF5 raw data chunk cache size in bytes (forwarded to NWBSlicer)."""
     rdcc_nslots: int = NWBSlicer.DEFAULT_RDCC_NSLOTS
     """HDF5 raw data chunk cache slot count (forwarded to NWBSlicer)."""
-    gap_tol: float = DEFAULT_GAP_TOL
-    """Gap threshold for timestamped continuous streams, as a fraction of the
-    nominal sample period: a gap is declared when an interval exceeds
-    ``(1 + gap_tol) / fs``. Chunks spanning a gap are split into gap-free
-    messages so the regular ``LinearAxis`` never misplaces post-gap samples.
+    gap_tol: typing.Optional[float] = None
+    """.. deprecated:: Ignored. Gaps are now found with ``gap_tolerance``."""
+    gap_tolerance: float = GAP_MIN_S
+    """The smallest margin, in seconds, above one sample period that an interval
+    between samples must exceed to count as a gap. The margin is never less than
+    one period, and a lone late timestamp is not a gap; see
+    :meth:`~ezmsg.nwb.slicer.NWBSlicer.segment_starts`.
 
-    The default ``0.5`` (1.5x period) sits between neural-data jitter (<~1.05x)
-    and the smallest real gap (one dropped sample = ~2x), so it catches every
-    gap without splitting on jitter. Set very large to disable splitting. No
-    effect on rate-only streams or event tables.
+    A chunk spanning a gap is split there, each part on its own regular
+    ``LinearAxis``, and the first message after a gap starts a new
+    :attr:`~ezmsg.util.messages.axisarray.AxisArray.segment`. Gaps are looked for
+    in a stream's ``*_device_ts`` partner when it has one. No effect on rate-only
+    streams, event tables, or streams with no nominal rate.
+
+    Files with heavy timestamp jitter (several ms) should keep ``dejitter`` on:
+    only that pass widens the threshold to clear the stream's own jitter.
     """
     dejitter: bool = True
     """Reconstruct smoothed monotone timestamps for streams with a paired
@@ -68,9 +76,10 @@ class NWBIteratorSettings(ez.Settings):
     """Cache reconstructed timestamps on disk across opens (forwarded to
     ``NWBSlicer``)."""
     real_gap_threshold: typing.Optional[float] = None
-    """Real-gap guard threshold in seconds (forwarded to ``NWBSlicer``). ``None``
-    auto-derives per stream; genuine gaps are preserved so chunks still split at
-    them. ``float("inf")`` disables the guard."""
+    """Explicit gap threshold in seconds, as an interval between samples (forwarded
+    to ``NWBSlicer``). ``None`` derives it from ``gap_tolerance``.
+    ``float("inf")`` turns gap handling off: nothing is split and the segment never
+    changes."""
     structured_ch_axis: bool = False
     """Build the ``ch`` axis as a structured record array from the electrodes
     table (forwarded to ``NWBSlicer``), matching what a live acquisition source
@@ -79,6 +88,10 @@ class NWBIteratorSettings(ez.Settings):
     schema. See :mod:`~ezmsg.nwb.electrodes`."""
     storage_options: typing.Optional[dict] = None
     """fsspec options for a remote Zarr store (e.g. ``account_name`` for ``abfs://``)."""
+
+    def __post_init__(self) -> None:
+        if self.gap_tol is not None:
+            warnings.warn("gap_tol is ignored; use gap_tolerance (seconds).", DeprecationWarning, stacklevel=3)
 
 
 @processor_state
@@ -97,9 +110,11 @@ def _build_chunk_messages_static(
     slicer: NWBSlicer,
     streams: dict,
     chunk_ix: int,
-    gap_tol: float = DEFAULT_GAP_TOL,
 ) -> list[AxisArray]:
     """Build the messages for ``chunk_ix`` from explicit slicer/streams refs.
+
+    Each stream's ``segment`` counter lives in its ``streams`` entry and is
+    advanced here, so chunks must be built in order.
 
     Module-level (not a method) on purpose: the prefetch worker captures only
     the values it needs, never ``self``. If it captured ``self``, the
@@ -145,10 +160,11 @@ def _build_chunk_messages_static(
                                 ),
                             },
                             key=strm_name,
+                            segment=strm_dict["segment"],
                         )
                     )
             else:
-                out.append(template)
+                out.append(replace(template, segment=strm_dict["segment"]))
         else:
             out_data = info.dset[start_idx:stop_idx]
             time_axis = template.axes["time"]
@@ -156,16 +172,19 @@ def _build_chunk_messages_static(
             # Timestamped continuous stream on a regular LinearAxis: a single
             # chunk that spans a gap in the explicit timestamps would emit a
             # uniform time axis that misplaces every post-gap sample. Split it
-            # into gap-free runs, each anchored on its own first timestamp.
+            # into gap-free runs, each anchored on its own first timestamp and
+            # each starting a new segment.
             # Rate-only streams (no per-sample timestamps) and CoordinateAxis
             # streams (no ``gain`` to compare against) keep the old single-chunk
             # path.
             if info.has_timestamps and info.timestamps is not None and hasattr(time_axis, "gain") and len(out_data):
                 ts_chunk = np.asarray(info.timestamps[start_idx:stop_idx])
-                gap_after = find_gaps(ts_chunk, time_axis.gain, gap_tol)
-                # Run boundaries within the chunk: [0, gap1+1, gap2+1, ..., len].
-                bounds = [0, *(gap_after + 1).tolist(), ts_chunk.shape[0]]
+                # A start at 0 is a gap on the chunk boundary: a new segment, no split.
+                starts = (slicer.segment_starts(strm_name, start_idx, stop_idx) - start_idx).tolist()
+                bounds = sorted({0, *starts, ts_chunk.shape[0]})
                 for b0, b1 in zip(bounds[:-1], bounds[1:]):
+                    if b0 in starts:
+                        strm_dict["segment"] += 1
                     out.append(
                         replace(
                             template,
@@ -175,6 +194,7 @@ def _build_chunk_messages_static(
                                 "time": replace(time_axis, offset=ts_off + ts_chunk[b0]),
                             },
                             key=strm_name,
+                            segment=strm_dict["segment"],
                         )
                     )
             elif not hasattr(time_axis, "gain") and info.timestamps is not None:
@@ -193,6 +213,7 @@ def _build_chunk_messages_static(
                             ),
                         },
                         key=strm_name,
+                        segment=strm_dict["segment"],
                     )
                 )
             else:
@@ -217,6 +238,7 @@ def _build_chunk_messages_static(
                             ),
                         },
                         key=strm_name,
+                        segment=strm_dict["segment"],
                     )
                 )
     return out
@@ -228,7 +250,6 @@ def _prefetch_worker(
     n_chunks: int,
     q: queue.Queue,
     stop: threading.Event,
-    gap_tol: float = DEFAULT_GAP_TOL,
 ) -> None:
     """Prefetch worker target. Top-level function (no closure over the
     iterator) so the iterator can be garbage-collected as soon as the user
@@ -239,7 +260,7 @@ def _prefetch_worker(
         for chunk_ix in range(n_chunks):
             if stop.is_set():
                 return
-            msgs = _build_chunk_messages_static(slicer, streams, chunk_ix, gap_tol)
+            msgs = _build_chunk_messages_static(slicer, streams, chunk_ix)
             # Block on a full queue, but wake periodically to honour stop.
             while not stop.is_set():
                 try:
@@ -298,6 +319,10 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
         # Tear down any existing prefetch worker before mutating state.
         self._stop_prefetch()
 
+        # Reopening restarts every stream, which is a break in each: carry the
+        # counters over so the next message does not repeat the last segment.
+        self._next_segment = {k: d["segment"] + 1 for k, d in (self._state.streams or {}).items()}
+
         self._state.n_chunks = 0
         self._state.chunk_ix = 0
         self._state.streams = {}
@@ -327,6 +352,7 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
             real_gap_threshold=self.settings.real_gap_threshold,
             structured_ch_axis=self.settings.structured_ch_axis,
             storage_options=self.settings.storage_options,
+            gap_tolerance=self.settings.gap_tolerance,
         )
         self._state.slicer = slicer
 
@@ -394,13 +420,14 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
             self._state.streams[name] = {
                 "info": info,
                 "chunk_offsets": chunk_ix_offsets,
+                "segment": self._next_segment.get(name, 0),
             }
 
         self._state.n_chunks = n_chunks
 
     def _build_chunk_messages(self, chunk_ix: int) -> list[AxisArray]:
         """Sync-side wrapper around :func:`_build_chunk_messages_static`."""
-        return _build_chunk_messages_static(self._state.slicer, self._state.streams, chunk_ix, self.settings.gap_tol)
+        return _build_chunk_messages_static(self._state.slicer, self._state.streams, chunk_ix)
 
     def _chunk_step(self):
         """Sync path: build the next chunk and append to the deque."""
@@ -430,7 +457,6 @@ class NWBAxisArrayIterator(BaseStatefulProducer[NWBIteratorSettings, AxisArray, 
                 self._state.n_chunks,
                 self._state.prefetch_queue,
                 self._state.prefetch_stop,
-                self.settings.gap_tol,
             ),
             name="NWBIterator-prefetch",
             daemon=True,

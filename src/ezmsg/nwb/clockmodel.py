@@ -71,10 +71,10 @@ tens of times the 99.9th percentile), and a small persistent clock-sync *step*
 is not a data gap -- it should be smoothed, not preserved. Only a jump well
 beyond that tail is treated as genuine data loss. Tune via ``real_gap_threshold``
 when you know a file's real gap sizes."""
-GAP_MIN_S = 0.005
-"""Floor for the auto threshold's margin above one sample period (s), so a
-near-perfect stream doesn't get a threshold so tight that sub-sample noise reads
-as a gap."""
+GAP_MIN_S = 0.010
+"""Default gap tolerance (s): the smallest margin above one sample period that an
+interval must exceed to count as a gap. Keeps a near-perfect stream from getting a
+threshold so tight that sub-sample noise reads as a gap."""
 GAP_VERIFY_WIN = 16
 """Half-window (samples) for the net-displacement check that separates a real
 gap (a sustained level shift) from a lone jitter spike (self-cancelling)."""
@@ -219,20 +219,33 @@ def _nominal_period(times: np.ndarray) -> float:
     return interval_median(np.diff(times))
 
 
-def _auto_gap_threshold(times: np.ndarray) -> float:
+def gap_threshold(period: float, tolerance: float = GAP_MIN_S) -> float:
+    """Gap threshold (an absolute inter-sample interval, s) from the nominal period alone.
+
+    ``period + max(tolerance, period)``: never below two periods, because a hole
+    shorter than one missing sample is not a gap at any rate. This is the part of
+    the rule that needs no statistics, so it can be applied chunk by chunk.
+    """
+    return period + max(tolerance, period)
+
+
+def _auto_gap_threshold(times: np.ndarray, period: float | None = None, tolerance: float = GAP_MIN_S) -> float:
     """Per-stream real-gap threshold (an absolute inter-sample interval, s).
+
+    :func:`gap_threshold`, widened to clear the stream's own jitter. ``period`` is
+    the nominal sample period when known; ``None`` takes the median interval.
 
     Built from the interval statistics, not a smooth-fit residual: a real gap is
     a rare outlier, so a high percentile of the interval deviation tracks the
     jitter envelope while excluding the gaps themselves, whereas a fit residual
     smears each gap across a bin and would push the threshold above the very gap
     it should catch. Threshold =
-    ``median_interval + max(GAP_MIN_S, GAP_ENVELOPE_MULT * envelope)``.
+    ``period + max(tolerance, period, GAP_ENVELOPE_MULT * envelope)``.
     """
     dt = np.diff(np.asarray(times, dtype=float))
     if dt.size == 0:
         return np.inf
-    period = interval_median(dt)
+    period = interval_median(dt) if period is None else period
     # The percentile stays on the full array. It is the one statistic here that a
     # subsample genuinely moves: the 99.9th percentile of 200k values rests on
     # their top 200 rather than on 7000, which shifted this threshold by 1.4% on
@@ -240,7 +253,7 @@ def _auto_gap_threshold(times: np.ndarray) -> float:
     # shift there re-segments the stream and re-times its samples -- a behaviour
     # change, not a speedup.
     envelope = float(np.percentile(np.abs(dt - period), GAP_ENVELOPE_PCT))
-    return period + max(GAP_MIN_S, GAP_ENVELOPE_MULT * envelope)
+    return period + max(tolerance, period, GAP_ENVELOPE_MULT * envelope)
 
 
 def find_real_gaps(
@@ -341,6 +354,7 @@ def reconstruct_self(
     n_knots: int = DEFAULT_DEJITTER_KNOTS,
     method: str = DEFAULT_DEJITTER_METHOD,
     gap_threshold_s: float | None = None,
+    gaps: np.ndarray | None = None,
 ) -> np.ndarray:
     """Dejitter a stream from its own timestamps: fit ``index -> dataset_time``.
 
@@ -350,13 +364,16 @@ def reconstruct_self(
     timestamps (see :func:`find_real_gaps`; ``gap_threshold_s`` is the jump
     threshold in seconds, or ``None`` to auto-derive per stream), and each
     segment is fit independently so the true jump between segments survives.
+    ``gaps`` supplies the gap left edges instead, when they were found on a more
+    reliable timebase (see :func:`detect_group_gaps`).
     Used when a stream has no clean sibling to borrow a clock model from.
     """
     ds = np.asarray(dataset_times, dtype=float)
     n = ds.shape[0]
     idx = np.arange(n, dtype=float)
     base = _smooth_eval(idx, ds, n_knots, method)
-    gaps = _detect_gaps(ds, gap_threshold_s)
+    if gaps is None:
+        gaps = _detect_gaps(ds, gap_threshold_s)
     if gaps.size == 0:
         return base
     out = base.copy()
@@ -377,6 +394,7 @@ def reconstruct_shared(
     n_knots: int = DEFAULT_DEJITTER_KNOTS,
     method: str = DEFAULT_DEJITTER_METHOD,
     gap_threshold_s: float | None = None,
+    gaps: np.ndarray | None = None,
 ) -> np.ndarray:
     """Reconstruct a target stream's dataset timestamps via a shared clock.
 
@@ -408,7 +426,8 @@ def reconstruct_shared(
             r = r + float(np.median(tgt_seg - r))
         return r
 
-    gaps = _detect_gaps(dev, gap_threshold_s)
+    if gaps is None:
+        gaps = _detect_gaps(dev, gap_threshold_s)
     if gaps.size == 0:
         return through_c(dev_base, tgt)
     out = np.empty(n, dtype=float)
@@ -422,11 +441,35 @@ def reconstruct_shared(
     return _enforce_join_monotonicity(out, segs, _nominal_period(dev), dev)
 
 
-def _detect_gaps(times: np.ndarray, gap_threshold_s: float | None) -> np.ndarray:
+def _detect_gaps(
+    times: np.ndarray,
+    gap_threshold_s: float | None,
+    period: float | None = None,
+    tolerance: float = GAP_MIN_S,
+) -> np.ndarray:
     """Real-gap left edges in ``times``, thresholded against its own jitter."""
-    period = _nominal_period(times)
-    threshold = gap_threshold_s if gap_threshold_s is not None else _auto_gap_threshold(times)
+    if period is None:
+        period = _nominal_period(times)
+    threshold = gap_threshold_s if gap_threshold_s is not None else _auto_gap_threshold(times, period, tolerance)
     return find_real_gaps(times, period, threshold)
+
+
+def detect_group_gaps(
+    members: list[dict],
+    gap_threshold_s: float | None = None,
+    gap_tolerance: float = GAP_MIN_S,
+) -> dict[str, np.ndarray]:
+    """Real-gap left edges for each member, found on its most reliable timebase.
+
+    That is the device time when the member has one: the dataset timestamps were
+    corrected to a common clock online, and that correction can step. A member may
+    carry its nominal sample ``period``; without one the median interval is used.
+    """
+    out = {}
+    for m in members:
+        times = m["dataset"] if m.get("device") is None else m["device"]
+        out[m["key"]] = _detect_gaps(np.asarray(times, dtype=float), gap_threshold_s, m.get("period"), gap_tolerance)
+    return out
 
 
 def _self_fit_resid_std(dataset_times: np.ndarray, n_knots: int, method: str) -> float:
@@ -440,6 +483,7 @@ def reconstruct_group(
     n_knots: int = DEFAULT_DEJITTER_KNOTS,
     method: str = DEFAULT_DEJITTER_METHOD,
     gap_threshold_s: float | None = None,
+    gaps: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     """Reconstruct every member of a shared-clock group.
 
@@ -451,8 +495,9 @@ def reconstruct_group(
     :data:`SHARED_MODEL_JITTER_RATIO` times the clean source and
     :data:`SHARED_MODEL_JITTER_FLOOR_PERIODS` sample periods; otherwise it is
     self-fit, which never imposes a sibling's clock. A single-member group falls
-    back to a self-fit. Genuine data gaps are preserved per member
-    (``gap_threshold_s`` forwarded; ``None`` = auto), and segment joins are kept
+    back to a self-fit. Genuine data gaps are preserved per member (``gaps``, from
+    :func:`detect_group_gaps`; found here with ``gap_threshold_s`` when not given,
+    ``None`` = auto), and segment joins are kept
     monotone (:func:`_enforce_join_monotonicity`). Returns
     ``{key: reconstructed_dataset_times}``.
 
@@ -461,14 +506,16 @@ def reconstruct_group(
     """
     if not members:
         return {}
+    if gaps is None:
+        gaps = detect_group_gaps(members, gap_threshold_s)
     if len(members) == 1:
         m = members[0]
-        return {m["key"]: reconstruct_self(m["dataset"], n_knots, method, gap_threshold_s)}
+        return {m["key"]: reconstruct_self(m["dataset"], n_knots, method, gaps=gaps[m["key"]])}
 
     resids = {m["key"]: _self_fit_resid_std(np.asarray(m["dataset"], dtype=float), n_knots, method) for m in members}
     clean_key = min(resids, key=resids.get)
     clean = next(m for m in members if m["key"] == clean_key)
-    clean_recon = reconstruct_self(clean["dataset"], n_knots, method, gap_threshold_s)
+    clean_recon = reconstruct_self(clean["dataset"], n_knots, method, gaps=gaps[clean_key])
     clean_resid = resids[clean_key]
 
     out: dict[str, np.ndarray] = {clean_key: clean_recon}
@@ -495,10 +542,10 @@ def reconstruct_group(
                 target_dataset=m["dataset"],
                 n_knots=n_knots,
                 method=method,
-                gap_threshold_s=gap_threshold_s,
+                gaps=gaps[m["key"]],
             )
         else:
-            out[m["key"]] = reconstruct_self(m["dataset"], n_knots, method, gap_threshold_s)
+            out[m["key"]] = reconstruct_self(m["dataset"], n_knots, method, gaps=gaps[m["key"]])
     return out
 
 

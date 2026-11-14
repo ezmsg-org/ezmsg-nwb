@@ -21,8 +21,13 @@ from ezmsg.util.messages.util import replace
 from .clockmodel import (
     DEFAULT_DEJITTER_KNOTS,
     DEFAULT_DEJITTER_METHOD,
+    GAP_MIN_S,
+    GAP_VERIFY_WIN,
     cache_lookup,
     cache_store,
+    detect_group_gaps,
+    find_real_gaps,
+    gap_threshold,
     group_clocks,
     reconstruct_group,
 )
@@ -126,6 +131,15 @@ class StreamInfo:
 
     is_event: bool = False
     """Whether this stream is an interval table (events) vs timeseries."""
+
+    gap_times: typing.Any = None
+    """Per-sample timestamps to look for gaps in, when they are more reliable than
+    ``timestamps``: the paired ``*_device_ts`` series' own timestamps."""
+
+    gaps: typing.Optional[np.ndarray] = None
+    """Left-edge sample indices of this stream's gaps, when the dejitter pass has
+    already found them all. None means look chunk by chunk
+    (see :meth:`NWBSlicer.segment_starts`)."""
 
     table_ref: typing.Any = None
     """Reference to the interval table (events only)."""
@@ -280,7 +294,10 @@ class NWBSlicer:
             explicit threshold in seconds. Real gaps are preserved (each inter-gap
             segment is reconstructed independently) so the iterator still splits a
             chunk there. Pass ``float("inf")`` to disable the guard and smooth
-            everything. Ignored when ``dejitter`` is False.
+            everything. Also overrides the threshold :meth:`segment_starts` uses.
+        gap_tolerance: The smallest margin, in seconds, above one sample period
+            that an interval must exceed to count as a gap. See
+            :meth:`segment_starts` for the whole rule.
         structured_ch_axis: Build the ``ch`` axis as a structured
             :data:`~ezmsg.nwb.electrodes.CHANNEL_DTYPE` array -- position,
             label, bank, headstage, array identity -- from the electrodes table,
@@ -319,6 +336,7 @@ class NWBSlicer:
         real_gap_threshold: typing.Optional[float] = None,
         structured_ch_axis: bool = False,
         storage_options: typing.Optional[dict] = None,
+        gap_tolerance: float = GAP_MIN_S,
     ):
         self._filepath = filepath
         self._storage_options = storage_options
@@ -331,6 +349,7 @@ class NWBSlicer:
         self._clock_groups = clock_groups
         self._dejitter_cache = dejitter_cache
         self._real_gap_threshold = real_gap_threshold
+        self._gap_tolerance = gap_tolerance
         self._structured_ch_axis = structured_ch_axis
 
         self._io: typing.Any = None  # NWBHDF5IO, or NWBZarrIO for a Zarr store
@@ -437,9 +456,26 @@ class NWBSlicer:
         # reconstruction (see ``_apply_dejitter``), so they never surface as
         # iterable streams -- the filter behaves as requested while dejitter
         # still fires. Without a filter (None) every stream is already present.
-        match_keys = self._stream_keys
+        # Keyed by the partner's own name and giving the key it is stored under,
+        # which follows the requested stream's: a stream asked for by its short
+        # name (``HUB1`` for ``CereLink_HUB1``) has a partner that cannot be
+        # matched by name, having no electrode group to take a manufacturer from.
+        partner_keys: dict[str, str] = {}
         if self._dejitter and self._stream_keys is not None:
-            match_keys = list(self._stream_keys) + [f"{k}_device_ts" for k in self._stream_keys]
+            for _, ts in all_timeseries:
+                if isinstance(ts, pynwb.TimeSeries):
+                    key = _match_stream_key(ts, self._stream_keys)
+                    if key is not None:
+                        partner_keys[f"{ts.name}_device_ts"] = f"{key}_device_ts"
+
+        # Gaps are looked for on device time wherever a stream has it, dejittered or
+        # not, so find each partner's timestamps here rather than through discovery
+        # (which would read them in full to infer a rate they do not carry).
+        device_ts = {
+            ts.name: ts.timestamps
+            for _, ts in all_timeseries
+            if isinstance(ts, pynwb.TimeSeries) and ts.name.endswith("_device_ts") and ts.timestamps is not None
+        }
 
         for address, child in all_timeseries:
             if type(child) is pynwb.misc.Units:
@@ -447,7 +483,7 @@ class NWBSlicer:
                 continue
             if not isinstance(child, pynwb.TimeSeries):
                 continue
-            matched_key = _match_stream_key(child, match_keys)
+            matched_key = _match_stream_key(child, self._stream_keys) or partner_keys.get(child.name)
             if matched_key is None:
                 continue
             if child.data.size == 0:
@@ -615,6 +651,9 @@ class NWBSlicer:
                 table_ref=None,
                 scaling=scaling,
             )
+            partner_ts = device_ts.get(f"{child.name}_device_ts")
+            if has_timestamps and partner_ts is not None and partner_ts.shape[0] == child.data.shape[0]:
+                self._streams[matched_key].gap_times = partner_ts
 
         self._start_time = start_time
         self._stop_time = stop_time
@@ -730,14 +769,18 @@ class NWBSlicer:
         if not pairs:
             return
 
-        params = (DEFAULT_DEJITTER_METHOD, DEFAULT_DEJITTER_KNOTS, self._real_gap_threshold)
+        params = (DEFAULT_DEJITTER_METHOD, DEFAULT_DEJITTER_KNOTS, self._real_gap_threshold, self._gap_tolerance)
         signature = self._file_signature()
 
         for group in self._resolve_groups(pairs):
             cached = {ck: (cache_lookup(signature, ck, params) if self._dejitter_cache else None) for ck in group}
-            if all(v is not None for v in cached.values()):
+            cached_gaps = {
+                ck: (cache_lookup(signature, f"{ck}#gaps", params) if self._dejitter_cache else None) for ck in group
+            }
+            if all(v is not None for v in (*cached.values(), *cached_gaps.values())):
                 for ck, arr in cached.items():
                     self._replace_timestamps(ck, arr)
+                    self._streams[ck].gaps = cached_gaps[ck]
                 continue
 
             # Cache miss somewhere in the group: materialize the whole group's
@@ -750,15 +793,17 @@ class NWBSlicer:
                         "key": ck,
                         "dataset": np.asarray(self._streams[ck].timestamps[:], dtype=float),
                         "device": np.asarray(self._streams[dk].timestamps[:], dtype=float),
+                        "period": 1.0 / float(self._streams[ck].fs) if self._streams[ck].fs else None,
                     }
                 )
-            recon = reconstruct_group(
-                members, DEFAULT_DEJITTER_KNOTS, DEFAULT_DEJITTER_METHOD, self._real_gap_threshold
-            )
+            gaps = detect_group_gaps(members, self._real_gap_threshold, self._gap_tolerance)
+            recon = reconstruct_group(members, DEFAULT_DEJITTER_KNOTS, DEFAULT_DEJITTER_METHOD, gaps=gaps)
             for ck, arr in recon.items():
                 self._replace_timestamps(ck, arr)
+                self._streams[ck].gaps = gaps[ck]
                 if self._dejitter_cache:
                     cache_store(signature, ck, params, arr)
+                    cache_store(signature, f"{ck}#gaps", params, gaps[ck])
 
         self._prune_hidden_device_streams()
         self._recompute_time_bounds()
@@ -846,6 +891,66 @@ class NWBSlicer:
     def get_stream_info(self, key: str) -> StreamInfo:
         """Return the StreamInfo for a given stream key."""
         return self._streams[key]
+
+    # --- Gaps ---
+
+    def segment_starts(self, stream_key: str, start_idx: int, stop_idx: int) -> np.ndarray:
+        """Indices in ``[start_idx, stop_idx)`` of samples that begin a new segment.
+
+        A sample begins a segment when a gap separates it from the one before: the
+        interval between them exceeds one sample period by more than the larger of
+        ``gap_tolerance`` and one period (or exceeds ``real_gap_threshold`` when
+        that is set), and the samples after it sit later than those before it by
+        at least half that threshold, which a lone late timestamp does not. See
+        :func:`~ezmsg.nwb.clockmodel.find_real_gaps`.
+
+        Intervals are read from the stream's ``*_device_ts`` partner when it has
+        one, otherwise from its own timestamps, a chunk at a time. A dejittered
+        stream's gaps were all found during that pass, with the threshold also
+        widened to clear the stream's jitter. Rate-only streams, events and
+        streams with no nominal rate have no gaps.
+        """
+        info = self._streams[stream_key]
+        none = np.empty(0, dtype=int)
+        if info.gaps is not None:
+            starts = info.gaps + 1
+        else:
+            times = info.gap_times if info.gap_times is not None else info.timestamps
+            if times is None or info.is_event or not info.fs or stop_idx <= start_idx:
+                return none
+            period = 1.0 / float(info.fs)
+            threshold = self._real_gap_threshold
+            if threshold is None:
+                threshold = gap_threshold(period, self._gap_tolerance)
+            # Enough either side for the sustained-shift check, and the sample before
+            # ``start_idx`` so a gap on the chunk boundary is seen.
+            lo = max(0, start_idx - 1 - GAP_VERIFY_WIN)
+            hi = min(info.n_samples, stop_idx + GAP_VERIFY_WIN)
+            starts = find_real_gaps(np.asarray(times[lo:hi], dtype=float), period, threshold) + lo + 1
+        return starts[(starts >= start_idx) & (starts < stop_idx)]
+
+    def index_at(self, stream_key: str, t: float) -> int:
+        """Index of the first sample of a timestamped stream at or after file-relative time ``t``."""
+        ts = self._streams[stream_key].timestamps
+        # ponytail: reads every timestamp when they are still on disk. Only used on a
+        # seek; bisect on disk instead if seeking a remote file gets slow.
+        return int(np.searchsorted(ts if isinstance(ts, np.ndarray) else ts[:], t, side="left"))
+
+    def stop_index(self, stream_key: str, start_idx: int, t_end: float) -> int:
+        """Index of the first sample at or after ``start_idx`` whose timestamp is not before ``t_end``."""
+        info = self._streams[stream_key]
+        ts = info.timestamps
+        if isinstance(ts, np.ndarray):
+            return max(start_idx, int(np.searchsorted(ts, t_end, side="left")))
+        # On disk: read forward only as far as needed, about a second at a time.
+        step = max(int(info.fs), 1024)
+        while start_idx < info.n_samples:
+            block = np.asarray(ts[start_idx : start_idx + step])
+            k = int(np.searchsorted(block, t_end, side="left"))
+            if k < block.shape[0]:
+                return start_idx + k
+            start_idx += block.shape[0]
+        return info.n_samples
 
     # --- Slicing methods ---
 
