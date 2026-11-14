@@ -80,8 +80,9 @@ def test_iterator_collapses_fragments(dejitter_nwb_path):
 
     off = drain(False)
     on = drain(True)
-    # Dejitter removes the intra-chunk gap splits: far fewer messages.
-    assert len(on) < len(off)
+    # Jitter is not a gap either way: the stream is no longer split on it even
+    # with dejitter off, where gaps are looked for on device time.
+    assert len(on) == len(off)
     # No samples lost either way.
     assert sum(m.data.shape[0] for m in on) == sum(m.data.shape[0] for m in off)
 

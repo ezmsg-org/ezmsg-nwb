@@ -604,9 +604,9 @@ def test_prefetch_runs_in_worker_thread(test_nwb_path, monkeypatch):
     seen_tids: list[int] = []
     real = iterator_mod._build_chunk_messages_static
 
-    def spy(slicer, streams, chunk_ix, gap_tol=0.5):
+    def spy(slicer, streams, chunk_ix):
         seen_tids.append(threading.get_ident())
-        return real(slicer, streams, chunk_ix, gap_tol)
+        return real(slicer, streams, chunk_ix)
 
     monkeypatch.setattr(iterator_mod, "_build_chunk_messages_static", spy)
 
@@ -931,9 +931,9 @@ def test_gappy_total_samples_and_order_preserved(gappy_nwb_path):
     np.testing.assert_array_equal(data[:, 0], np.arange(n, dtype=np.float32))
 
 
-def test_gap_tol_disables_split(gappy_nwb_path):
-    """A large ``gap_tol`` widens the gap threshold enough that the stream is
-    emitted as a single (gap-spanning) chunk again — the knob works.
+def test_infinite_gap_threshold_disables_split(gappy_nwb_path):
+    """An infinite ``real_gap_threshold`` turns gap handling off: the stream is
+    emitted as a single (gap-spanning) chunk again.
     """
     it = NWBAxisArrayIterator(
         NWBIteratorSettings(
@@ -941,7 +941,7 @@ def test_gap_tol_disables_split(gappy_nwb_path):
             chunk_dur=100.0,
             reference_clock=ReferenceClockType.UNKNOWN,
             stream_keys=["Gappy"],
-            gap_tol=1e6,
+            real_gap_threshold=float("inf"),
         )
     )
     msgs = [m for m in it if m.data.shape[0] > 0]

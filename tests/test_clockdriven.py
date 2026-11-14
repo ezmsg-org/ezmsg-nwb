@@ -433,22 +433,50 @@ def test_clockdriven_window_inside_gap_emits_empty(gappy_nwb_path):
     assert p._state.file_t == pytest.approx(1.7, abs=1e-9)
 
 
-def test_clockdriven_window_spanning_gap_coordinate_axis(gappy_nwb_path):
-    """A window containing samples on both sides of the gap emits a
-    CoordinateAxis with the true timestamps, not a misleading LinearAxis."""
+def test_clockdriven_window_spanning_gap_stops_at_the_gap(gappy_nwb_path):
+    """A window containing samples on both sides of the gap emits only those
+    before it. Those after it go out on the next tick, as a new segment, on their
+    own regular LinearAxis."""
     p = _gappy_producer(gappy_nwb_path, start_offset=1.0)
-    r = p(AxisArray.LinearAxis(gain=2.0, offset=0.0))  # window [1.0, 3.0)
-    assert r is not None
-    assert r.data.shape[0] == 100
-    assert hasattr(r.axes["time"], "data")  # CoordinateAxis
-    ts = np.asarray(r.axes["time"].data)
-    assert ts[49] == pytest.approx(1.49, abs=1e-6)
-    assert ts[50] == pytest.approx(2.50, abs=1e-6)
+    tick = AxisArray.LinearAxis(gain=2.0, offset=0.0)
+    before = p(tick)  # window [1.0, 3.0): samples 100..199, gap after 149
+    after = p(tick)  # window [3.0, 5.0), plus the 50 held back
+    assert before.data.shape[0] == 50
+    assert before.axes["time"].offset == pytest.approx(1.00, abs=1e-6)
+    assert after.data.shape[0] == 150
+    assert after.axes["time"].offset == pytest.approx(2.50, abs=1e-6)
+    assert after.segment == before.segment + 1
+    np.testing.assert_array_equal(after.data[:, 0], np.arange(150, 300, dtype=np.float32))
 
 
-def test_clockdriven_gap_tol_keeps_linear_axis(gappy_nwb_path):
-    """A large gap_tol keeps a gap-spanning window on a single LinearAxis."""
-    p = _gappy_producer(gappy_nwb_path, start_offset=1.0, gap_tol=1e6)
+def test_clockdriven_gap_on_window_boundary_starts_a_segment(gappy_nwb_path):
+    """Ticks that land in the gap are empty and keep the segment; it changes on
+    the first tick that has a sample from after the gap."""
+    p = _gappy_producer(gappy_nwb_path, start_offset=1.0)
+    tick = AxisArray.LinearAxis(gain=0.5, offset=0.0)
+    out = [p(tick) for _ in range(4)]  # [1.0,1.5) [1.5,2.0) [2.0,2.5) [2.5,3.0)
+    assert [m.data.shape[0] for m in out] == [50, 0, 0, 50]
+    assert [m.segment - out[0].segment for m in out] == [0, 0, 0, 1]
+
+
+def test_clockdriven_seek_starts_a_segment(gappy_nwb_path):
+    p = _gappy_producer(gappy_nwb_path, start_offset=0.0)
+    tick = AxisArray.LinearAxis(gain=0.1, offset=0.0)
+    first = p(tick)
+    p.seek(0.0)  # back to the same place: still not a continuation
+    again = p(tick)
+    assert again.segment == first.segment + 1
+    np.testing.assert_array_equal(again.data, first.data)
+
+
+def test_clockdriven_gap_tol_is_deprecated(gappy_nwb_path):
+    with pytest.warns(DeprecationWarning, match="gap_tolerance"):
+        _gappy_producer(gappy_nwb_path, gap_tol=0.5)
+
+
+def test_clockdriven_infinite_gap_threshold_ignores_the_gap(gappy_nwb_path):
+    """An infinite real_gap_threshold keeps a gap-spanning window whole."""
+    p = _gappy_producer(gappy_nwb_path, start_offset=1.0, real_gap_threshold=float("inf"))
     r = p(AxisArray.LinearAxis(gain=2.0, offset=0.0))
     assert r is not None
     assert hasattr(r.axes["time"], "gain")  # LinearAxis despite the gap

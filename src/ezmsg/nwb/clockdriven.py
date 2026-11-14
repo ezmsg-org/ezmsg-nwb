@@ -5,14 +5,17 @@ from __future__ import annotations
 import asyncio
 import os
 import typing
+import warnings
 
 import ezmsg.core as ez
 from ezmsg.baseproc.clockdriven import BaseClockDrivenProducer, ClockDrivenSettings, ClockDrivenState
 from ezmsg.baseproc.protocols import processor_state
 from ezmsg.baseproc.units import BaseClockDrivenUnit
 from ezmsg.util.messages.axisarray import AxisArray, LinearAxis
+from ezmsg.util.messages.util import replace
 
-from .slicer import DEFAULT_GAP_TOL, NWBSlicer
+from .clockmodel import GAP_MIN_S
+from .slicer import NWBSlicer
 from .util import ReferenceClockType
 
 
@@ -32,17 +35,25 @@ class NWBClockDrivenSettings(ClockDrivenSettings):
     meaningful when ``n_time`` is ``None`` (variable chunk size); with a fixed
     ``n_time`` the rate acts as a pause/unpause gate since chunk size is fixed.
     """
-    gap_tol: float = DEFAULT_GAP_TOL
-    """Gap threshold for timestamped continuous streams, as a fraction of the
-    nominal sample period (forwarded to ``NWBSlicer.read_by_time``).
+    gap_tol: typing.Optional[float] = None
+    """.. deprecated:: Ignored. Gaps are now found with ``gap_tolerance``."""
+    gap_tolerance: float = GAP_MIN_S
+    """The smallest margin, in seconds, above one sample period that an interval
+    between samples must exceed to count as a gap. The margin is never less than
+    one period, and a lone late timestamp is not a gap; see
+    :meth:`~ezmsg.nwb.slicer.NWBSlicer.segment_starts`. Gaps are looked for in the
+    stream's ``*_device_ts`` partner when it has one.
 
     The clock cadence is never altered: ``file_t`` always advances by ``dt`` per
     tick so sibling producers on the same clock stay aligned, and windows that
-    fall inside a gap emit zero-length chunks. When a single window straddles a
-    gap (interval > ``(1 + gap_tol)`` nominal periods), that chunk's time axis
-    becomes a ``CoordinateAxis`` carrying the true per-sample timestamps rather
-    than a uniform ``LinearAxis`` that would misplace post-gap samples. Set very
-    large to keep a single LinearAxis across gaps. No effect on event streams.
+    fall inside a gap emit zero-length chunks. A window that straddles a gap emits
+    only the samples before it; those after it go out on the next tick, as the
+    start of a new :attr:`~ezmsg.util.messages.axisarray.AxisArray.segment`, so
+    that tick's chunk is longer than usual. A seek starts a new segment too.
+    No effect on rate-only or event streams, which have no gaps.
+
+    Files with heavy timestamp jitter (several ms) should keep ``dejitter`` on:
+    only that pass widens the threshold to clear the stream's own jitter.
     """
     dejitter: bool = True
     """Reconstruct smoothed monotone timestamps for streams with a paired
@@ -54,8 +65,9 @@ class NWBClockDrivenSettings(ClockDrivenSettings):
     """Cache reconstructed timestamps on disk across opens (forwarded to
     ``NWBSlicer``)."""
     real_gap_threshold: typing.Optional[float] = None
-    """Real-gap guard threshold in seconds (forwarded to ``NWBSlicer``). ``None``
-    auto-derives per stream; ``float("inf")`` disables the guard."""
+    """Explicit gap threshold in seconds, as an interval between samples (forwarded
+    to ``NWBSlicer``). ``None`` derives it from ``gap_tolerance``;
+    ``float("inf")`` turns gap handling off."""
     structured_ch_axis: bool = False
     """Build the ``ch`` axis as a structured record array from the electrodes
     table (forwarded to ``NWBSlicer``), matching what a live acquisition source
@@ -64,6 +76,10 @@ class NWBClockDrivenSettings(ClockDrivenSettings):
     schema. See :mod:`~ezmsg.nwb.electrodes`."""
     storage_options: typing.Optional[dict] = None
     """fsspec options for a remote Zarr store (e.g. ``account_name`` for ``abfs://``)."""
+
+    def __post_init__(self) -> None:
+        if self.gap_tol is not None:
+            warnings.warn("gap_tol is ignored; use gap_tolerance (seconds).", DeprecationWarning, stacklevel=3)
 
 
 @processor_state
@@ -77,6 +93,12 @@ class NWBClockDrivenState(ClockDrivenState):
     n_total_samples: int = 0
     t0: float = 0.0  # Stream start time (file-relative, before ts_off)
     file_t: float = 0.0  # Current playback position (file-relative, from stream t0)
+    ts_idx: int | None = None
+    """Timestamped streams: index of the next sample to emit. None after a seek,
+    when it has to be looked up from ``file_t``."""
+    segment: int = -1
+    """Counter for the output ``segment``. Never rewound, so a seek or a reopened
+    file cannot repeat the previous number."""
 
 
 class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWBClockDrivenState]):
@@ -162,6 +184,7 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
             real_gap_threshold=self.settings.real_gap_threshold,
             structured_ch_axis=self.settings.structured_ch_axis,
             storage_options=self.settings.storage_options,
+            gap_tolerance=self.settings.gap_tolerance,
         )
         self._state.slicer = slicer
 
@@ -202,6 +225,9 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
         else:
             self._state.sample_idx = 0
         self._state.file_t = self._state.t0 + start_offset
+        # What comes next does not continue what came before.
+        self._state.ts_idx = None
+        self._state.segment += 1
 
     def _get_fs(self) -> float:
         """Return the effective sample rate (user-specified or auto-detected)."""
@@ -217,9 +243,10 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
         if self.settings.playback_rate == 0.0:
             return None
         if self._state.is_event or self._state.has_timestamps:
-            return self._process_time_window(clock_tick)
+            output = self._process_time_window(clock_tick)
         else:
-            return self._process_rate_only(clock_tick)
+            output = self._process_rate_only(clock_tick)
+        return None if output is None else replace(output, segment=self._state.segment)
 
     def _process_rate_only(self, clock_tick: LinearAxis) -> AxisArray | None:
         """Rate-only continuous: replicate base class counter logic with auto-detected fs."""
@@ -283,11 +310,27 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
         else:
             dt = clock_tick.gain * self.settings.playback_rate
 
+        key = self.settings.stream_key
         t_start = self._state.file_t
         t_end = t_start + dt
-        output = slicer.read_by_time(self.settings.stream_key, t_start, t_end, gap_tol=self.settings.gap_tol)
         self._state.file_t = t_end
-        return output
+        if self._state.is_event or self._get_fs() == 0.0:
+            return slicer.read_by_time(key, t_start, t_end, gap_tol=float("inf"))
+
+        # Continue from where the last tick stopped, which is short of its window's
+        # end when it stopped at a gap.
+        start = self._state.ts_idx
+        if start is None:
+            start = slicer.index_at(key, t_start)
+        stop = slicer.stop_index(key, start, t_end)
+        starts = slicer.segment_starts(key, start, stop)
+        if starts.size and starts[0] == start:
+            self._state.segment += 1
+            starts = starts[1:]
+        if starts.size:
+            stop = int(starts[0])
+        self._state.ts_idx = stop
+        return slicer.read_by_index(key, start, stop)
 
     def _produce(self, n_samples: int, time_axis: LinearAxis) -> AxisArray:
         # Required by ABC but we override _process directly
