@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pynwb
 import pytest
-from ezmsg.util.messages.axisarray import AxisArray
+from ezmsg.util.messages.axisarray import AxisArray, replace
 from pynwb import NWBHDF5IO
 
 from ezmsg.nwb import NWBSinkConsumer, NWBSinkSettings, ReferenceClockType
@@ -315,6 +315,23 @@ def test_multiple_streams_coexist():
         assert "Beta" in nwbfile.acquisition
         assert len(nwbfile.acquisition["Alpha"].data) == 30
         assert len(nwbfile.acquisition["Beta"].data) == 30
+
+    path.unlink(missing_ok=True)
+
+
+def test_segment_change_does_not_reopen_file():
+    """A new segment is a gap in the data, not a new file: both chunks land in the one file."""
+    path = _fresh_path("segment_change")
+    sink = _sink(path)
+
+    sink(replace(_make_continuous(n=30, ch=2), segment=0))
+    io_before = sink._state.io
+    sink(replace(_make_continuous(n=20, ch=2, offset=1.0), segment=1))
+    assert sink._state.io is io_before
+    sink.close(write=True)
+
+    with pynwb.NWBHDF5IO(str(path), "r") as io:
+        assert len(io.read().acquisition["TestStream"].data) == 50
 
     path.unlink(missing_ok=True)
 
