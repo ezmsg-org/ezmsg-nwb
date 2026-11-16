@@ -431,10 +431,10 @@ def test_ragged_stream_lengths_do_not_crash(test_nwb_path):
 
     keys = [m.key for m in it]  # full iteration must not raise
 
-    # The full-length stream still produces messages for every chunk...
-    assert keys.count("BinnedSpikes") == it._state.n_chunks
+    # The full-length stream still produces messages for every chunk, then its end-of-stream marker...
+    assert keys.count("BinnedSpikes") == it._state.n_chunks + 1
     # ...while the truncated stream contributes one fewer.
-    assert keys.count("RawAnalog") == it._state.n_chunks - 1
+    assert keys.count("RawAnalog") == it._state.n_chunks
 
 
 def test_late_starting_stream_stays_aligned(tmp_path):

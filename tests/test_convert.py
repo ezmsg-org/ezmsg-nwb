@@ -88,6 +88,22 @@ def test_overrides_correct_the_file_then_target_converts(scaled_nwb_path):
     assert out.attrs["unit"] == "microvolts"
 
 
+def test_output_config_id_announces_what_was_done(scaled_nwb_path):
+    """Scaling changes what the values mean, so downstream must see a new id: one per
+    setting, stable across messages, and the input's own id when nothing was done."""
+    raw = read(scaled_nwb_path)
+    assert raw.config_id
+    tx = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="volts"))
+    volts = [tx(raw).config_id for _ in range(3)]
+    micro = NWBScalingTransformer(settings=NWBScalingSettings(target_unit="microvolts"))(raw).config_id
+    assert len(set(volts)) == 1 and volts[0] not in (0, raw.config_id, micro)
+    assert micro != raw.config_id
+    at_reader = scaled(scaled_nwb_path)
+    assert NWBScalingTransformer(settings=NWBScalingSettings())(at_reader).config_id == at_reader.config_id
+    undeclared = message(np.ones((4, 2), dtype=np.int16), StreamScaling(0.5, 0.0, "volts", False, True))
+    assert NWBScalingTransformer(settings=NWBScalingSettings())(undeclared).config_id == 0
+
+
 # --- Idempotence -------------------------------------------------------------
 
 

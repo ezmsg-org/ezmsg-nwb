@@ -8,6 +8,7 @@ import typing
 import warnings
 
 import ezmsg.core as ez
+from ezmsg.baseproc import end_of_stream
 from ezmsg.baseproc.clockdriven import BaseClockDrivenProducer, ClockDrivenSettings, ClockDrivenState
 from ezmsg.baseproc.protocols import processor_state
 from ezmsg.baseproc.units import BaseClockDrivenUnit
@@ -97,8 +98,10 @@ class NWBClockDrivenState(ClockDrivenState):
     """Timestamped streams: index of the next sample to emit. None after a seek,
     when it has to be looked up from ``file_t``."""
     segment: int = -1
-    """Counter for the output ``segment``. Never rewound, so a seek or a reopened
-    file cannot repeat the previous number."""
+    """Counter for the output ``segment``; the seek on opening the file makes it 0. Never rewound,
+    so a seek or a reopened file cannot repeat the previous number."""
+    last: AxisArray | None = None
+    """The last message with samples, until the end-of-stream marker that follows it is sent."""
 
 
 class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWBClockDrivenState]):
@@ -135,7 +138,7 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
             return False  # Not yet initialized / idle — not exhausted
         if self._state.is_event or self._state.has_timestamps:
             return False  # Time-window streams don't track exhaustion via index
-        return self._state.sample_idx >= self._state.n_total_samples
+        return self._state.sample_idx >= self._state.n_total_samples and self._state.last is None
 
     async def _areset_state(self, time_axis: LinearAxis) -> None:
         """Offload the slow ``NWBSlicer`` open onto a worker thread so that
@@ -228,6 +231,7 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
         # What comes next does not continue what came before.
         self._state.ts_idx = None
         self._state.segment += 1
+        self._state.last = None
 
     def _get_fs(self) -> float:
         """Return the effective sample rate (user-specified or auto-detected)."""
@@ -246,7 +250,25 @@ class NWBClockDrivenProducer(BaseClockDrivenProducer[NWBClockDrivenSettings, NWB
             output = self._process_time_window(clock_tick)
         else:
             output = self._process_rate_only(clock_tick)
+        if output is not None and output.data.size:
+            self._state.last = replace(output, segment=self._state.segment)
+            return self._state.last
+        if self._state.last is not None and self._at_end():
+            # Once, on the first empty tick after the stream's last sample. A gap emits no marker: the
+            # data after it is the next segment. Empty outputs after it carry its segment.
+            output, self._state.last = end_of_stream(self._state.last), None
+            self._state.segment = output.segment
+            return output
         return None if output is None else replace(output, segment=self._state.segment)
+
+    def _at_end(self) -> bool:
+        """Whether every sample of the stream has been read."""
+        state = self._state
+        if not (state.is_event or state.has_timestamps):
+            return state.sample_idx >= state.n_total_samples
+        if state.is_event or self._get_fs() == 0.0:
+            return state.file_t > state.slicer.get_stream_info(self.settings.stream_key).timestamps[-1]
+        return state.ts_idx is not None and state.ts_idx >= state.n_total_samples
 
     def _process_rate_only(self, clock_tick: LinearAxis) -> AxisArray | None:
         """Rate-only continuous: replicate base class counter logic with auto-detected fs."""

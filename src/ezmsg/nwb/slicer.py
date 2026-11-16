@@ -15,7 +15,7 @@ import h5py
 import numpy as np
 import pynwb
 import remfile
-from ezmsg.util.messages.axisarray import AxisArray
+from ezmsg.util.messages.axisarray import AxisArray, chain_config_id, compute_config_id
 from ezmsg.util.messages.util import replace
 
 from .clockmodel import (
@@ -32,7 +32,7 @@ from .clockmodel import (
     reconstruct_group,
 )
 from .electrodes import build_channel_axis
-from .scaling import StreamScaling, describe_stream_scaling
+from .scaling import StreamScaling, describe_stream_scaling, scaling_fingerprint
 from .util import ReferenceClockType, as_text, as_text_array, interval_median, is_zarr_array
 
 # Default gap threshold as a fraction of the nominal sample period (1.5x period).
@@ -659,6 +659,13 @@ class NWBSlicer:
         self._stop_time = stop_time
 
         self._apply_dejitter()
+
+        # Every message is a `replace` of its stream's template, so this one id per stream covers them all.
+        # The scaling is in attrs, which compute_config_id ignores, but it is what the values mean.
+        for info in self._streams.values():
+            config_id = compute_config_id(info.template)
+            scaling = scaling_fingerprint(info.template.attrs)
+            info.template.config_id = config_id if scaling is None else chain_config_id(config_id, scaling)
 
     # --- Dejitter / clock reconstruction ---
 

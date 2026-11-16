@@ -34,7 +34,7 @@ from dataclasses import dataclass
 import ezmsg.core as ez
 import numpy as np
 from ezmsg.baseproc import BaseStatefulTransformer, BaseTransformerUnit, processor_state
-from ezmsg.util.messages.axisarray import AxisArray
+from ezmsg.util.messages.axisarray import AxisArray, chain_config_id
 from ezmsg.util.messages.util import replace
 
 from .scaling import (
@@ -104,10 +104,8 @@ class _Plan:
     without changing the scaling still hits, and a stream whose scaling genuinely
     changes mid-run rebuilds. None when the message reported no scaling.
 
-    ``attrs_ref`` is the attrs dict itself, kept only to pin it alive. The cheap
-    per-message check in :meth:`NWBScalingTransformer._hash_message` is keyed on
-    its ``id()``, and an object we hold cannot be freed and have its address
-    reused by a different dict -- which is the trap in caching on ``id()``.
+    ``attrs_ref`` is the attrs dict itself, for the cheap per-message identity
+    check in :meth:`NWBScalingTransformer._process`.
     """
 
     source: typing.Any
@@ -130,6 +128,11 @@ class _Plan:
     n_ch: int = -1
     """Channel count a vector gain was built for; -1 for a scalar gain."""
     ndim: int = -1
+    parts: typing.Any = None
+    """What this stage does to a stream, chained onto the input ``config_id``."""
+    in_id: int = 0
+    out_id: int = 0
+    """``config_id`` for outputs, derived once per ``in_id``; 0 for an undeclared input."""
 
 
 @processor_state
@@ -169,23 +172,6 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
     would cost more than it saved.
     """
 
-    def _hash_message(self, message: AxisArray) -> int:
-        """Cheap and allowed to be wrong -- this runs on *every* message.
-
-        Correctness lives in :meth:`_reset_state`, which re-validates by value
-        against the fingerprint it holds; this only decides whether that check is
-        worth running. So it keys on the identity of the attrs dict, which the
-        reader builds once per stream and every message of that stream shares.
-
-        Reading the five ``nwb_scaling_*`` values here instead would be right but
-        wasteful: it costs ~160 ns against a ~2 us call, and :meth:`_reset_state`
-        pays it again on the way through. ``id()`` is safe because the plan holds
-        the dict (see :class:`_Plan`), so no other object can take its address.
-        A stage that rebuilds attrs per message merely lands in ``_reset_state``,
-        whose by-value check then hits without rebuilding the plan.
-        """
-        return hash((message.key, id(message.attrs)))
-
     def _reset_state(self, message: AxisArray) -> None:
         plans = self._state.plans
         if plans is None or self._state.settings_ref is not self.settings:
@@ -197,9 +183,6 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
         plan = plans.get(message.key)
         if plan is not None and plan.source == fingerprint:
             # Same scaling, different attrs dict -- an upstream stage rebuilt it.
-            # Re-pin to the dict ``_hash_message`` is now keyed on, or that id()
-            # would name an object nothing holds, free to be released and have
-            # its address taken by attrs carrying a *different* scaling.
             plan.attrs_ref = message.attrs
             return
         plans[message.key] = self._build_plan(message, fingerprint)
@@ -236,7 +219,13 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
         out_attrs["unit"] = final.unit
         if is_identity_scaling(gain, offset):
             # Arithmetically a no-op: record the unit, keep the stored dtype.
-            return _Plan(source=fingerprint, attrs_ref=message.attrs, out_attrs=out_attrs, identity=True)
+            return _Plan(
+                source=fingerprint,
+                attrs_ref=message.attrs,
+                out_attrs=out_attrs,
+                identity=True,
+                parts=("identity", final.unit),
+            )
 
         out_dtype = np.dtype(self.settings.conversion_dtype)
         gain_arr = np.asarray(gain, dtype=out_dtype)
@@ -254,6 +243,7 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
             dtype=out_dtype,
             n_ch=n_ch,
             ndim=message.data.ndim,
+            parts=("scaled", final.unit, gain, offset, out_dtype.str),
         )
 
     def _plan_retarget(
@@ -306,11 +296,18 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
         return gain, offset, StreamScaling(gain, offset, unit, True, scaling.voltage)
 
     def _process(self, message: AxisArray) -> AxisArray:
-        plan = self._state.plans[message.key]
+        plan = self._state.plans.get(message.key)
+        if plan is None or plan.attrs_ref is not message.attrs:
+            # Not hashed while config_id is unchanged, and config_id may leave attrs (the scaling) out.
+            self._reset_state(message)
+            plan = self._state.plans[message.key]
         if plan.passthrough:
             return message
+        if plan.in_id != message.config_id:
+            plan.in_id = message.config_id
+            plan.out_id = message.config_id and chain_config_id(message.config_id, plan.parts)
         if plan.identity:
-            return replace(message, attrs=plan.out_attrs)
+            return replace(message, attrs=plan.out_attrs, config_id=plan.out_id)
         data = message.data
         if plan.n_ch >= 0 and (data.ndim != plan.ndim or data.shape[1] != plan.n_ch):
             # Re-checked per message, not just per plan: the plan is keyed on the
@@ -320,7 +317,7 @@ class NWBScalingTransformer(BaseStatefulTransformer[NWBScalingSettings, AxisArra
         out = np.multiply(data, plan.gain, dtype=plan.dtype)
         if plan.offset is not None:
             out += plan.offset
-        return replace(message, data=out, attrs=plan.out_attrs)
+        return replace(message, data=out, attrs=plan.out_attrs, config_id=plan.out_id)
 
 
 def _check_channels(n_gain: int, shape: tuple[int, ...], stream_key: str) -> None:

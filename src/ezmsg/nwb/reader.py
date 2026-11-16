@@ -17,10 +17,13 @@ class NWBIteratorUnit(BaseProducerUnit[NWBIteratorSettings, AxisArray, NWBAxisAr
 
     @ez.publisher(OUTPUT_SIGNAL)
     async def produce(self) -> typing.AsyncGenerator:
+        segments = {}
         while True:
             out = await self.producer.__acall__()
             if out is not None:
-                if math.prod(out.data.shape) > 0:
+                # An empty chunk carries nothing, but an empty end_of_stream marker starts a new segment.
+                if math.prod(out.data.shape) > 0 or segments.get(out.key, out.segment) != out.segment:
+                    segments[out.key] = out.segment
                     yield self.OUTPUT_SIGNAL, out
                 await asyncio.sleep(0)
             elif self.producer.exhausted:
