@@ -1,7 +1,8 @@
 """The reported scaling has to survive stages that walk attrs generically.
 
-``ezmsg-sigproc``'s ``concat`` merges two messages' attrs and rejects any value
-that is not a scalar. A nested ``nwb_scaling`` dict raised ``TypeError`` there
+``ezmsg-sigproc``'s ``concat`` merges two messages' attrs. Before 3.13 it
+rejected any value that was not a scalar, and it still cannot promote an unequal
+one. A nested ``nwb_scaling`` dict raised ``TypeError`` there
 even when both sides carried an identical one, so any concat touching an
 NWB-sourced stream failed outright. Flat ``nwb_scaling_*`` keys fix that, and
 give concat something it can act on: an unequal gain is promoted onto the ``ch``
@@ -66,10 +67,26 @@ def test_a_differing_gain_is_promoted_onto_the_ch_axis():
     assert out.attrs[UNIT_ATTR] == "volts"
 
 
-def test_a_vector_gain_is_still_rejected():
-    """Known hole, left deliberately: ``_ALLOWED_ATTR_SCALARS`` has no ndarray,
-    so a genuinely per-channel gain cannot ride in attrs at all. Only reachable
-    when a file's channel_conversion entries differ -- uniform ones collapse to
-    a scalar in ``resolve_scaling``. Tracked upstream in ezmsg-sigproc."""
+def test_an_equal_vector_gain_is_kept_as_an_attr():
+    """ezmsg-sigproc 3.13 keeps a non-scalar attr when both inputs hold equal
+    values. A vector gain only exists when a file's channel_conversion entries
+    differ -- uniform ones collapse to a scalar in ``resolve_scaling``.
+
+    The kept gain still has one entry per input channel, not per output channel,
+    so ``NWBScalingTransformer`` refuses it rather than scale by position."""
+    from ezmsg.nwb.convert import NWBScalingSettings, NWBScalingTransformer
+
+    out = concatenate(message(np.array([0.25, 0.50]), "a"), message(np.array([0.25, 0.50]), "b"))
+
+    assert out.data.shape == (10, 4)
+    np.testing.assert_array_equal(out.attrs[GAIN_ATTR], [0.25, 0.50])
+    np.testing.assert_array_equal(StreamScaling.from_attrs(out.attrs).gain, [0.25, 0.50])
+    with pytest.raises(ValueError, match="does not fit"):
+        NWBScalingTransformer(NWBScalingSettings())(out)
+
+
+def test_an_unequal_vector_gain_is_still_rejected():
+    """Known hole, left deliberately: concat cannot promote a non-scalar attr
+    onto the ``ch`` axis, so two different per-channel gains still raise."""
     with pytest.raises(TypeError, match="ndarray"):
-        concatenate(message(np.array([0.25, 0.50]), "a"), message(np.array([0.25, 0.50]), "b"))
+        concatenate(message(np.array([0.25, 0.50]), "a"), message(np.array([0.25, 0.75]), "b"))
