@@ -116,7 +116,10 @@ def test_rate_only_exhaustion(test_nwb_path):
     result = producer(clock_tick)
     assert result is not None
 
-    # After consuming all samples, should be exhausted
+    # All samples consumed, but the end-of-stream marker is still to come.
+    assert not producer.exhausted
+    eos = producer(clock_tick)
+    assert eos.data.shape[0] == 0 and eos.segment == result.segment + 1
     assert producer.exhausted
 
     # Next call should return None
@@ -450,13 +453,13 @@ def test_clockdriven_window_spanning_gap_stops_at_the_gap(gappy_nwb_path):
 
 
 def test_clockdriven_gap_on_window_boundary_starts_a_segment(gappy_nwb_path):
-    """Ticks that land in the gap are empty and keep the segment; it changes on
-    the first tick that has a sample from after the gap."""
+    """Ticks that land in the gap are empty and keep the run's segment (no marker); it goes up by
+    one on the first tick that has a sample from after the gap."""
     p = _gappy_producer(gappy_nwb_path, start_offset=1.0)
     tick = AxisArray.LinearAxis(gain=0.5, offset=0.0)
     out = [p(tick) for _ in range(4)]  # [1.0,1.5) [1.5,2.0) [2.0,2.5) [2.5,3.0)
     assert [m.data.shape[0] for m in out] == [50, 0, 0, 50]
-    assert [m.segment - out[0].segment for m in out] == [0, 0, 0, 1]
+    assert [m.segment for m in out] == [0, 0, 0, 1]
 
 
 def test_clockdriven_seek_starts_a_segment(gappy_nwb_path):

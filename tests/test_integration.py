@@ -95,8 +95,8 @@ def test_nwbiterator_unit_system(test_nwb_path):
     log_file = Path(tempfile.gettempdir()) / "test_nwbiterator_unit.txt"
     log_file.write_text("")
 
-    # Broadband is 3000 samples at 1 s chunks: exactly 3 messages.
-    n_messages = 3
+    # Broadband is 3000 samples at 1 s chunks: exactly 3 messages, then the end-of-stream marker.
+    n_messages = 4
 
     settings = NWBIteratorTestSettings(
         nwbiterator_settings=NWBIteratorSettings(
@@ -125,6 +125,7 @@ def test_nwbiterator_unit_system(test_nwb_path):
 
     total_samples = sum(m.data.shape[0] for m in messages)
     assert total_samples == 3000
+    assert messages[-1].data.shape[0] == 0
 
 
 # -- NWBClockDrivenUnit system test --

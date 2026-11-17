@@ -11,6 +11,7 @@ from collections import deque
 
 import ezmsg.core as ez
 import numpy as np
+from ezmsg.baseproc import end_of_stream
 from ezmsg.baseproc.protocols import processor_state
 from ezmsg.baseproc.stateful import BaseStatefulProducer
 from ezmsg.util.messages.axisarray import AxisArray
@@ -241,6 +242,10 @@ def _build_chunk_messages_static(
                         segment=strm_dict["segment"],
                     )
                 )
+        if start_idx < stop_idx and stop_idx >= info.dset.shape[0]:
+            # The stream's last sample. Later chunks' empty messages carry the marker's segment.
+            out.append(end_of_stream(out[-1]))
+            strm_dict["segment"] = out[-1].segment
     return out
 
 

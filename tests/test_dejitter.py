@@ -116,7 +116,7 @@ def test_real_gap_splits_iterator_chunk(dejitter_gapped_nwb_path):
     it = NWBAxisArrayIterator(
         NWBIteratorSettings(filepath=dejitter_gapped_nwb_path, chunk_dur=10.0, stream_keys=["HUB"], dejitter=True)
     )
-    msgs = list(it)
+    msgs = [m for m in it if m.data.shape[0]]  # not the end-of-stream markers
     it.close()
     # chunk_dur exceeds the record, so absent a gap this would be one message;
     # the preserved gap forces a split into two contiguous runs.
