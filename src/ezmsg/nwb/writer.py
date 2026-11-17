@@ -181,6 +181,10 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         # ``_request_reset``; message identity does not force a rebuild.
         return 0
 
+    def _reset_segment(self, message: typing.Optional[AxisArray]) -> None:
+        # A gap in the data is still the same recording: keep appending to the open file.
+        pass
+
     def _reset_state(self, message: typing.Optional[AxisArray]) -> None:
         """(Re)open the NWB file using the current settings.
 
