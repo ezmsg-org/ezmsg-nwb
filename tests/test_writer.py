@@ -205,18 +205,14 @@ def test_recording_toggled_live_resumes_writes():
 # -- error paths --
 
 
-def test_shape_mismatch_raises_and_closes():
-    path = _fresh_path("shape_mismatch")
-    sink = _sink(path)
+def test_shape_change_with_family_filepath_raises_and_closes(tmp_path):
+    """A '%d' filepath is one family-driver file, so it cannot split: a shape change still raises."""
+    sink = _sink(tmp_path / "family_%d.nwb", split_bytes=10_000_000)
 
     sink._process(_make_continuous(n=50, ch=4, key="S"))
-    bad = _make_continuous(n=50, ch=8, key="S")  # different trailing shape
-
-    with pytest.raises(ValueError, match="changed shape"):
-        sink._process(bad)
-    assert sink._state.io is None, "close() should run on shape mismatch"
-
-    path.unlink(missing_ok=True)
+    with pytest.raises(ValueError, match="cannot split"):
+        sink._process(_make_continuous(n=50, ch=8, offset=0.05, key="S"))
+    assert sink._state.io is None, "close() should run on a change it cannot split"
 
 
 def test_str_data_without_event_key_raises():
@@ -462,20 +458,165 @@ def test_meta_yaml_roundtrip(tmp_path):
         assert nwbfile.subject.species == "Mus musculus"
 
 
-def test_rate_change_raises_and_closes():
-    """Same key, different sample rate → consistency check fires alongside
-    the shape check and tears the file down."""
-    path = _fresh_path("rate_change")
+def test_rate_change_splits(tmp_path):
+    """Same key, different sample rate → the stream continues in a new file at the new rate."""
+    path = tmp_path / "rate.nwb"
     sink = _sink(path)
 
     sink._process(_make_continuous(n=50, ch=4, fs=1000.0, key="K"))
-    bad = _make_continuous(n=50, ch=4, fs=2000.0, offset=0.05, key="K")
+    sink._process(_make_continuous(n=50, ch=4, fs=2000.0, offset=0.05, key="K"))
+    sink.close(write=True)
 
-    with pytest.raises(ValueError, match="changed shape"):
-        sink._process(bad)
-    assert sink._state.io is None, "rate change must close the file"
+    with NWBHDF5IO(str(path), "r") as io:
+        assert io.read().acquisition["K"].timestamps.attrs["rate"] == 1000.0
+    with NWBHDF5IO(str(_split_path(path, 1)), "r") as io:
+        series = io.read().acquisition["K"]
+        assert series.timestamps.attrs["rate"] == 2000.0
+        assert len(series.data) == 50
 
-    path.unlink(missing_ok=True)
+
+# -- configuration change splits the file --
+
+
+def _split_path(path: Path, n: int) -> Path:
+    return path.parent / f"{path.stem}_{n:02}{path.suffix}"
+
+
+def _labels_of(series) -> list:
+    return list(series.electrodes.table["label"][series.electrodes.data[:]])
+
+
+def test_channel_relabel_splits(tmp_path):
+    """Same channel count, new labels → second file, each with its own samples and electrodes."""
+    path = tmp_path / "relabel.nwb"
+    sink = _sink(path)
+    before = replace(_make_continuous(n=30, ch=2, ch_labels=["a", "b"]), config_id=1)
+    after = replace(_make_continuous(n=20, ch=2, offset=0.03, ch_labels=["c", "d"]), config_id=2)
+    sink._process(before)
+    sink._process(after)
+    sink.close(write=True)
+
+    with NWBHDF5IO(str(path), "r") as io:
+        series = io.read().acquisition["TestStream"]
+        np.testing.assert_array_equal(series.data[:], before.data)
+        assert _labels_of(series) == ["a", "b"]
+    with NWBHDF5IO(str(_split_path(path, 1)), "r") as io:
+        nwbfile = io.read()
+        series = nwbfile.acquisition["TestStream"]
+        np.testing.assert_array_equal(series.data[:], after.data)
+        assert _labels_of(series) == ["c", "d"]
+        assert list(nwbfile.electrodes["label"][:]) == ["c", "d"]
+        # Same clock as the first file: the new file's timestamps continue from it.
+        assert series.timestamps[0] == pytest.approx(0.03)
+
+
+def test_unsafe_dtype_change_splits(tmp_path):
+    """float64 into a float32 dataset would lose precision, so the stream moves to a new file."""
+    path = tmp_path / "dtype.nwb"
+    sink = _sink(path)
+    msg = replace(_make_continuous(n=30, ch=2), config_id=1)
+    sink._process(msg)
+    sink._process(replace(msg, data=msg.data.astype(np.float64), config_id=2))
+    sink.close(write=True)
+
+    with NWBHDF5IO(str(path), "r") as io:
+        assert io.read().acquisition["TestStream"].data.dtype == np.float32
+    with NWBHDF5IO(str(_split_path(path, 1)), "r") as io:
+        series = io.read().acquisition["TestStream"]
+        assert series.data.dtype == np.float64
+        assert len(series.data) == 30
+
+
+def test_safe_dtype_change_does_not_split(tmp_path):
+    """int16 then float32 into a float64 dataset loses nothing, so both are appended to the one file."""
+    path = tmp_path / "safe_dtype.nwb"
+    sink = _sink(path)
+    msg = replace(_make_continuous(n=30, ch=2), config_id=1)
+    sink._process(replace(msg, data=msg.data.astype(np.float64)))
+    sink._process(replace(msg, data=np.ones((30, 2), dtype=np.int16), config_id=2))
+    sink._process(replace(msg, config_id=3))
+    sink.close(write=True)
+
+    assert sink._state.split_count == 0
+    assert not _split_path(path, 1).exists()
+    with NWBHDF5IO(str(path), "r") as io:
+        series = io.read().acquisition["TestStream"]
+        assert series.data.dtype == np.float64
+        assert len(series.data) == 90
+
+
+@pytest.mark.parametrize("config_ids", [(1, 2), (0, 0)], ids=["declared", "undeclared"])
+def test_channel_count_change_splits(tmp_path, config_ids):
+    path = tmp_path / "count.nwb"
+    sink = _sink(path)
+    sink._process(replace(_make_continuous(n=30, ch=4), config_id=config_ids[0]))
+    sink._process(replace(_make_continuous(n=20, ch=8, offset=0.03), config_id=config_ids[1]))
+    sink.close(write=True)
+
+    with NWBHDF5IO(str(path), "r") as io:
+        assert io.read().acquisition["TestStream"].data.shape == (30, 4)
+    with NWBHDF5IO(str(_split_path(path, 1)), "r") as io:
+        assert io.read().acquisition["TestStream"].data.shape == (20, 8)
+
+
+def test_segment_or_config_id_change_alone_does_not_split(tmp_path):
+    """A new segment, or a new config_id with the same layout, keeps writing to the one file."""
+    path = tmp_path / "nosplit.nwb"
+    sink = _sink(path)
+    labels = ["a", "b"]
+    sink._process(replace(_make_continuous(n=30, ch=2, ch_labels=labels), config_id=1))
+    sink._process(replace(_make_continuous(n=20, ch=2, offset=1.0, ch_labels=labels), config_id=1, segment=1))
+    sink._process(replace(_make_continuous(n=10, ch=2, offset=2.0, ch_labels=labels), config_id=2, segment=1))
+    sink.close(write=True)
+
+    assert sink._state.split_count == 0
+    assert not _split_path(path, 1).exists()
+    with NWBHDF5IO(str(path), "r") as io:
+        assert len(io.read().acquisition["TestStream"].data) == 60
+
+
+def test_unchanged_stream_and_epochs_continue_across_config_split(tmp_path):
+    path = tmp_path / "two_streams.nwb"
+    sink = _sink(path)
+    events = AxisArray(
+        data=np.array([["before"]]),
+        dims=["time", "ch"],
+        axes={"time": AxisArray.CoordinateAxis(np.array([0.01]), dims=["time"], unit="s")},
+        key="epochs",
+    )
+    sink._process(replace(_make_continuous(n=30, ch=4), config_id=1))
+    sink._process(replace(_make_continuous(n=30, ch=3, key="Other"), config_id=7))
+    sink._process(events)
+    sink._process(replace(_make_continuous(n=20, ch=8, offset=0.03), config_id=2))
+    sink._process(replace(_make_continuous(n=20, ch=3, offset=0.03, key="Other"), config_id=7))
+    sink._process(replace(events, data=np.array([["after"]])))
+    sink.close(write=True)
+
+    with NWBHDF5IO(str(path), "r") as io:
+        nwbfile = io.read()
+        assert nwbfile.acquisition["Other"].data.shape == (30, 3)
+        assert "before" in list(nwbfile.epochs["label"][:])
+    with NWBHDF5IO(str(_split_path(path, 1)), "r") as io:
+        nwbfile = io.read()
+        assert nwbfile.acquisition["TestStream"].data.shape == (20, 8)
+        assert nwbfile.acquisition["Other"].data.shape == (20, 3)
+        assert list(nwbfile.acquisition["Other"].timestamps[:2]) == pytest.approx([0.03, 0.031])
+        assert "after" in list(nwbfile.epochs["label"][:])
+
+
+def test_config_change_while_paused_splits_and_drops_empty_file(tmp_path):
+    """While not recording, a change still moves the stream to a new file; the empty first file is deleted."""
+    path = tmp_path / "paused.nwb"
+    sink = _sink(path, recording=False)
+    sink._process(_make_continuous(n=30, ch=4))
+    sink._process(_make_continuous(n=30, ch=8, offset=0.03))
+    sink.update_settings(dataclasses.replace(sink.settings, recording=True))
+    sink._process(_make_continuous(n=10, ch=8, offset=0.06))
+    sink.close(write=True)
+
+    assert not path.exists()
+    with NWBHDF5IO(str(_split_path(path, 1)), "r") as io:
+        assert io.read().acquisition["TestStream"].data.shape == (10, 8)
 
 
 def _send_one_message(sink, key: str, dtype, fs: float = 100.0, n_ch: int = 4, n_time: int = 5):
