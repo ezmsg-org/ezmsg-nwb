@@ -62,6 +62,9 @@ D - When opening the *next* file when splitting
 * Copy as much information from the old NWBFile to the new NWBFile as possible.
 * Close as in C.
 * Follow pattern A where the metadata comes from the old datasets instead of loaded from a file.
+* A split happens when the total size passes ``split_bytes``, or when a stream's shape, rate or channel labels
+  change, or its dtype changes to one its dataset cannot hold without loss. In the latter case that stream's
+  series is created from its new message.
 
 """
 
@@ -116,16 +119,21 @@ class SeriesState:
     """Per-stream bookkeeping for one NWB series.
 
     ``shape`` is the trailing (non-time) shape used by
-    :meth:`NWBSinkConsumer._check_msg_consistency`. ``data`` and ``ts`` hold
+    :meth:`NWBSinkConsumer._config_change`. ``data`` and ``ts`` hold
     the live ``h5py.Dataset`` (or pynwb container) references used by
     :meth:`NWBSinkConsumer._process` to append rows. ``bytes_written``
     tracks cumulative append size for the file-split threshold.
+    ``config_id`` is the last message's ``AxisArray.config_id`` (``None``
+    before the first message) and ``labels`` its ``ch`` labels (``None``
+    if it had none, or if the series was pre-created without a message).
     """
 
     shape: typing.Tuple[int, ...]
     data: typing.Any = None
     ts: typing.Any = None
     bytes_written: int = 0
+    config_id: typing.Optional[int] = None
+    labels: typing.Optional[np.ndarray] = None
 
 
 @processor_state
@@ -260,14 +268,26 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
             b_new = self._state.io is None
             b_new = b_new or self._current_msg.key not in self._state.series
 
-            # If inc message key is in state.series but properties do not match previous dataset properties
-            #  then close io and raise error
-            if not b_new and not self._check_msg_consistency():
-                nwbfile = self._state.nwbfile
-                b_final_write = hasattr(nwbfile, "epochs") and nwbfile.epochs is not None
-                b_final_write = b_final_write or (hasattr(nwbfile, "trials") and nwbfile.trials is not None)
-                self.close(write=b_final_write)
-                raise ValueError("Data provided to NWBSink has changed shape. Closing NWB file.")
+            # A stream whose layout changed goes on in a new file. Only a new (or undeclared) config_id
+            #  is checked; the event tables join labels into one string, so their shape does not matter.
+            key = self._current_msg.key
+            config_id = self._current_msg.config_id
+            if not b_new and key not in ["epochs", "trials"]:
+                series_state = self._state.series[key]
+                if config_id == 0 or config_id != series_state.config_id:
+                    change = self._config_change()
+                    if change and "%d" in str(self._state.filepath):
+                        # One family-driver file cannot be split into a second file.
+                        nwbfile = self._state.nwbfile
+                        b_final_write = hasattr(nwbfile, "epochs") and nwbfile.epochs is not None
+                        b_final_write = b_final_write or (hasattr(nwbfile, "trials") and nwbfile.trials is not None)
+                        self.close(write=b_final_write)
+                        raise ValueError(
+                            f"Stream {key} changed {change}; cannot split a '%d' filepath. Closing NWB file."
+                        )
+                    if change:
+                        ez.logger.warning(f"NWBSink: stream {key} changed {change}; continuing in a new file.")
+                        self._split(changed_key=key)
 
             if b_new:
                 # Use first incoming timestamp to set the session start time.
@@ -297,6 +317,13 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                     self._prep_continuous_io()
                     self._flush_io(reopen=True)
                     self._update_rate_for_current()
+
+            if key not in ["epochs", "trials"]:
+                series_state = self._state.series[key]
+                series_state.config_id = config_id
+                if series_state.labels is None:
+                    # A pre-created series has no labels; take them from its first message.
+                    series_state.labels = _ch_labels(self._current_msg)
 
             if self.settings.recording and self._current_msg.data.size:
                 axis = self.settings.axis
@@ -331,12 +358,28 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
 
                 total_bytes = sum(s.bytes_written for s in self._state.series.values())
                 if 0 < self.settings.split_bytes <= total_bytes and "%d" not in str(self._state.filepath):
-                    self._state.split_count += 1
-                    self.path_on_disk.unlink(missing_ok=True)
-                    new_nwbfile, new_meta = self._copy_nwb()
-                    self.close()
-                    self._nwb_create_or_fail(nwbfile=new_nwbfile)
-                    self._prep_from_meta(new_meta)
+                    self._split()
+
+    def _split(self, changed_key: typing.Optional[str] = None) -> None:
+        """Close the current file and continue every series in the next one.
+
+        Series are recreated from the closed file's shape, rate and dtype, except
+        ``changed_key``, which is created from the current message.
+        """
+        new_nwbfile, new_meta = self._copy_nwb()
+        new_meta.pop(changed_key, None)
+        # Close before advancing split_count so an empty file is deleted at its own path.
+        self.close()
+        self._state.split_count += 1
+        self.path_on_disk.unlink(missing_ok=True)
+        self._nwb_create_or_fail(nwbfile=new_nwbfile)
+        msg = self._current_msg
+        if changed_key is not None:
+            self._prep_continuous_io()
+        self._prep_from_meta(new_meta)
+        self._current_msg = msg
+        if changed_key is not None:
+            self._update_rate_for_current()
 
     @property
     def path_on_disk(self) -> Path:
@@ -619,19 +662,23 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         new_value = recording if recording is not None else not self.settings.recording
         self.update_settings(dataclasses.replace(self.settings, recording=new_value))
 
-    def _check_msg_consistency(self) -> bool:
-        axis = self.settings.axis
-        key = self._current_msg.key
-        series_state = self._state.series[key]
-        in_ax = self._current_msg.axes[axis]
-        b_rate_change = (
-            axis in self._current_msg.axes
-            and series_state.ts is not None
-            and not hasattr(in_ax, "data")
-            and series_state.ts.attrs["rate"] != 1 / in_ax.gain
-        )
-        b_shape_change = series_state.shape != self._current_msg.data.shape[1:]
-        return not (b_rate_change or b_shape_change)
+    def _config_change(self) -> str:
+        """Describe how the current message's layout differs from its series, or "" if it does not."""
+        msg = self._current_msg
+        series_state = self._state.series[msg.key]
+        in_ax = msg.axes.get(self.settings.axis)
+        changes = []
+        if series_state.shape != msg.data.shape[1:]:
+            changes.append(f"shape {series_state.shape} -> {msg.data.shape[1:]}")
+        if in_ax is not None and not hasattr(in_ax, "data") and series_state.ts.attrs["rate"] != 1 / in_ax.gain:
+            changes.append(f"rate {series_state.ts.attrs['rate']} -> {1 / in_ax.gain}")
+        # A dtype the dataset holds without loss (e.g. float32 into float64) is appended as is.
+        if not np.can_cast(msg.data.dtype, series_state.data.dtype, casting="safe"):
+            changes.append(f"dtype {series_state.data.dtype} -> {msg.data.dtype}")
+        labels = _ch_labels(msg)
+        if series_state.labels is not None and (labels is None or not np.array_equal(series_state.labels, labels)):
+            changes.append("channel labels")
+        return ", ".join(changes)
 
     def _update_rate_for_current(self):
         axis = self.settings.axis
@@ -903,7 +950,8 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         nwbfile = self._state.nwbfile
         targ_ax_ix = self._current_msg.get_axis_idx(self.settings.axis)
         shape = self._current_msg.data.shape[:targ_ax_ix] + self._current_msg.data.shape[targ_ax_ix + 1 :]
-        self._state.series[key] = SeriesState(shape=shape)
+        labels = _ch_labels(self._current_msg)
+        self._state.series[key] = SeriesState(shape=shape, labels=labels)
         dataio = H5DataIO(
             shape=(0,) + shape,
             dtype=self._current_msg.data.dtype,
@@ -920,11 +968,7 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
 
         # If channel label info is provided then we create an electrode table and our timeseries is
         #  a pynwb.ecephys.ElectricalSeries.
-        if (
-            "ch" in self._current_msg.axes
-            and hasattr(self._current_msg.axes["ch"], "data")
-            and len(self._current_msg.axes["ch"].data)
-        ):
+        if labels is not None:
             b_first = nwbfile.electrodes is None or "label" not in nwbfile.electrodes.colnames
             if b_first:
                 nwbfile.add_electrode_column(name="label", description="electrode label")
@@ -986,6 +1030,14 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                 description=series_description,
             )
         nwbfile.add_acquisition(series)
+
+
+def _ch_labels(msg: AxisArray) -> typing.Optional[np.ndarray]:
+    """The message's channel labels, or None if its ``ch`` axis has none."""
+    ch_ax = msg.axes.get("ch")
+    if ch_ax is not None and hasattr(ch_ax, "data") and len(ch_ax.data):
+        return ch_ax.data
+    return None
 
 
 class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
