@@ -1,14 +1,19 @@
-"""``NWBSink`` writes a structured ``ch`` axis field for field (issue #46)."""
+"""A ``ch`` axis written by ``NWBSink`` reads back field for field (issues #46, #47)."""
 
 from __future__ import annotations
+
+import datetime
 
 import numpy as np
 import pynwb
 import pytest
 from ezmsg.util.messages.axisarray import AxisArray
+from hdmf.common import DynamicTable, VectorData
 
 from ezmsg.nwb import (
     CHANNEL_DTYPE,
+    NWBAxisArrayIterator,
+    NWBIteratorSettings,
     NWBSinkConsumer,
     NWBSinkSettings,
     NWBSlicer,
@@ -99,11 +104,8 @@ def test_electrode_stream_roundtrips_with_extra_field(tmp_path):
         assert {"rel_x", "rel_y", "term", "bank", "headstage", "size", "unit"} <= set(nwb.electrodes.colnames)
         assert "array" not in nwb.electrodes.colnames
         assert len(nwb.electrodes) == 3
-        assert list(nwb.electrodes["unit"][:]) == ["uV"] * 3
-        np.testing.assert_array_equal(nwb.electrodes["rel_x"][:], ch["x"])
-        np.testing.assert_array_equal(nwb.electrodes["term"][:], ch["elec"])
-    np.testing.assert_array_equal(_read_ch(path, "Neural", structured=False), ch["label"])
-    np.testing.assert_array_equal(_read_ch(path, "Sub", structured=False), sub["label"])
+    _assert_same(_read_ch(path, "Neural"), ch)
+    _assert_same(_read_ch(path, "Sub"), sub)
 
 
 def test_live_shaped_axis_roundtrips_to_the_live_dtype(tmp_path):
@@ -125,11 +127,9 @@ def test_non_electrode_stream_writes_a_channel_table(tmp_path):
         assert series.unit == "m/s"
         assert series.conversion == 1.0
         assert nwb.electrodes is None
-        table = nwb.acquisition["Decoder_channels"]
-        assert table.colnames == ("label", "unit", "gain", "index")
-        for name in ch.dtype.names:
-            np.testing.assert_array_equal(table[name][:], ch[name])
-        assert table["index"].data.dtype == np.int32
+        assert nwb.acquisition["Decoder_channels"].colnames == ("label", "unit", "gain", "index")
+    _assert_same(_read_ch(path, "Decoder"), ch)
+    np.testing.assert_array_equal(_read_ch(path, "Decoder", structured=False), ["vx", "vy"])
 
 
 def test_mixed_units_are_marked(tmp_path):
@@ -148,17 +148,87 @@ def test_labelled_stream_can_opt_out_of_the_electrodes_table(tmp_path):
         nwb = io.read()
         assert type(nwb.acquisition["Kin"]) is pynwb.TimeSeries
         assert list(nwb.electrodes["label"][:]) == ["e1"]
-        assert list(nwb.acquisition["Kin_channels"]["label"][:]) == ["px", "py"]
+    np.testing.assert_array_equal(_read_ch(path, "Kin", structured=False), ["px", "py"])
 
 
 def test_split_keeps_electrodes_and_channel_table(tmp_path):
     """The second file of a split gets the same electrodes and channel table (#45)."""
     path = tmp_path / "split.nwb"
-    el, dec = _electrode_ch(["elec1-a", "elec1-b"], extra=False), _decoder_ch()
+    el, dec = _electrode_ch(["elec1-a", "elec1-b"]), _decoder_ch()
     _write(path, _msg("Neural", el), _msg("Decoder", dec), split=True, split_bytes=10**9)
     second = tmp_path / "split_01.nwb"
     with pynwb.NWBHDF5IO(str(second), "r") as io:
-        nwb = io.read()
-        assert isinstance(nwb.acquisition["Neural"], pynwb.ecephys.ElectricalSeries)
-        assert list(nwb.acquisition["Decoder_channels"]["label"][:]) == ["vx", "vy"]
+        assert isinstance(io.read().acquisition["Neural"], pynwb.ecephys.ElectricalSeries)
     _assert_same(_read_ch(second, "Neural"), el)
+    _assert_same(_read_ch(second, "Decoder"), dec)
+
+
+def test_iterator_carries_the_channel_table_axis(tmp_path):
+    path = tmp_path / "it.nwb"
+    ch = _decoder_ch()
+    _write(path, _msg("Decoder", ch))
+    it = NWBAxisArrayIterator(
+        settings=NWBIteratorSettings(
+            filepath=str(path),
+            chunk_dur=0.1,
+            reference_clock=ReferenceClockType.UNKNOWN,
+            dejitter=False,
+            structured_ch_axis=True,
+        )
+    )
+    try:
+        msg = next(m for m in it if m.data.shape[0])
+    finally:
+        it.close()
+    _assert_same(msg.axes["ch"].data, ch)
+
+
+def _hand_built(path, table_columns=None, description="fixture"):
+    nwb = pynwb.NWBFile(
+        session_description="hand built",
+        identifier="hand",
+        session_start_time=datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc),
+    )
+    nwb.add_acquisition(
+        pynwb.TimeSeries(
+            name="Kin", data=np.zeros((10, 2)), unit="n/a", rate=10.0, starting_time=0.0, description=description
+        )
+    )
+    if table_columns:
+        nwb.add_acquisition(
+            DynamicTable(
+                name="Kin_channels",
+                description="text only",
+                columns=[VectorData(name=k, description=k, data=v) for k, v in table_columns.items()],
+            )
+        )
+    with pynwb.NWBHDF5IO(str(path), "w") as io:
+        io.write(nwb)
+
+
+def test_text_channel_table_is_cast(tmp_path):
+    path = tmp_path / "text.nwb"
+    _hand_built(path, {"label": ["1", "2"], "index": ["3", "4"], "gain": ["1.5", "2"], "kind": ["a", "1"]})
+    ch = _read_ch(path, "Kin")
+    assert ch.dtype.names == ("label", "index", "gain", "kind")
+    assert ch.dtype["label"].kind == "U" and ch.dtype["kind"].kind == "U"
+    assert ch.dtype["index"].kind == "i" and ch.dtype["gain"].kind == "f"
+    np.testing.assert_array_equal(ch["label"], ["1", "2"])
+    np.testing.assert_array_equal(ch["gain"], [1.5, 2.0])
+
+
+def test_description_labels_are_a_fallback(tmp_path):
+    path = tmp_path / "desc.nwb"
+    _hand_built(path, description="kinematics channel_labels=px, py")
+    np.testing.assert_array_equal(_read_ch(path, "Kin", structured=False), ["px", "py"])
+    np.testing.assert_array_equal(_read_ch(path, "Kin")["label"], ["px", "py"])
+
+
+def test_undescribed_timeseries_has_no_ch_axis(tmp_path):
+    path = tmp_path / "bare.nwb"
+    _hand_built(path)
+    slicer = NWBSlicer(path, dejitter=False, structured_ch_axis=True)
+    try:
+        assert "ch" not in slicer.get_stream_info("Kin").template.axes
+    finally:
+        slicer.close()

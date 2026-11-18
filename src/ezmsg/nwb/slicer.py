@@ -31,7 +31,7 @@ from .clockmodel import (
     group_clocks,
     reconstruct_group,
 )
-from .electrodes import build_channel_axis
+from .electrodes import build_channel_axis, series_channel_axis
 from .scaling import StreamScaling, describe_stream_scaling, scaling_fingerprint
 from .util import ReferenceClockType, as_text, as_text_array, interval_median, is_zarr_array
 
@@ -305,8 +305,10 @@ class NWBSlicer:
             a file sees the axis it was written against. Default False: the
             columns this reads are an acquisition-stack convention rather than
             part of the NWB schema, and most files carry none of them. Raises
-            for a file that has none rather than inventing geometry. See
-            :mod:`~ezmsg.nwb.electrodes`.
+            for a file that has none rather than inventing geometry. Any further
+            electrodes column follows those fields under its own name. A series
+            without electrodes takes its fields from a ``<name>_channels`` table
+            beside it, one field per column. See :mod:`~ezmsg.nwb.electrodes`.
     Note:
         Data comes back as the file stores it -- integer ADC counts, typically,
         not the unit the file declares. Every message carries what it takes to
@@ -585,6 +587,12 @@ class NWBSlicer:
                     axes["ch"] = AxisArray.CoordinateAxis(
                         data=np.array([f"ch_{idx}" for idx in ids.tolist()]), dims=["ch"]
                     )
+            elif child.data.ndim > 1:
+                # No electrodes: a non-electrode stream (decoder output, kinematics) describes its channels in a
+                #  ``<name>_channels`` table, if at all.
+                ch = series_channel_axis(child, self._structured_ch_axis)
+                if ch is not None:
+                    axes["ch"] = AxisArray.CoordinateAxis(data=ch, dims=["ch"], unit="struct" if ch.dtype.names else "")
 
             # ``matched_key`` is the user-facing key — equal to ``child.name``
             # when there's no stream_keys filter or an exact match, or the
