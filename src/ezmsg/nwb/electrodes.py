@@ -34,6 +34,7 @@ import typing
 
 import ezmsg.core as ez
 import numpy as np
+from hdmf.common import DynamicTable, DynamicTableRegion, VectorIndex
 
 from .util import as_text_array
 
@@ -86,6 +87,11 @@ written to a column of its own name.
 
 ELECTRODE_FIELDS = frozenset(COLUMN_SOURCES) - {"label"}
 """Fields whose presence marks a structured ``ch`` axis as describing electrodes."""
+
+NWB_ELECTRODE_COLUMNS = frozenset(
+    {"location", "group", "group_name", "x", "y", "z", "imp", "filtering", "reference", "rel_x", "rel_y", "rel_z"}
+)
+"""Electrodes-table columns the NWB schema defines; never read back as extra fields."""
 
 
 def array_identity(label: str, headstage: int, bank: str = "") -> str:
@@ -182,8 +188,16 @@ def build_channel_axis(
             f"structured_ch_axis off for files that do not carry them."
         )
 
+    # Any other column a writer stored -- ``unit``, application fields -- follows the live fields, which keep
+    #  their place so code reading ``ch["x"]`` is unaffected.
+    skip = NWB_ELECTRODE_COLUMNS | set(CHANNEL_DTYPE.names) | {c for names in COLUMN_SOURCES.values() for c in names}
+    extras = {name: _column_values(table[name], region_idx) for name in table.colnames if name not in skip}
+    extras = {name: values for name, values in extras.items() if values is not None}
+
     n = len(region_idx)
-    out = np.zeros(n, dtype=CHANNEL_DTYPE)
+    out = np.zeros(n, dtype=CHANNEL_DTYPE.descr + [(name, values.dtype) for name, values in extras.items()])
+    for name, values in extras.items():
+        out[name] = values
 
     for field in ("x", "y", "size", "elec", "headstage"):
         values = _column(table, COLUMN_SOURCES[field], region_idx)
@@ -235,3 +249,57 @@ def _warn_on_merged_arrays(
             f"Channels from physically separate arrays will group together; anything keyed on ch['array'] "
             f"-- per-array rereferencing especially -- will mix them."
         )
+
+
+def _column_values(
+    column: typing.Any, rows: typing.Any = slice(None), cast: bool = True
+) -> typing.Optional[np.ndarray]:
+    """One flat column as a typed array, or None for one that is not a value per row (ragged, references).
+
+    Text columns are cast when every value parses -- int, then float -- so a recorder that only had text
+    metadata reads back the same as one that stored typed values.
+    """
+    if isinstance(column, (VectorIndex, DynamicTableRegion)):
+        return None
+    values = np.asarray(column.data[:])[rows]
+    if values.ndim != 1:
+        return None
+    if values.dtype.kind in "OSU":
+        if not all(isinstance(v, (str, bytes)) for v in values.tolist()):
+            return None
+        values = as_text_array(values)
+        if cast:
+            for kind in (int, float):
+                try:
+                    return np.array([kind(v) for v in values], dtype=kind)
+                except ValueError:
+                    pass
+    return values
+
+
+def series_channel_axis(series: typing.Any, structured: bool) -> typing.Optional[np.ndarray]:
+    """The ``ch`` axis of a series without electrodes, or None if the file does not describe its channels.
+
+    From a ``<series name>_channels`` table beside the series -- one row per data column, one column per
+    field -- else from a ``channel_labels=a,b,c`` suffix on its description. *structured* gives a record
+    per channel with one field per column; otherwise the labels alone.
+    """
+    name = f"{series.name}_channels"
+    table = next(
+        (c for c in getattr(series.parent, "children", ()) if c.name == name and isinstance(c, DynamicTable)), None
+    )
+    if table is not None:
+        columns = {c: _column_values(table[c], cast=c != "label") for c in table.colnames}
+        columns = {c: values for c, values in columns.items() if values is not None}
+    else:
+        _, sep, tail = (series.description or "").rpartition("channel_labels=")
+        columns = {"label": np.array([label.strip() for label in tail.split(",")])} if sep else {}
+
+    if not columns or len(next(iter(columns.values()))) != series.data.shape[1]:
+        return None
+    if not structured:
+        return columns.get("label")
+    out = np.zeros(series.data.shape[1], dtype=[(c, values.dtype) for c, values in columns.items()])
+    for c, values in columns.items():
+        out[c] = values
+    return out

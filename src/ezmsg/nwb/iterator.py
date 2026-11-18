@@ -84,7 +84,9 @@ class NWBIteratorSettings(ez.Settings):
     structured_ch_axis: bool = False
     """Build the ``ch`` axis as a structured record array from the electrodes
     table (forwarded to ``NWBSlicer``), matching what a live acquisition source
-    emits: position, label, bank, headstage, array identity. Default False --
+    emits: position, label, bank, headstage, array identity, then any further
+    electrodes column (or, for a series without electrodes, the columns of its
+    ``<name>_channels`` table). Default False --
     these columns are an acquisition-stack convention, not part of the NWB
     schema. See :mod:`~ezmsg.nwb.electrodes`."""
     storage_options: typing.Optional[dict] = None
