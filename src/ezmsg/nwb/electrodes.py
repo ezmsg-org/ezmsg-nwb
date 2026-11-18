@@ -77,6 +77,17 @@ answer True for files that have no channel map at all.
 """
 
 
+FIELD_COLUMNS: dict[str, str] = {field: names[0] for field, names in COLUMN_SOURCES.items()}
+"""The column a writer stores each field in: the inverse of :data:`COLUMN_SOURCES`.
+
+``array`` has no column; it is derived on read. A field not listed here is
+written to a column of its own name.
+"""
+
+ELECTRODE_FIELDS = frozenset(COLUMN_SOURCES) - {"label"}
+"""Fields whose presence marks a structured ``ch`` axis as describing electrodes."""
+
+
 def array_identity(label: str, headstage: int, bank: str = "") -> str:
     """Electrode-array identity for a channel.
 

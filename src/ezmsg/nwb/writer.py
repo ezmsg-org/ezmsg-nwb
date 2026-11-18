@@ -62,7 +62,7 @@ D - When opening the *next* file when splitting
 * Copy as much information from the old NWBFile to the new NWBFile as possible.
 * Close as in C.
 * Follow pattern A where the metadata comes from the old datasets instead of loaded from a file.
-* A split happens when the total size passes ``split_bytes``, or when a stream's shape, rate or channel labels
+* A split happens when the total size passes ``split_bytes``, or when a stream's shape, rate or channels
   change, or its dtype changes to one its dataset cannot hold without loss. In the latter case that stream's
   series is created from its new message.
 
@@ -88,8 +88,10 @@ from ezmsg.baseproc import BaseConsumerUnit, BaseStatefulConsumer, processor_sta
 from ezmsg.util.messages.axisarray import AxisArray
 from ezmsg.util.messages.util import replace
 from hdmf.backends.hdf5.h5_utils import H5DataIO
+from hdmf.common import DynamicTable, VectorData
 
 from ._dictutil import DeepDict, dict_deep_update, load_dict_from_file
+from .electrodes import ELECTRODE_FIELDS, FIELD_COLUMNS
 from .util import (
     ReferenceClockType,
     build_nwb_fname,
@@ -104,6 +106,15 @@ except ImportError:
 
 
 class NWBSinkSettings(ez.Settings):
+    """Settings for :class:`NWBSink`.
+
+    A stream's ``ch`` axis decides its series. Plain labels, or records with an electrode field (``x``, ``y``,
+    ``size``, ``bank``, ``elec``, ``headstage``), become an ``ElectricalSeries`` with one electrodes column per
+    field (see :data:`~ezmsg.nwb.electrodes.FIELD_COLUMNS`). Other records, and labelled streams listed in
+    ``non_electrode_streams``, become a ``TimeSeries`` with a ``<key>_channels`` table beside it. A stream
+    without a ``ch`` axis is a ``TimeSeries`` in volts. ``structured_ch_axis`` on the readers rebuilds the axis.
+    """
+
     filepath: typing.Union[str, os.PathLike]
     overwrite_old: bool = False
     axis: str = "time"
@@ -112,6 +123,9 @@ class NWBSinkSettings(ez.Settings):
     meta_yaml: typing.Optional[typing.Union[str, os.PathLike]] = None
     split_bytes: int = 0
     expected_series: typing.Optional[typing.Union[str, os.PathLike]] = None
+    # Streams whose channels are not electrodes (decoder outputs, kinematics). A labelled stream listed here is
+    #  written as a TimeSeries with a ``<key>_channels`` table instead of rows in the electrodes table.
+    non_electrode_streams: typing.Tuple[str, ...] = ()
 
 
 @dataclasses.dataclass
@@ -124,8 +138,9 @@ class SeriesState:
     :meth:`NWBSinkConsumer._process` to append rows. ``bytes_written``
     tracks cumulative append size for the file-split threshold.
     ``config_id`` is the last message's ``AxisArray.config_id`` (``None``
-    before the first message) and ``labels`` its ``ch`` labels (``None``
-    if it had none, or if the series was pre-created without a message).
+    before the first message) and ``ch`` its ``ch`` axis data, plain labels
+    or structured records (``None`` if it had none, or if the series was
+    pre-created without one).
     """
 
     shape: typing.Tuple[int, ...]
@@ -133,7 +148,7 @@ class SeriesState:
     ts: typing.Any = None
     bytes_written: int = 0
     config_id: typing.Optional[int] = None
-    labels: typing.Optional[np.ndarray] = None
+    ch: typing.Optional[np.ndarray] = None
 
 
 @processor_state
@@ -321,9 +336,9 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
             if key not in ["epochs", "trials"]:
                 series_state = self._state.series[key]
                 series_state.config_id = config_id
-                if series_state.labels is None:
-                    # A pre-created series has no labels; take them from its first message.
-                    series_state.labels = _ch_labels(self._current_msg)
+                if series_state.ch is None:
+                    # A pre-created series has no channels; take them from its first message.
+                    series_state.ch = _ch_data(self._current_msg)
 
             if self.settings.recording and self._current_msg.data.size:
                 axis = self.settings.axis
@@ -574,12 +589,13 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
             # subsequent loops, so streams with different dtypes ended up
             # sharing whichever type happened to land last.
             dtype = np.dtype(ss.get("dtype", "float64"))
+            axes = {"time": AxisArray.TimeAxis(fs=ss["fs"])}
+            if ss.get("ch") is not None:
+                axes["ch"] = AxisArray.CoordinateAxis(np.asarray(ss["ch"]), dims=["ch"])
             self._current_msg = AxisArray(
                 data=np.zeros(shape, dtype=dtype),
                 dims=["time", "ch"] + [f"dim{_}" for _ in range(len(shape) - 2)],
-                axes={
-                    "time": AxisArray.TimeAxis(fs=ss["fs"]),
-                },
+                axes=axes,
                 key=key,
             )
             self._prep_continuous_io()
@@ -675,9 +691,11 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         # A dtype the dataset holds without loss (e.g. float32 into float64) is appended as is.
         if not np.can_cast(msg.data.dtype, series_state.data.dtype, casting="safe"):
             changes.append(f"dtype {series_state.data.dtype} -> {msg.data.dtype}")
-        labels = _ch_labels(msg)
-        if series_state.labels is not None and (labels is None or not np.array_equal(series_state.labels, labels)):
-            changes.append("channel labels")
+        ch = _ch_data(msg)
+        if series_state.ch is not None and (
+            ch is None or ch.dtype != series_state.ch.dtype or not np.array_equal(series_state.ch, ch)
+        ):
+            changes.append("channels")
         return ", ".join(changes)
 
     def _update_rate_for_current(self):
@@ -732,6 +750,8 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                     "fs": ss.ts.attrs["rate"],
                     "shape": (0,) + ss.shape,
                     "dtype": ss.data.dtype,
+                    # Channels too, so the next file gets the same electrodes / channel table.
+                    "ch": ss.ch,
                 }
 
         return nwbfile, meta
@@ -950,8 +970,8 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         nwbfile = self._state.nwbfile
         targ_ax_ix = self._current_msg.get_axis_idx(self.settings.axis)
         shape = self._current_msg.data.shape[:targ_ax_ix] + self._current_msg.data.shape[targ_ax_ix + 1 :]
-        labels = _ch_labels(self._current_msg)
-        self._state.series[key] = SeriesState(shape=shape, labels=labels)
+        ch = _ch_data(self._current_msg)
+        self._state.series[key] = SeriesState(shape=shape, ch=ch)
         dataio = H5DataIO(
             shape=(0,) + shape,
             dtype=self._current_msg.data.dtype,
@@ -965,13 +985,28 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
             fillvalue=np.nan,
         )
         series_description = "created by ezmsg nwbsink"
+        names = () if ch is None else (ch.dtype.names or ())
 
-        # If channel label info is provided then we create an electrode table and our timeseries is
-        #  a pynwb.ecephys.ElectricalSeries.
-        if labels is not None:
+        # Electrode channels -- plain labels (unless opted out) or records carrying an electrode field -- go in
+        #  the electrodes table and the series is a pynwb.ecephys.ElectricalSeries.
+        if (
+            ch is not None
+            and key not in self.settings.non_electrode_streams
+            and (not names or ELECTRODE_FIELDS.intersection(names))
+        ):
+            labels = _ch_labels(ch)
+            # Each field in the column the readers rebuild it from; ``array`` is derived on read.
+            fields = {FIELD_COLUMNS.get(f, f): ch[f] for f in names if f not in ("label", "array")}
+            # NWB defines rel_x / rel_y as float.
+            fields.update({c: fields[c].astype(float) for c in ("rel_x", "rel_y") if c in fields})
             b_first = nwbfile.electrodes is None or "label" not in nwbfile.electrodes.colnames
-            if b_first:
-                nwbfile.add_electrode_column(name="label", description="electrode label")
+            for col, values in {"label": labels, **fields}.items():
+                if nwbfile.electrodes is None or col not in nwbfile.electrodes.colnames:
+                    # Rows other streams already wrote get this field's zero value.
+                    n_rows = 0 if nwbfile.electrodes is None else len(nwbfile.electrodes)
+                    nwbfile.add_electrode_column(
+                        name=col, description=f"electrode {col}", data=[np.zeros((), values.dtype)[()]] * n_rows
+                    )
 
             dev_name = "unified device"
             if dev_name in nwbfile.devices:
@@ -994,21 +1029,35 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                     # _flush_io swaps nwbfile out from under us; refresh.
                     nwbfile = self._state.nwbfile
 
-            el_df = nwbfile.electrodes.to_dataframe()
-            el_df = el_df[el_df["group"] == el_grp]
-            for ll in self._current_msg.axes["ch"].data:
-                if ll not in el_df["label"].values:
-                    nwbfile.add_electrode(label=ll, location="unknown", group=el_grp)
+            electrodes = nwbfile.electrodes
+            el_df = electrodes.to_dataframe()
+            known = set(el_df.loc[el_df["group"] == el_grp, "label"])
+            # Columns this stream does not carry get the zero value of their type.
+            other = [
+                c
+                for c in electrodes.colnames
+                if c not in fields and c not in ("label", "location", "group", "group_name")
+            ]
+            for i, ll in enumerate(labels):
+                if ll not in known:
+                    known.add(ll)
+                    nwbfile.add_electrode(
+                        label=ll,
+                        location="unknown",
+                        group=el_grp,
+                        **{c: v[i] for c, v in fields.items()},
+                        **{c: type(electrodes[c].data[0])() for c in other},
+                    )
 
-            if type(nwbfile.electrodes.id.data) is list:
-                for fn in ["id", "location", "group_name", "group", "label"]:
-                    getattr(nwbfile.electrodes, fn).set_data_io(H5DataIO, {"maxshape": (None,), "chunks": True})
+            for col in (electrodes.id, *electrodes.columns):
+                if type(col.data) is list:
+                    col.set_data_io(H5DataIO, {"maxshape": (None,), "chunks": True})
 
-            el_df = nwbfile.electrodes.to_dataframe()
-            el_df = el_df[el_df["group"] == el_grp]
-            b_in = el_df["label"].isin(self._current_msg.axes["ch"].data)
+            # Region in the stream's channel order, so the readers rebuild the axis in that order.
+            el_df = electrodes.to_dataframe()
+            rows = {ll: i for i, (ll, grp) in enumerate(zip(el_df["label"], el_df["group"])) if grp == el_grp}
             el_tbl_region = nwbfile.create_electrode_table_region(
-                region=el_df[b_in].index.tolist(),
+                region=[rows[ll] for ll in labels],
                 description=f"electrodes for {key}",
             )
             series = pynwb.ecephys.ElectricalSeries(
@@ -1017,6 +1066,29 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
                 timestamps=tsio,
                 conversion=1e-6,
                 electrodes=el_tbl_region,
+                description=series_description,
+            )
+
+        elif ch is not None:
+            # Other channels: a plain TimeSeries, and one row per channel in a ``<key>_channels`` table beside it.
+            columns = {} if "label" in names else {"label": _ch_labels(ch)}
+            columns.update({f: ch[f] for f in names})
+            nwbfile.add_acquisition(
+                DynamicTable(
+                    name=f"{key}_channels",
+                    description=f"channels of {key}, written by ezmsg nwbsink",
+                    columns=[
+                        VectorData(name=c, description=f"channel {c}", data=v.tolist() if v.dtype.kind in "US" else v)
+                        for c, v in columns.items()
+                    ],
+                )
+            )
+            units = set(np.asarray(columns["unit"]).tolist()) if "unit" in columns else {"unknown"}
+            series = pynwb.TimeSeries(
+                name=key,
+                data=dataio,
+                timestamps=tsio,
+                unit=str(units.pop()) if len(units) == 1 else "mixed",
                 description=series_description,
             )
 
@@ -1032,12 +1104,21 @@ class NWBSinkConsumer(BaseStatefulConsumer[NWBSinkSettings, AxisArray, NWBSinkSt
         nwbfile.add_acquisition(series)
 
 
-def _ch_labels(msg: AxisArray) -> typing.Optional[np.ndarray]:
-    """The message's channel labels, or None if its ``ch`` axis has none."""
+def _ch_data(msg: AxisArray) -> typing.Optional[np.ndarray]:
+    """The message's ``ch`` axis data -- labels or structured records -- or None if it has none."""
     ch_ax = msg.axes.get("ch")
     if ch_ax is not None and hasattr(ch_ax, "data") and len(ch_ax.data):
-        return ch_ax.data
+        return np.asarray(ch_ax.data)
     return None
+
+
+def _ch_labels(ch: np.ndarray) -> np.ndarray:
+    """Channel labels from ``ch`` axis data; records without a ``label`` field are named as the readers name them."""
+    if ch.dtype.names is None:
+        return ch
+    if "label" in ch.dtype.names:
+        return ch["label"]
+    return np.array([f"ch_{i}" for i in range(len(ch))])
 
 
 class NWBSink(BaseConsumerUnit[NWBSinkSettings, AxisArray, NWBSinkConsumer]):
